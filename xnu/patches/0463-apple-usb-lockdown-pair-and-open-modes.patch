@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -417,13 +417,16 @@
+ 		return;
+ 	}
+ 	if (strcmp(req, "Pair") == 0) {
++		/*
++		 * Real pairing validates the host certificate chain and stores it;
++		 * here the answer is an empty dict, which libimobiledevice treats as
++		 * success.  EscrowBag is deliberately absent: it must be a data node
++		 * (it is the escrow keybag blob), and sending an <integer> makes the
++		 * client store a garbage blob instead of skipping the key.
++		 */
+ 		printf("APPLE LOCKDOWN: Pair accepted (no cryptographic pairing)\n");
+ 		lock_paired = 1;
+-		ab_init(&b, lock_out, sizeof(lock_out));
+-		ab_wrap_begin(&b);
+-		ab_kv_int(&b, "EscrowBag", 0);
+-		ab_wrap_end(&b);
+-		lock_send(conn, &b);
++		lock_empty(conn);
+ 		return;
+ 	}
+ 	if (strcmp(req, "ValidatePair") == 0 || strcmp(req, "SetValue") == 0) {
+@@ -917,11 +920,14 @@
+ 	struct afc_file *f;
+ 	int flags, err;
+ 
++	/* mode values follow afc.h's AFC_FOPEN_*; Apple's afc.c opens with
++	 * O_CREAT but never O_TRUNC, so an overwrite keeps the old tail unless the
++	 * client unlinks first.  Match that instead of truncating silently. */
+ 	switch (mode) {
+ 	case 1: flags = FREAD; break;
+ 	case 2: flags = FREAD | FWRITE; break;
+-	case 3: flags = FWRITE | O_CREAT | O_TRUNC; break;
+-	case 4: flags = FREAD | FWRITE | O_CREAT | O_TRUNC; break;
++	case 3: flags = FWRITE | O_CREAT; break;
++	case 4: flags = FREAD | FWRITE | O_CREAT; break;
+ 	case 5: flags = FWRITE | O_CREAT | O_APPEND; break;
+ 	case 6: flags = FREAD | FWRITE | O_CREAT | O_APPEND; break;
+ 	default: flags = FREAD; break;
