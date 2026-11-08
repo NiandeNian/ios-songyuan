@@ -1,0 +1,108 @@
+name: nezha-relink
+
+# Incrementally relink the SHIPPING XNU object set with only the four objects
+# carrying patches 0457 (USB gadget probe) / 0458 (code-signing bypass) /
+# 0459 (GPU fence hang recovery).  A whole-kernel replacement built by CI
+# cannot boot: the Xcode-16 link drops the low __PRELINK_TEXT segments, which
+# changes virt_base from 0xfffffff002000000 to 0xfffffff006000000 and the
+# kernel faults at GPU buffer-pool init (Synchronous External abort, esr
+# 0x96000010).  Relinking the original objects keeps the original layout.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  relink:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch relink materials
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p relink/mat
+          for n in relink-xnu-objects-old.tar.gz \
+                   relink-nezha-drivers.tar.gz \
+                   relink-patched-objects.tar.gz \
+                   relink-LDFLAGS.old \
+                   relink-link.filelist.old; do
+            echo "== $n"
+            gh release download turnip-ci --repo "$GITHUB_REPOSITORY" \
+              --pattern "$n" --dir relink/mat --clobber
+          done
+          ls -la relink/mat
+
+      - name: Lay out objects and build tree
+        run: |
+          set -euo pipefail
+          mkdir -p relink/ci relink/drivers relink/patched \
+                   relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA \
+                   relink/out
+          tar -xzf relink/mat/relink-xnu-objects-old.tar.gz -C relink/ci
+          tar -xzf relink/mat/relink-nezha-drivers.tar.gz -C relink/drivers
+          tar -xzf relink/mat/relink-patched-objects.tar.gz -C relink/patched
+          cp relink/mat/relink-LDFLAGS.old \
+             relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA/.LDFLAGS
+          cp relink/mat/relink-link.filelist.old \
+             relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA/link.filelist
+          echo "objects: $(find relink/ci/obj -name '*.o' | wc -l)"
+          echo "drivers: $(ls relink/drivers/*.o | wc -l)"
+
+          # The four patched objects come from the CI build of the same patched
+          # source tree.  kern_cs is not in relink_nezha_kernel.py's replacement
+          # list, so it must be replaced inside the upstream object directory.
+          # The other three are also copied over the Nezha driver objects so the
+          # replacement path picks them up too.
+          D=relink/ci/obj/DEVELOPMENT_ARM64_PANDORA/bsd/DEVELOPMENT
+          for o in sweet_ufs kern_cs kern_exec pandora_gpu; do
+            test -f "relink/patched/bsd/DEVELOPMENT/$o.o"
+            cp "relink/patched/bsd/DEVELOPMENT/$o.o" "$D/$o.o"
+            driver=$(ls relink/drivers/*__$o.c.o 2>/dev/null || true)
+            if [ -n "$driver" ]; then cp "relink/patched/bsd/DEVELOPMENT/$o.o" "$driver"; fi
+          done
+          echo "patched objects installed"
+
+      - name: Relink with Apple ld64
+        run: |
+          set -euo pipefail
+          ld -v 2>&1 | head -2 || true
+          python3 tools/relink/relink_nezha_kernel.py \
+            --buildtree relink/buildtree \
+            --ci relink/ci \
+            --objects relink/drivers \
+            --ld /usr/bin/ld \
+            --out relink/out/kernel.development.pandora
+          ls -la relink/out/
+
+      - name: Report linked layout
+        run: |
+          python3 - <<'PY'
+          import struct
+          d = open('relink/out/kernel.development.pandora','rb').read()
+          magic, cpu, sub, ftype, ncmds, sizeofcmds, flags = struct.unpack_from('<7I', d, 0)
+          assert magic == 0xfeedfacf, 'not a 64-bit Mach-O'
+          off, segs = 32, []
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from('<II', d, off)
+              if cmd == 0x19:
+                  name = d[off+8:off+24].split(b'\0')[0].decode()
+                  vmaddr, vmsize = struct.unpack_from('<QQ', d, off+24)
+                  segs.append((vmaddr, name, vmsize))
+              off += size
+          low = min(s[0] for s in segs)
+          print('segments:', len(segs))
+          for va, name, size in sorted(segs):
+              print(f'  {name:20s} 0x{va:x} 0x{size:x}')
+          print(f'virt_base would be 0x{low & ~(0x2000000-1):x} (shipping: 0xfffffff002000000)')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nezha-relinked-kernel
+          path: relink/out/kernel.development.pandora
+          retention-days: 14
