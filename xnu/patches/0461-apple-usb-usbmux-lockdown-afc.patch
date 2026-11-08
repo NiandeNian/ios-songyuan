@@ -1,0 +1,2077 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -37,6 +37,8 @@
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
+ 
++#include "apple_usb.h"
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+@@ -194,6 +196,8 @@
+ 	uint32_t    events;
+ 	bool        configured;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
++	int         personality;    /* UD_ECM (CDC-ECM) or UD_APPLE (usbmux) */
++	uint32_t    rx_req;         /* bytes the armed RX TRB asked for */
+ 	/* network */
+ 	ifnet_t     ifp;
+ 	lck_mtx_t  *lock;           /* TX ring and TX endpoint */
+@@ -320,18 +324,54 @@
+ };
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+ 
++/*
++ * Apple personality (sweetusb>=3): the interface usbmuxd looks for.
++ * usbmuxd requires idVendor 0x05ac and a product id inside 0x1290..0x12af
++ * (work/references/apple-usb/usbmuxd-usb.c:754-760) and picks the function by
++ * class/subclass/protocol 0xff/0xfe/0x02 (usbmuxd-usb.c:446-448).
++ * A single interface with two bulk endpoints is enough; the serial number is
++ * this port's own, not a copy of any real device's.
++ */
++#define UD_ECM          0
++#define UD_APPLE        1
++
++static const uint8_t ud_apple_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0xac, 0x05, 0xa8, 0x12, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_apple_cfg_desc[32] = {
++	9, 2, 32, 0, 1, 1, 0, 0x80, 250,                /* config: 1 interface, 500 mA */
++	9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,             /* usbmux function */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++static const char *const ud_apple_strings[] = {
++	NULL, "UniXNU", "UniXNU iPhone", "F2LXUNIXNU01",
++};
++
+ static uint32_t
+ ud_string(unsigned idx, uint8_t *out)
+ {
++	const char *const *tab;
++	unsigned n;
++	const char *str;
++
+ 	if (idx == 0) {
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
+ 		return 4;
+ 	}
+-	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
++	if (ud.personality == UD_APPLE) {
++		tab = ud_apple_strings;
++		n = sizeof(ud_apple_strings) / sizeof(ud_apple_strings[0]);
++	} else {
++		tab = ud_strings;
++		n = sizeof(ud_strings) / sizeof(ud_strings[0]);
++	}
++	if (idx >= n) {
+ 		return 0;
+ 	}
+-	const char *str = ud_strings[idx];
+-	uint32_t n = 2;
++	str = tab[idx];
++	n = 2;
+ 	for (; *str && n < 126; str++) {
+ 		out[n++] = (uint8_t)*str;
+ 		out[n++] = 0;
+@@ -343,6 +383,7 @@
+ 
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
++static void ud_apple_tx_kick(void);
+ static void ud_link_event(bool up);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+@@ -362,6 +403,22 @@
+ ud_configure(void)
+ {
+ 	if (ud.configured) {
++		return;
++	}
++	if (ud.personality == UD_APPLE) {
++		if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++		    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++		    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++		    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++		    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++			printf("SWEET USB: usbmux endpoints setup failed\n");
++			return;
++		}
++		dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX));
++		ud.configured = true;
++		apple_usbmux_link_up();
++		ud_rx_arm();
++		printf("SWEET USB: usbmux endpoints configured\n");
+ 		return;
+ 	}
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+@@ -400,9 +457,12 @@
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
++		const uint8_t *dd = ud.personality == UD_APPLE ? ud_apple_dev_desc : ud_dev_desc;
++		const uint8_t *cd = ud.personality == UD_APPLE ? ud_apple_cfg_desc : ud_cfg_desc;
++
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1: memcpy(data, dd, 18); n = 18; break;
++		case 2: memcpy(data, cd, cd[2] | (cd[3] << 8)); n = cd[2] | (cd[3] << 8); break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -457,7 +517,11 @@
+ static void
+ ud_rx_arm(void)
+ {
+-	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++	/* The Apple function runs at packet granularity so that a bulk transfer
++	 * never depends on the host appending a zero-length packet. The mux
++	 * layer does the reassembly. */
++	ud.rx_req = ud.personality == UD_APPLE ? 512 : UD_FRAME_MAX;
++	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, ud.rx_req, TRBCTL_NORMAL);
+ }
+ 
+ static void
+@@ -465,8 +529,16 @@
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
+-	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+-	ud_sync(UD_RX, UD_FRAME_MAX);
++	uint32_t len = ud.rx_req - (t[2] & 0xffffff);
++	ud_sync(UD_RX, ud.rx_req);
++	if (ud.personality == UD_APPLE) {
++		if (len != 0 && len <= ud.rx_req) {
++			apple_usbmux_input((const uint8_t *)(ud.dma + UD_RX), len);
++		}
++		ud_apple_tx_kick();
++		ud_rx_arm();
++		return;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -523,6 +595,24 @@
+ 	}
+ }
+ 
++/* Apple function: one mux frame per bulk-IN transfer, packet sized. */
++static void
++ud_apple_tx_kick(void)
++{
++	uint32_t n;
++
++	if (ud.personality != UD_APPLE || !ud.configured || ud.tx_busy) {
++		return;
++	}
++	n = apple_usbmux_next_tx((uint8_t *)(ud.dma + UD_TX), 512);
++	if (n == 0) {
++		return;
++	}
++	ud.tx_busy = true;
++	ud.tx_frames++;
++	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++}
++
+ static errno_t
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+@@ -699,6 +789,11 @@
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
++		if (ud.personality == UD_APPLE) {
++			ud.tx_busy = false;
++			ud_apple_tx_kick();
++			return;
++		}
+ 		lck_mtx_lock(ud.lock);
+ 		ud.tx_busy = false;
+ 		ud_tx_kick_locked();
+@@ -758,6 +853,9 @@
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		if (ud.personality == UD_APPLE) {
++			ud_apple_tx_kick();
++		}
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+@@ -829,7 +927,17 @@
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+-	ud_if_create();
++	{
++		int mode = 1;
++
++		PE_parse_boot_argn("sweetusb", &mode, sizeof(mode));
++		ud.personality = (mode >= 3) ? UD_APPLE : UD_ECM;
++		printf("SWEET USB: personality %s (sweetusb=%d)\n",
++		    ud.personality == UD_APPLE ? "apple-usbmux" : "cdc-ecm", mode);
++	}
++	if (ud.personality == UD_ECM) {
++		ud_if_create();
++	}
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+diff --git a/bsd/dev/apple_usb.h b/bsd/dev/apple_usb.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/apple_usb.h
+@@ -0,0 +1,55 @@
++/*
++ * apple_usb.h -- Apple USB device communication stack for UniXNU.
++ *
++ * Layer boundaries (see docs/usb/APPLE_USB_ARCHITECTURE.md):
++ *
++ *   transport (sweet_usb.c)  <->  mux (apple_usbmux.c)  <->  services
++ *
++ * The transport knows only bytes.  It hands complete bulk-OUT packets to
++ * apple_usbmux_input() and pulls bytes for bulk-IN from apple_usbmux_next_tx().
++ * The mux layer knows frames and connections but not plist or AFC payloads.
++ * Services (lockdown, AFC) know only their own protocol.
++ */
++#ifndef _BSD_DEV_APPLE_USB_H_
++#define _BSD_DEV_APPLE_USB_H_
++
++#include <sys/types.h>
++
++/* ---- transport -> mux ---- */
++void     apple_usbmux_input(const uint8_t *buf, uint32_t len);
++uint32_t apple_usbmux_next_tx(uint8_t *buf, uint32_t maxlen);
++void     apple_usbmux_link_up(void);
++void     apple_usbmux_link_down(void);
++int      apple_usbmux_active(void);
++
++/* ---- services -> mux ---- */
++int  apple_mux_send(void *conn, const void *buf, uint32_t len);
++void apple_mux_close(void *conn);
++
++/*
++ * A service is bound to a device-side TCP port.  open() returns a private
++ * context for the connection (or NULL to refuse it); close() must release it.
++ */
++struct apple_service {
++	const char *name;
++	uint16_t    port;
++	void      (*open)(void *conn, void **ctx);
++	void      (*input)(void *conn, void *ctx, const uint8_t *buf, uint32_t len);
++	void      (*close)(void *conn, void *ctx);
++};
++
++extern struct apple_service apple_lockdown_service;
++extern struct apple_service apple_afc_service;
++
++/* Set by the lockdown service once it hands out the AFC port. */
++#define APPLE_AFC_PORT  0x0F00
++
++/* Shared helpers (apple_services.c) */
++uint32_t apple_be32(const uint8_t *p);
++uint64_t apple_be64(const uint8_t *p);
++uint64_t apple_le64(const uint8_t *p);
++void     apple_put_be32(uint8_t *p, uint32_t v);
++void     apple_put_be16(uint8_t *p, uint16_t v);
++void     apple_put_le64(uint8_t *p, uint64_t v);
++
++#endif /* _BSD_DEV_APPLE_USB_H_ */
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/apple_usbmux.c
+@@ -0,0 +1,601 @@
++/*
++ * apple_usbmux.c -- Apple USB multiplexing ("usbmux") device side.
++ *
++ * Wire format (see work/references/apple-usb/usbmuxd-device.c):
++ *
++ *   struct mux_header { u32 protocol; u32 length; u32 magic; u16 tx_seq; u16 rx_seq; }
++ *   magic 0xfeedface, big endian; magic/seq only exist once the device is v2.
++ *
++ * Handshake:
++ *   host -> MUX_PROTO_VERSION {major,minor,padding}   (8-byte header)
++ *   dev  -> MUX_PROTO_VERSION {major=2,minor=0}       (8-byte header)
++ *   host -> MUX_PROTO_SETUP   payload 0x07            (16-byte header, seq reset)
++ *   then MUX_PROTO_TCP: 16-byte mux header + 20-byte tcphdr + payload
++ *
++ * Everything here runs in the gadget's single event thread (ud_thread), so
++ * there are no locks: input, next_tx and the service callbacks never overlap.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/types.h>
++#include <sys/errno.h>
++#include <sys/kernel.h>
++#include <libkern/libkern.h>
++#include <vm/vm_kern.h>
++
++#include "apple_usb.h"
++
++#define AMUX_MAX_CONN   8
++#define AMUX_RXBUF      8192
++#define AMUX_RING       16384
++#define AMUX_CTRL_Q     8
++#define AMUX_CTRL_MAX   96
++#define AMUX_TCP_HDR    20
++#define AMUX_MUX_HDR    16
++
++#define MUX_PROTO_VERSION 0
++#define MUX_PROTO_CONTROL 1
++#define MUX_PROTO_SETUP   2
++#define MUX_PROTO_TCP     6
++#define MUX_MAGIC         0xfeedfaceu
++
++#define TH_FIN 0x01
++#define TH_SYN 0x02
++#define TH_RST 0x04
++#define TH_PSH 0x08
++#define TH_ACK 0x10
++
++struct amux_ring {
++	uint8_t *buf;
++	uint32_t cap;
++	uint32_t alloc;         /* bytes actually mapped (round_page(cap)) */
++	uint32_t head;
++	uint32_t count;
++};
++
++struct amux_conn {
++	bool     used;
++	uint16_t sport;         /* device-side port (host's destination port) */
++	uint16_t dport;         /* host-side port */
++	uint32_t tx_seq;
++	uint32_t rx_seq;
++	struct amux_ring in;
++	struct amux_ring out;
++	struct apple_service *svc;
++	void    *ctx;
++};
++
++struct amux_ctrl {
++	uint16_t len;
++	uint8_t  data[AMUX_CTRL_MAX];
++};
++
++static struct {
++	bool     up;
++	bool     neg;
++	bool     active;
++	uint16_t mux_tx_seq;
++	uint16_t mux_rx_seq;
++	uint8_t *rxbuf;
++	uint32_t rxbuf_alloc;
++	uint32_t rxlen;
++	struct amux_conn conn[AMUX_MAX_CONN];
++	struct amux_ctrl ctrl[AMUX_CTRL_Q];
++	uint32_t ctrl_head;
++	uint32_t ctrl_count;
++} am;
++
++/* ------------------------------------------------------------------ */
++/* rings                                                              */
++/* ------------------------------------------------------------------ */
++
++static int
++ring_init(struct amux_ring *r, uint32_t cap)
++{
++	vm_offset_t va = 0;
++	vm_size_t bytes = round_page((vm_size_t)cap);
++
++	if (r->buf != NULL) {
++		return 0;
++	}
++	if (kmem_alloc(kernel_map, &va, bytes,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	r->buf = (uint8_t *)va;
++	r->alloc = (uint32_t)bytes;
++	r->cap = cap;
++	r->head = 0;
++	r->count = 0;
++	return 0;
++}
++
++static void
++ring_free(struct amux_ring *r)
++{
++	if (r->buf != NULL) {
++		kmem_free(kernel_map, (vm_offset_t)r->buf, (vm_size_t)r->alloc);
++	}
++	r->buf = NULL;
++	r->cap = r->alloc = r->head = r->count = 0;
++}
++
++static uint32_t
++ring_push(struct amux_ring *r, const uint8_t *src, uint32_t len)
++{
++	uint32_t tail, first;
++
++	if (r->buf == NULL || len == 0) {
++		return 0;
++	}
++	if (len > r->cap - r->count) {
++		len = r->cap - r->count;        /* drop the excess */
++	}
++	tail = (r->head + r->count) % r->cap;
++	first = MIN(len, r->cap - tail);
++	memcpy(r->buf + tail, src, first);
++	if (len > first) {
++		memcpy(r->buf, src + first, len - first);
++	}
++	r->count += len;
++	return len;
++}
++
++static uint32_t
++ring_span(struct amux_ring *r, uint8_t **pp)
++{
++	uint32_t n = MIN(r->count, r->cap - r->head);
++	*pp = r->buf + r->head;
++	return n;
++}
++
++static void
++ring_drop(struct amux_ring *r, uint32_t len)
++{
++	if (len > r->count) {
++		len = r->count;
++	}
++	r->head = (r->head + len) % r->cap;
++	r->count -= len;
++}
++
++/* ------------------------------------------------------------------ */
++/* outgoing frames                                                    */
++/* ------------------------------------------------------------------ */
++
++static void
++ctrl_push(const uint8_t *data, uint32_t len)
++{
++	struct amux_ctrl *c;
++
++	if (len == 0 || len > AMUX_CTRL_MAX) {
++		return;
++	}
++	if (am.ctrl_count == AMUX_CTRL_Q) {
++		printf("APPLE MUX: control queue overflow\n");
++		return;
++	}
++	c = &am.ctrl[(am.ctrl_head + am.ctrl_count) % AMUX_CTRL_Q];
++	memcpy(c->data, data, len);
++	c->len = (uint16_t)len;
++	am.ctrl_count++;
++}
++
++static uint32_t
++tcp_build(uint8_t *out, uint16_t sport, uint16_t dport, uint32_t seq,
++    uint32_t ack, uint8_t flags, const uint8_t *data, uint32_t len)
++{
++	uint32_t total = AMUX_MUX_HDR + AMUX_TCP_HDR + len;
++
++	apple_put_be32(out, MUX_PROTO_TCP);
++	apple_put_be32(out + 4, total);
++	apple_put_be32(out + 8, MUX_MAGIC);
++	apple_put_be16(out + 12, am.mux_tx_seq++);
++	apple_put_be16(out + 14, am.mux_rx_seq);
++
++	apple_put_be16(out + 16, sport);
++	apple_put_be16(out + 18, dport);
++	apple_put_be32(out + 20, seq);
++	apple_put_be32(out + 24, ack);
++	out[28] = (uint8_t)((AMUX_TCP_HDR / 4) << 4);
++	out[29] = flags;
++	apple_put_be16(out + 30, 0xffff);
++	apple_put_be16(out + 32, 0);
++	apple_put_be16(out + 34, 0);
++	if (len != 0 && data != NULL) {
++		memcpy(out + AMUX_MUX_HDR + AMUX_TCP_HDR, data, len);
++	}
++	return total;
++}
++
++static void
++mux_send_small(uint16_t sport, uint16_t dport, uint32_t seq, uint32_t ack,
++    uint8_t flags)
++{
++	uint8_t buf[AMUX_MUX_HDR + AMUX_TCP_HDR];
++
++	ctrl_push(buf, tcp_build(buf, sport, dport, seq, ack, flags, NULL, 0));
++}
++
++static void
++version_reply(void)
++{
++	uint8_t buf[20];
++
++	apple_put_be32(buf, MUX_PROTO_VERSION);
++	apple_put_be32(buf + 4, sizeof(buf));
++	apple_put_be32(buf + 8, 2);             /* major */
++	apple_put_be32(buf + 12, 0);            /* minor */
++	apple_put_be32(buf + 16, 0);            /* padding */
++	ctrl_push(buf, sizeof(buf));
++}
++
++/* ------------------------------------------------------------------ */
++/* connections                                                        */
++/* ------------------------------------------------------------------ */
++
++static struct amux_conn *
++conn_find(uint16_t sport, uint16_t dport)
++{
++	for (int i = 0; i < AMUX_MAX_CONN; i++) {
++		if (am.conn[i].used && am.conn[i].sport == sport &&
++		    am.conn[i].dport == dport) {
++			return &am.conn[i];
++		}
++	}
++	return NULL;
++}
++
++static struct amux_conn *
++conn_alloc(void)
++{
++	for (int i = 0; i < AMUX_MAX_CONN; i++) {
++		if (!am.conn[i].used) {
++			return &am.conn[i];
++		}
++	}
++	return NULL;
++}
++
++static struct apple_service *
++service_for_port(uint16_t port)
++{
++	if (port == apple_lockdown_service.port) {
++		return &apple_lockdown_service;
++	}
++	if (port == apple_afc_service.port) {
++		return &apple_afc_service;
++	}
++	return NULL;
++}
++
++static void
++conn_release(struct amux_conn *c)
++{
++	if (!c->used) {
++		return;
++	}
++	if (c->svc != NULL && c->svc->close != NULL && c->ctx != NULL) {
++		c->svc->close(c, c->ctx);
++	}
++	ring_free(&c->in);
++	ring_free(&c->out);
++	memset(c, 0, sizeof(*c));
++}
++
++static void
++conn_release_all(void)
++{
++	for (int i = 0; i < AMUX_MAX_CONN; i++) {
++		conn_release(&am.conn[i]);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* receive                                                            */
++/* ------------------------------------------------------------------ */
++
++static void
++amux_syn(uint16_t hsport, uint16_t hdport, uint32_t seq)
++{
++	struct apple_service *svc = service_for_port(hdport);
++	struct amux_conn *c;
++
++	if (svc == NULL) {
++		printf("APPLE MUX: no service on port %u\n", hdport);
++		mux_send_small(hdport, hsport, 0, seq + 1, TH_RST | TH_ACK);
++		return;
++	}
++	c = conn_alloc();
++	if (c == NULL) {
++		mux_send_small(hdport, hsport, 0, seq + 1, TH_RST | TH_ACK);
++		return;
++	}
++	c->used = true;
++	c->sport = hdport;
++	c->dport = hsport;
++	c->tx_seq = 0x1000u + 0x400u * (uint32_t)(c - &am.conn[0]);
++	c->rx_seq = seq + 1;
++	c->svc = svc;
++	c->ctx = NULL;
++	(void)ring_init(&c->in, AMUX_RING);
++	(void)ring_init(&c->out, AMUX_RING);
++	if (svc->open != NULL) {
++		svc->open(c, &c->ctx);
++	}
++	mux_send_small(c->sport, c->dport, c->tx_seq, c->rx_seq, TH_SYN | TH_ACK);
++	c->tx_seq++;
++	printf("APPLE MUX: connect %u -> host %u (%s)\n", hdport, hsport, svc->name);
++}
++
++static void
++amux_tcp_input(uint8_t *seg, uint32_t len)
++{
++	uint16_t sport, dport;
++	uint32_t seq;
++	uint8_t off, flags, hlen;
++	const uint8_t *pl;
++	uint32_t plen;
++	struct amux_conn *c;
++
++	if (len < AMUX_TCP_HDR) {
++		return;
++	}
++	sport = (uint16_t)((seg[0] << 8) | seg[1]);
++	dport = (uint16_t)((seg[2] << 8) | seg[3]);
++	seq = apple_be32(seg + 4);
++	off = seg[12];
++	flags = seg[13];
++	hlen = (uint8_t)((off >> 4) * 4);
++	if (hlen < AMUX_TCP_HDR) {
++		hlen = AMUX_TCP_HDR;
++	}
++	if (len < hlen) {
++		return;
++	}
++	pl = seg + hlen;
++	plen = len - hlen;
++
++	if (flags & TH_RST) {
++		c = conn_find(dport, sport);
++		if (c != NULL) {
++			conn_release(c);
++		}
++		return;
++	}
++	if (flags & TH_SYN) {
++		amux_syn(sport, dport, seq);
++		return;
++	}
++
++	c = conn_find(dport, sport);
++	if (c == NULL) {
++		mux_send_small(dport, sport, 0, seq + plen, TH_RST | TH_ACK);
++		return;
++	}
++	if (plen != 0) {
++		c->rx_seq = seq + plen;
++		(void)ring_push(&c->in, pl, plen);
++		mux_send_small(c->sport, c->dport, c->tx_seq, c->rx_seq, TH_ACK);
++		if (c->svc != NULL && c->svc->input != NULL) {
++			c->svc->input(c, c->ctx, pl, plen);
++		}
++	}
++	if (flags & TH_FIN) {
++		c->rx_seq = seq + plen + 1;
++		mux_send_small(c->sport, c->dport, c->tx_seq, c->rx_seq, TH_FIN | TH_ACK);
++		conn_release(c);
++	}
++}
++
++static void
++amux_dispatch(uint8_t *pkt, uint32_t total, uint32_t hdr)
++{
++	uint32_t proto = apple_be32(pkt);
++
++	if (total >= AMUX_MUX_HDR) {
++		am.mux_rx_seq = (uint16_t)((pkt[14] << 8) | pkt[15]);
++	}
++
++	switch (proto) {
++	case MUX_PROTO_VERSION: {
++		uint32_t major;
++
++		if (total < hdr + 12) {
++			return;
++		}
++		major = apple_be32(pkt + hdr);
++		if (major != 1 && major != 2) {
++			printf("APPLE MUX: host version %u unsupported\n", major);
++			return;
++		}
++		version_reply();
++		am.neg = true;
++		am.active = false;
++		printf("APPLE MUX: host asked v%u.%u, replied v2.0\n", major,
++		    apple_be32(pkt + hdr + 4));
++		break;
++	}
++	case MUX_PROTO_SETUP:
++		am.active = true;
++		am.mux_tx_seq = 0;
++		am.mux_rx_seq = 0xffff;
++		printf("APPLE MUX: link active\n");
++		break;
++	case MUX_PROTO_CONTROL:
++		break;
++	case MUX_PROTO_TCP:
++		amux_tcp_input(pkt + hdr, total - hdr);
++		break;
++	default:
++		printf("APPLE MUX: protocol %u ignored\n", proto);
++		break;
++	}
++}
++
++void
++apple_usbmux_input(const uint8_t *buf, uint32_t len)
++{
++	if (!am.up || am.rxbuf == NULL || len == 0) {
++		return;
++	}
++	if (len > AMUX_RXBUF - am.rxlen) {
++		printf("APPLE MUX: reassembly overflow, dropping %u\n", am.rxlen);
++		am.rxlen = 0;
++		return;
++	}
++	memcpy(am.rxbuf + am.rxlen, buf, len);
++	am.rxlen += len;
++
++	for (;;) {
++		uint32_t need = am.neg ? AMUX_MUX_HDR : 8;
++		uint32_t total;
++
++		if (am.rxlen < need) {
++			break;
++		}
++		total = apple_be32(am.rxbuf + 4);
++		if (total < need || total > AMUX_RXBUF) {
++			printf("APPLE MUX: bad frame length %u, resync\n", total);
++			am.rxlen = 0;
++			break;
++		}
++		if (am.rxlen < total) {
++			break;
++		}
++		amux_dispatch(am.rxbuf, total, need);
++		if (am.rxlen > total) {
++			memmove(am.rxbuf, am.rxbuf + total, am.rxlen - total);
++		}
++		am.rxlen -= total;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* transmit                                                           */
++/* ------------------------------------------------------------------ */
++
++uint32_t
++apple_usbmux_next_tx(uint8_t *buf, uint32_t maxlen)
++{
++	if (!am.up || maxlen <= AMUX_MUX_HDR + AMUX_TCP_HDR) {
++		return 0;
++	}
++	if (am.ctrl_count != 0) {
++		struct amux_ctrl *c = &am.ctrl[am.ctrl_head];
++		uint32_t len = c->len;
++
++		memcpy(buf, c->data, len);
++		am.ctrl_head = (am.ctrl_head + 1) % AMUX_CTRL_Q;
++		am.ctrl_count--;
++		return len;
++	}
++	for (int i = 0; i < AMUX_MAX_CONN; i++) {
++		struct amux_conn *c = &am.conn[i];
++		uint32_t maxpay, n;
++		uint8_t *span = NULL;
++
++		if (!c->used || c->out.count == 0) {
++			continue;
++		}
++		maxpay = maxlen - (AMUX_MUX_HDR + AMUX_TCP_HDR);
++		n = ring_span(&c->out, &span);
++		if (n > maxpay) {
++			n = maxpay;
++		}
++		if (n == 0) {
++			continue;
++		}
++		tcp_build(buf, c->sport, c->dport, c->tx_seq, c->rx_seq,
++		    TH_ACK | TH_PSH, span, n);
++		ring_drop(&c->out, n);
++		c->tx_seq += n;
++		return AMUX_MUX_HDR + AMUX_TCP_HDR + n;
++	}
++	return 0;
++}
++
++int
++apple_mux_send(void *conn, const void *buf, uint32_t len)
++{
++	struct amux_conn *c = (struct amux_conn *)conn;
++
++	if (c == NULL || !c->used) {
++		return EINVAL;
++	}
++	return (int)ring_push(&c->out, (const uint8_t *)buf, len);
++}
++
++void
++apple_mux_close(void *conn)
++{
++	struct amux_conn *c = (struct amux_conn *)conn;
++
++	if (c == NULL || !c->used) {
++		return;
++	}
++	mux_send_small(c->sport, c->dport, c->tx_seq++, c->rx_seq, TH_FIN | TH_ACK);
++	conn_release(c);
++}
++
++/* ------------------------------------------------------------------ */
++/* link state                                                         */
++/* ------------------------------------------------------------------ */
++
++void
++apple_usbmux_link_up(void)
++{
++	if (am.rxbuf == NULL) {
++		vm_offset_t va = 0;
++		vm_size_t bytes = round_page((vm_size_t)AMUX_RXBUF);
++
++		if (kmem_alloc(kernel_map, &va, bytes,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++			printf("APPLE MUX: no reassembly buffer\n");
++			return;
++		}
++		am.rxbuf = (uint8_t *)va;
++		am.rxbuf_alloc = (uint32_t)bytes;
++	}
++	for (int i = 0; i < AMUX_MAX_CONN; i++) {
++		(void)ring_init(&am.conn[i].in, AMUX_RING);
++		(void)ring_init(&am.conn[i].out, AMUX_RING);
++	}
++	am.up = true;
++	am.neg = false;
++	am.active = false;
++	am.rxlen = 0;
++	am.ctrl_head = 0;
++	am.ctrl_count = 0;
++	am.mux_tx_seq = 0;
++	am.mux_rx_seq = 0;
++	printf("APPLE MUX: link up\n");
++}
++
++void
++apple_usbmux_link_down(void)
++{
++	if (!am.up) {
++		return;
++	}
++	am.up = false;
++	am.neg = false;
++	am.active = false;
++	am.rxlen = 0;
++	am.ctrl_head = 0;
++	am.ctrl_count = 0;
++	conn_release_all();
++	printf("APPLE MUX: link down\n");
++}
++
++int
++apple_usbmux_active(void)
++{
++	return am.active ? 1 : 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/apple_services.c
+@@ -0,0 +1,1171 @@
++/*
++ * apple_services.c -- lockdown and AFC services for the UniXNU Apple USB stack.
++ *
++ * lockdown: XML plist request/response over a mux connection on port 62078.
++ * AFC:      "CFA6LPAA" packets over a mux connection on APPLE_AFC_PORT.
++ *
++ * Both are deliberately plaintext: lockdown answers StartSession with
++ * EnableSessionSSL=false, which is a protocol-legal path and keeps a TLS
++ * stack out of the kernel.  See docs/usb/APPLE_USB_PROTOCOL_RESEARCH.md.
++ *
++ * All of this runs in the gadget event thread, so static buffers are safe.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/types.h>
++#include <sys/errno.h>
++#include <sys/malloc.h>
++#include <sys/kernel.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/vfs_context.h>
++#include <sys/uio.h>
++#include <sys/uio_internal.h>
++#include <sys/dirent.h>
++#include <libkern/libkern.h>
++
++#include "apple_usb.h"
++
++extern int pandora_mkdir(const char *path, int mode);
++extern int pandora_rename(const char *from, const char *to);
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++
++/* ------------------------------------------------------------------ */
++/* byte helpers                                                       */
++/* ------------------------------------------------------------------ */
++
++uint32_t
++apple_be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++	       ((uint32_t)p[2] << 8) | (uint32_t)p[3];
++}
++
++uint64_t
++apple_be64(const uint8_t *p)
++{
++	return ((uint64_t)apple_be32(p) << 32) | apple_be32(p + 4);
++}
++
++uint64_t
++apple_le64(const uint8_t *p)
++{
++	uint64_t v = 0;
++
++	for (int i = 7; i >= 0; i--) {
++		v = (v << 8) | p[i];
++	}
++	return v;
++}
++
++void
++apple_put_be32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++void
++apple_put_be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++void
++apple_put_le64(uint8_t *p, uint64_t v)
++{
++	for (int i = 0; i < 8; i++) {
++		p[i] = (uint8_t)(v >> (8 * i));
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* bounded string builder                                             */
++/* ------------------------------------------------------------------ */
++
++struct abuf {
++	char    *p;
++	uint32_t len;
++	uint32_t cap;
++	bool     ovf;
++};
++
++static void
++ab_init(struct abuf *b, char *buf, uint32_t cap)
++{
++	b->p = buf;
++	b->len = 0;
++	b->cap = cap;
++	b->ovf = false;
++	if (cap != 0) {
++		buf[0] = '\0';
++	}
++}
++
++static void
++ab_raw(struct abuf *b, const char *s, uint32_t n)
++{
++	if (b->ovf || b->len + n >= b->cap) {
++		b->ovf = true;
++		return;
++	}
++	memcpy(b->p + b->len, s, n);
++	b->len += n;
++	b->p[b->len] = '\0';
++}
++
++static void
++ab_puts(struct abuf *b, const char *s)
++{
++	ab_raw(b, s, (uint32_t)strlen(s));
++}
++
++static void
++ab_kv_str(struct abuf *b, const char *k, const char *v)
++{
++	ab_puts(b, "<key>");
++	ab_puts(b, k);
++	ab_puts(b, "</key><string>");
++	ab_puts(b, v != NULL ? v : "");
++	ab_puts(b, "</string>");
++}
++
++static void
++ab_kv_int(struct abuf *b, const char *k, long long v)
++{
++	char tmp[32];
++
++	snprintf(tmp, sizeof(tmp), "%lld", v);
++	ab_puts(b, "<key>");
++	ab_puts(b, k);
++	ab_puts(b, "</key><integer>");
++	ab_puts(b, tmp);
++	ab_puts(b, "</integer>");
++}
++
++static void
++ab_kv_bool(struct abuf *b, const char *k, int v)
++{
++	ab_puts(b, "<key>");
++	ab_puts(b, k);
++	ab_puts(b, v ? "</key><true/>" : "</key><false/>");
++}
++
++static void
++ab_wrap_begin(struct abuf *b)
++{
++	ab_puts(b, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
++	    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\"><dict>");
++}
++
++static void
++ab_wrap_end(struct abuf *b)
++{
++	ab_puts(b, "</dict></plist>\n");
++}
++
++/* ------------------------------------------------------------------ */
++/* very small plist reader                                            */
++/* ------------------------------------------------------------------ */
++
++static const char *
++mem_find(const char *hay, uint32_t haylen, const char *needle)
++{
++	uint32_t n = (uint32_t)strlen(needle);
++
++	if (n == 0 || haylen < n) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i + n <= haylen; i++) {
++		if (memcmp(hay + i, needle, n) == 0) {
++			return hay + i;
++		}
++	}
++	return NULL;
++}
++
++/*
++ * Find <key>KEY</key> and return the text of the element that follows.
++ * Handles <string>, <integer>, <real>, <true/> and <false/>.
++ */
++static int
++plist_get(const char *xml, uint32_t len, const char *key, char *out, uint32_t outcap)
++{
++	char tag[96];
++	const char *p, *end;
++	uint32_t n;
++
++	snprintf(tag, sizeof(tag), "<key>%s</key>", key);
++	p = mem_find(xml, len, tag);
++	if (p == NULL) {
++		return 0;
++	}
++	end = xml + len;
++	p += strlen(tag);
++	while (p < end && (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')) {
++		p++;
++	}
++	if (p + 8 <= end && memcmp(p, "<string>", 8) == 0) {
++		p += 8;
++		const char *e = mem_find(p, (uint32_t)(end - p), "</string>");
++		if (e == NULL) {
++			return 0;
++		}
++		n = (uint32_t)(e - p);
++		if (n >= outcap) {
++			n = outcap - 1;
++		}
++		memcpy(out, p, n);
++		out[n] = '\0';
++		return 1;
++	}
++	if (p + 9 <= end && memcmp(p, "<integer>", 9) == 0) {
++		p += 9;
++		const char *e = mem_find(p, (uint32_t)(end - p), "</integer>");
++		if (e == NULL) {
++			return 0;
++		}
++		n = (uint32_t)(e - p);
++		if (n >= outcap) {
++			n = outcap - 1;
++		}
++		memcpy(out, p, n);
++		out[n] = '\0';
++		return 1;
++	}
++	if (p + 6 <= end && memcmp(p, "<true/>", 7) == 0) {
++		snprintf(out, outcap, "1");
++		return 1;
++	}
++	if (p + 7 <= end && memcmp(p, "<false/>", 8) == 0) {
++		snprintf(out, outcap, "0");
++		return 1;
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* lockdown                                                           */
++/* ------------------------------------------------------------------ */
++
++#define LOCK_PORT        62078
++#define LOCK_BUF         4096
++#define LOCK_SLOTS       2
++
++struct lock_ctx {
++	bool     used;
++	uint32_t len;
++	char     buf[LOCK_BUF];
++};
++
++static struct lock_ctx lock_pool[LOCK_SLOTS];
++static char lock_out[2048];
++static int  lock_paired;
++
++static void
++lock_open(void *conn, void **ctx)
++{
++	for (int i = 0; i < LOCK_SLOTS; i++) {
++		if (!lock_pool[i].used) {
++			lock_pool[i].used = true;
++			lock_pool[i].len = 0;
++			*ctx = &lock_pool[i];
++			printf("APPLE LOCKDOWN: session opened\n");
++			return;
++		}
++	}
++	*ctx = NULL;
++	apple_mux_close(conn);
++}
++
++static void
++lock_close(void *conn, void *ctx)
++{
++	struct lock_ctx *c = (struct lock_ctx *)ctx;
++
++	(void)conn;
++	if (c != NULL) {
++		c->used = false;
++		c->len = 0;
++	}
++	printf("APPLE LOCKDOWN: session closed\n");
++}
++
++static void
++lock_send(void *conn, struct abuf *b)
++{
++	if (b->ovf) {
++		printf("APPLE LOCKDOWN: response truncated\n");
++		return;
++	}
++	(void)apple_mux_send(conn, b->p, b->len);
++}
++
++static void
++lock_empty(void *conn)
++{
++	struct abuf b;
++
++	ab_init(&b, lock_out, sizeof(lock_out));
++	ab_wrap_begin(&b);
++	ab_wrap_end(&b);
++	lock_send(conn, &b);
++}
++
++static void
++lock_error(void *conn, const char *err)
++{
++	struct abuf b;
++
++	ab_init(&b, lock_out, sizeof(lock_out));
++	ab_wrap_begin(&b);
++	ab_kv_str(&b, "Error", err);
++	ab_wrap_end(&b);
++	lock_send(conn, &b);
++}
++
++static const char *
++lock_value_for(const char *key)
++{
++	if (strcmp(key, "ProductVersion") == 0) {
++		return "16.0";
++	}
++	if (strcmp(key, "BuildVersion") == 0) {
++		return "20A000";
++	}
++	if (strcmp(key, "ProductType") == 0) {
++		return "iPhone15,2";
++	}
++	if (strcmp(key, "ProductName") == 0) {
++		return "iPhone OS";
++	}
++	if (strcmp(key, "HardwareModel") == 0) {
++		return "D63AP";
++	}
++	if (strcmp(key, "UniqueDeviceID") == 0) {
++		return "00008120-000A1B2C3D4E5F60";
++	}
++	if (strcmp(key, "UniqueChipID") == 0) {
++		return "1234567890123";
++	}
++	if (strcmp(key, "SerialNumber") == 0) {
++		return "F2LXUNIXNU01";
++	}
++	if (strcmp(key, "ModelNumber") == 0) {
++		return "MQ0E3";
++	}
++	if (strcmp(key, "RegionInfo") == 0) {
++		return "CH/A";
++	}
++	if (strcmp(key, "CPUArchitecture") == 0) {
++		return "arm64e";
++	}
++	return NULL;
++}
++
++static void
++lock_request(void *conn, struct lock_ctx *c)
++{
++	char req[64];
++	char key[64];
++	char svc[96];
++	struct abuf b;
++
++	if (!plist_get(c->buf, c->len, "Request", req, sizeof(req))) {
++		printf("APPLE LOCKDOWN: request without Request key\n");
++		lock_empty(conn);
++		return;
++	}
++
++	if (strcmp(req, "QueryType") == 0) {
++		ab_init(&b, lock_out, sizeof(lock_out));
++		ab_wrap_begin(&b);
++		ab_kv_str(&b, "Type", "com.apple.mobile.lockdown");
++		ab_wrap_end(&b);
++		lock_send(conn, &b);
++		return;
++	}
++	if (strcmp(req, "GetValue") == 0) {
++		const char *v;
++
++		if (!plist_get(c->buf, c->len, "Key", key, sizeof(key))) {
++			lock_empty(conn);
++			return;
++		}
++		v = lock_value_for(key);
++		if (v == NULL) {
++			/* Certificates are not implemented yet; the host treats a
++			 * missing key as "not available" instead of aborting. */
++			printf("APPLE LOCKDOWN: GetValue %s -> unsupported\n", key);
++			lock_empty(conn);
++			return;
++		}
++		ab_init(&b, lock_out, sizeof(lock_out));
++		ab_wrap_begin(&b);
++		ab_kv_str(&b, "Key", key);
++		ab_kv_str(&b, "Value", v);
++		ab_wrap_end(&b);
++		lock_send(conn, &b);
++		return;
++	}
++	if (strcmp(req, "Pair") == 0) {
++		printf("APPLE LOCKDOWN: Pair accepted (no cryptographic pairing)\n");
++		lock_paired = 1;
++		ab_init(&b, lock_out, sizeof(lock_out));
++		ab_wrap_begin(&b);
++		ab_kv_int(&b, "EscrowBag", 0);
++		ab_wrap_end(&b);
++		lock_send(conn, &b);
++		return;
++	}
++	if (strcmp(req, "ValidatePair") == 0 || strcmp(req, "SetValue") == 0) {
++		lock_empty(conn);
++		return;
++	}
++	if (strcmp(req, "StartSession") == 0) {
++		ab_init(&b, lock_out, sizeof(lock_out));
++		ab_wrap_begin(&b);
++		ab_kv_bool(&b, "EnableSessionSSL", 0);
++		ab_kv_str(&b, "SessionID", "1");
++		ab_wrap_end(&b);
++		lock_send(conn, &b);
++		return;
++	}
++	if (strcmp(req, "StartService") == 0) {
++		if (!plist_get(c->buf, c->len, "Service", svc, sizeof(svc))) {
++			lock_error(conn, "InvalidService");
++			return;
++		}
++		if (strcmp(svc, "com.apple.afc") != 0) {
++			printf("APPLE LOCKDOWN: StartService %s unsupported\n", svc);
++			lock_error(conn, "InvalidService");
++			return;
++		}
++		ab_init(&b, lock_out, sizeof(lock_out));
++		ab_wrap_begin(&b);
++		ab_kv_str(&b, "Service", "com.apple.afc");
++		ab_kv_int(&b, "Port", APPLE_AFC_PORT);
++		ab_kv_bool(&b, "EnableServiceSSL", 0);
++		ab_wrap_end(&b);
++		lock_send(conn, &b);
++		printf("APPLE LOCKDOWN: AFC handed out on port %u\n", APPLE_AFC_PORT);
++		return;
++	}
++	printf("APPLE LOCKDOWN: unsupported request %s\n", req);
++	lock_empty(conn);
++}
++
++static void
++lock_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
++{
++	struct lock_ctx *c = (struct lock_ctx *)ctx;
++	const char *p;
++	uint32_t end;
++
++	if (c == NULL) {
++		return;
++	}
++	if (len > LOCK_BUF - c->len) {
++		printf("APPLE LOCKDOWN: request too large, dropping\n");
++		c->len = 0;
++		return;
++	}
++	memcpy(c->buf + c->len, buf, len);
++	c->len += len;
++
++	/* One XML document per burst; the host waits for our answer before
++	 * sending the next request, so there is never more than one pending. */
++	p = mem_find(c->buf, c->len, "</plist>");
++	if (p == NULL) {
++		return;
++	}
++	end = (uint32_t)(p - c->buf) + (uint32_t)strlen("</plist>");
++	c->len = end;
++	c->buf[c->len] = '\0';
++	lock_request(conn, c);
++	c->len = 0;
++}
++
++struct apple_service apple_lockdown_service = {
++	.name  = "lockdown",
++	.port  = LOCK_PORT,
++	.open  = lock_open,
++	.input = lock_input,
++	.close = lock_close,
++};
++
++/* ------------------------------------------------------------------ */
++/* AFC                                                                */
++/* ------------------------------------------------------------------ */
++
++#define AFC_ROOT        "/private/var/mobile/Media/UniXNU"
++#define AFC_HDR         40
++#define AFC_BUF         8192
++#define AFC_SLOTS       2
++#define AFC_FILES       16
++#define AFC_IO_MAX      65536
++
++#define AFC_OP_STATUS    0x01
++#define AFC_OP_DATA      0x02
++#define AFC_OP_READ_DIR  0x03
++#define AFC_OP_REMOVE    0x08
++#define AFC_OP_MAKE_DIR  0x09
++#define AFC_OP_FILE_INFO 0x0A
++#define AFC_OP_DEVINFO   0x0B
++#define AFC_OP_FILE_OPEN 0x0D
++#define AFC_OP_FILE_OPEN_RES 0x0E
++#define AFC_OP_FILE_READ 0x0F
++#define AFC_OP_FILE_WRITE 0x10
++#define AFC_OP_FILE_SEEK 0x11
++#define AFC_OP_FILE_TELL 0x12
++#define AFC_OP_FILE_TELL_RES 0x13
++#define AFC_OP_FILE_CLOSE 0x14
++#define AFC_OP_RENAME    0x18
++
++#define AFC_E_SUCCESS    0
++#define AFC_E_UNKNOWN    1
++#define AFC_E_INVALID    7
++#define AFC_E_NOTFOUND   8
++#define AFC_E_ISDIR      9
++#define AFC_E_PERM      10
++#define AFC_E_NOSPACE   18
++#define AFC_E_IO        20
++
++struct afc_file {
++	bool     used;
++	vnode_t  vp;
++	uint64_t off;
++};
++
++struct afc_ctx {
++	bool     used;
++	uint32_t len;
++	uint64_t pktno;
++	char     buf[AFC_BUF];
++	struct afc_file files[AFC_FILES];
++};
++
++static struct afc_ctx afc_pool[AFC_SLOTS];
++static char     afc_out[AFC_HDR + AFC_BUF];
++static uint8_t  afc_io[AFC_IO_MAX];
++static bool     afc_root_ready;
++
++static int
++afc_make_root(void)
++{
++	if (afc_root_ready) {
++		return 0;
++	}
++	(void)pandora_mkdir(AFC_ROOT, 0755);
++	afc_root_ready = true;
++	return 0;
++}
++
++/*
++ * Map an AFC path onto the sandbox.  AFC paths are absolute inside the
++ * sandbox ("/", "/DCIM"); ".." is rejected outright.
++ */
++static int
++afc_path(const char *rel, char *out, size_t cap)
++{
++	size_t n = 0;
++	bool dotdot = false;
++
++	afc_make_root();
++	while (*rel == '/') {
++		rel++;
++	}
++	/* reject any ".." component */
++	for (const char *p = rel; *p != '\0'; p++) {
++		if (p[0] == '.' && p[1] == '.' &&
++		    (p == rel || p[-1] == '/') && (p[2] == '/' || p[2] == '\0')) {
++			dotdot = true;
++			break;
++		}
++	}
++	if (dotdot) {
++		return EPERM;
++	}
++	n = (size_t)snprintf(out, cap, "%s/%s", AFC_ROOT, rel);
++	if (n >= cap) {
++		return ENAMETOOLONG;
++	}
++	return 0;
++}
++
++static void
++afc_reply(void *conn, struct afc_ctx *c, uint64_t op, const void *payload, uint32_t len)
++{
++	uint8_t *h = (uint8_t *)afc_out;
++	uint32_t total = AFC_HDR + len;
++
++	if (len > AFC_BUF) {
++		len = AFC_BUF;
++		total = AFC_HDR + len;
++	}
++	memcpy(afc_out, "CFA6LPAA", 8);
++	apple_put_le64(h + 8, total);
++	apple_put_le64(h + 16, total);
++	apple_put_le64(h + 24, c->pktno++);
++	apple_put_le64(h + 32, op);
++	if (len != 0 && payload != NULL) {
++		memcpy(afc_out + AFC_HDR, payload, len);
++	}
++	(void)apple_mux_send(conn, afc_out, total);
++}
++
++static void
++afc_status(void *conn, struct afc_ctx *c, uint64_t status)
++{
++	uint8_t st[8];
++
++	apple_put_le64(st, status);
++	afc_reply(conn, c, AFC_OP_STATUS, st, sizeof(st));
++}
++
++static int
++afc_errno_to_afc(int err)
++{
++	switch (err) {
++	case 0:
++		return AFC_E_SUCCESS;
++	case ENOENT:
++		return AFC_E_NOTFOUND;
++	case EISDIR:
++		return AFC_E_ISDIR;
++	case EACCES:
++	case EPERM:
++		return AFC_E_PERM;
++	case ENOSPC:
++		return AFC_E_NOSPACE;
++	default:
++		return AFC_E_IO;
++	}
++}
++
++static struct afc_file *
++afc_file_get(struct afc_ctx *c, uint64_t handle)
++{
++	uint32_t idx = (uint32_t)handle;
++
++	if (idx >= AFC_FILES || !c->files[idx].used) {
++		return NULL;
++	}
++	return &c->files[idx];
++}
++
++static struct afc_file *
++afc_file_alloc(struct afc_ctx *c, vnode_t vp)
++{
++	for (uint32_t i = 0; i < AFC_FILES; i++) {
++		if (!c->files[i].used) {
++			c->files[i].used = true;
++			c->files[i].vp = vp;
++			c->files[i].off = 0;
++			return &c->files[i];
++		}
++	}
++	return NULL;
++}
++
++/* Append "key\0value\0" to a buffer, returns the new length. */
++static uint32_t
++afc_kv(char *buf, uint32_t cap, uint32_t off, const char *k, const char *v)
++{
++	uint32_t kn = (uint32_t)strlen(k) + 1;
++	uint32_t vn = (uint32_t)strlen(v) + 1;
++
++	if (off + kn + vn > cap) {
++		return off;
++	}
++	memcpy(buf + off, k, kn);
++	off += kn;
++	memcpy(buf + off, v, vn);
++	off += vn;
++	return off;
++}
++
++static void
++afc_open(void *conn, void **ctx)
++{
++	for (int i = 0; i < AFC_SLOTS; i++) {
++		if (!afc_pool[i].used) {
++			afc_pool[i].used = true;
++			afc_pool[i].len = 0;
++			afc_pool[i].pktno = 0;
++			memset(afc_pool[i].files, 0, sizeof(afc_pool[i].files));
++			*ctx = &afc_pool[i];
++			printf("APPLE AFC: session opened\n");
++			return;
++		}
++	}
++	*ctx = NULL;
++	apple_mux_close(conn);
++}
++
++static void
++afc_close(void *conn, void *ctx)
++{
++	struct afc_ctx *c = (struct afc_ctx *)ctx;
++	vfs_context_t vctx = vfs_context_kernel();
++
++	(void)conn;
++	if (c == NULL) {
++		return;
++	}
++	for (uint32_t i = 0; i < AFC_FILES; i++) {
++		if (c->files[i].used && c->files[i].vp != NULL) {
++			vnode_close(c->files[i].vp, 0, vctx);
++			c->files[i].used = false;
++			c->files[i].vp = NULL;
++		}
++	}
++	c->used = false;
++	c->len = 0;
++	printf("APPLE AFC: session closed\n");
++}
++
++static void
++afc_devinfo(void *conn, struct afc_ctx *c)
++{
++	uint32_t n = 0;
++
++	memset(afc_io, 0, 512);
++	n = afc_kv((char *)afc_io, 512, n, "Model", "UniXNU");
++	n = afc_kv((char *)afc_io, 512, n, "FSTotalBytes", "34359738368");
++	n = afc_kv((char *)afc_io, 512, n, "FSFreeBytes", "17179869184");
++	n = afc_kv((char *)afc_io, 512, n, "FSBlockSize", "4096");
++	afc_reply(conn, c, AFC_OP_DATA, afc_io, n);
++}
++
++static void
++afc_file_info(void *conn, struct afc_ctx *c, const char *rel)
++{
++	char path[512];
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	char num[32];
++	uint32_t n = 0;
++	int err;
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_type);
++	VATTR_WANTED(&va, va_mode);
++	VATTR_WANTED(&va, va_data_size);
++	VATTR_WANTED(&va, va_nlink);
++	VATTR_WANTED(&va, va_modify_time);
++	VATTR_WANTED(&va, va_create_time);
++	err = vnode_getattr(vp, &va, vctx);
++	vnode_put(vp);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++
++	memset(afc_io, 0, 1024);
++	snprintf(num, sizeof(num), "%lld", (long long)va.va_data_size);
++	n = afc_kv((char *)afc_io, 1024, n, "st_size", num);
++	snprintf(num, sizeof(num), "%d", (int)((va.va_data_size + 511) / 512));
++	n = afc_kv((char *)afc_io, 1024, n, "st_blocks", num);
++	snprintf(num, sizeof(num), "%d", (int)va.va_nlink);
++	n = afc_kv((char *)afc_io, 1024, n, "st_nlink", num);
++	n = afc_kv((char *)afc_io, 1024, n, "st_ifmt",
++	    va.va_type == VDIR ? "S_IFDIR" :
++	    va.va_type == VLNK ? "S_IFLNK" : "S_IFREG");
++	snprintf(num, sizeof(num), "%lld", (long long)va.va_modify_time.tv_sec * 1000000000LL);
++	n = afc_kv((char *)afc_io, 1024, n, "st_mtime", num);
++	snprintf(num, sizeof(num), "%lld", (long long)va.va_create_time.tv_sec * 1000000000LL);
++	n = afc_kv((char *)afc_io, 1024, n, "st_birthtime", num);
++	afc_reply(conn, c, AFC_OP_DATA, afc_io, n);
++}
++
++static void
++afc_read_dir(void *conn, struct afc_ctx *c, const char *rel)
++{
++	char path[512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	UIO_STACKBUF(uio_store, 1);
++	uio_t uio;
++	uint32_t out = 0;
++	int eofflag = 0, numdirent = 0, err;
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	if (vnode_vtype(vp) != VDIR) {
++		vnode_put(vp);
++		afc_status(conn, c, AFC_E_ISDIR);
++		return;
++	}
++	memset(afc_io, 0, 4096);
++	uio = uio_createwithbuffer(1, 0, UIO_SYSSPACE, UIO_READ, uio_store,
++	    sizeof(uio_store));
++	if (uio == NULL) {
++		vnode_put(vp);
++		afc_status(conn, c, AFC_E_IO);
++		return;
++	}
++	uio_addiov(uio, (user_addr_t)(uintptr_t)afc_io, 4096);
++	err = VNOP_READDIR(vp, uio, 0, &eofflag, &numdirent, vctx);
++	vnode_put(vp);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	{
++		uint32_t used = 4096 - (uint32_t)uio_resid(uio);
++
++		for (uint32_t o = 0; o + sizeof(struct dirent) <= used; ) {
++			struct dirent *dp = (struct dirent *)(void *)(afc_io + o);
++
++			if (dp->d_reclen == 0 || o + dp->d_reclen > used) {
++				break;
++			}
++			if (dp->d_namlen != 0 && dp->d_name[0] != '\0') {
++				uint32_t n = (uint32_t)dp->d_namlen + 1;
++				if (out + n + 1 > 4096) {
++					break;
++				}
++				memcpy(afc_io + out, dp->d_name, n);
++				out += n;
++			}
++			o += dp->d_reclen;
++		}
++	}
++	/* the list is terminated by an empty string */
++	if (out + 1 <= 4096) {
++		afc_io[out++] = '\0';
++	}
++	afc_reply(conn, c, AFC_OP_DATA, afc_io, out);
++}
++
++static void
++afc_file_open(void *conn, struct afc_ctx *c, const char *rel, uint32_t mode)
++{
++	char path[512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	struct afc_file *f;
++	int flags, err;
++
++	switch (mode) {
++	case 1: flags = FREAD; break;
++	case 2: flags = FREAD | FWRITE; break;
++	case 3: flags = FWRITE | O_CREAT | O_TRUNC; break;
++	case 4: flags = FREAD | FWRITE | O_CREAT | O_TRUNC; break;
++	case 5: flags = FWRITE | O_CREAT | O_APPEND; break;
++	case 6: flags = FREAD | FWRITE | O_CREAT | O_APPEND; break;
++	default: flags = FREAD; break;
++	}
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_open(path, flags, 0644, 0, &vp, vctx);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	f = afc_file_alloc(c, vp);
++	if (f == NULL) {
++		vnode_close(vp, flags, vctx);
++		afc_status(conn, c, AFC_E_UNKNOWN);
++		return;
++	}
++	{
++		uint8_t h[8];
++		apple_put_le64(h, (uint64_t)(f - &c->files[0]));
++		afc_reply(conn, c, AFC_OP_FILE_OPEN_RES, h, sizeof(h));
++	}
++}
++
++static void
++afc_file_read(void *conn, struct afc_ctx *c, uint64_t handle, uint64_t want)
++{
++	struct afc_file *f = afc_file_get(c, handle);
++	vfs_context_t vctx = vfs_context_kernel();
++	int resid = 0, err;
++
++	if (f == NULL) {
++		afc_status(conn, c, AFC_E_INVALID);
++		return;
++	}
++	if (want > AFC_IO_MAX) {
++		want = AFC_IO_MAX;
++	}
++	if (want == 0) {
++		afc_reply(conn, c, AFC_OP_DATA, NULL, 0);
++		return;
++	}
++	err = vn_rdwr(UIO_READ, f->vp, (caddr_t)(uintptr_t)afc_io, (int)want,
++	    (off_t)f->off, UIO_SYSSPACE, 0, vfs_context_ucred(vctx),
++	    &resid, vfs_context_proc(vctx));
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	{
++		uint32_t got = (uint32_t)((int)want - resid);
++
++		f->off += got;
++		afc_reply(conn, c, AFC_OP_DATA, afc_io, got);
++	}
++}
++
++static void
++afc_file_write(void *conn, struct afc_ctx *c, uint64_t handle, const uint8_t *data,
++    uint32_t len)
++{
++	struct afc_file *f = afc_file_get(c, handle);
++	vfs_context_t vctx = vfs_context_kernel();
++	int resid = 0, err;
++
++	if (f == NULL) {
++		afc_status(conn, c, AFC_E_INVALID);
++		return;
++	}
++	if (len > AFC_IO_MAX) {
++		len = AFC_IO_MAX;
++	}
++	memcpy(afc_io, data, len);
++	err = vn_rdwr(UIO_WRITE, f->vp, (caddr_t)(uintptr_t)afc_io, (int)len,
++	    (off_t)f->off, UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(vctx),
++	    &resid, vfs_context_proc(vctx));
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	f->off += len;
++	afc_status(conn, c, AFC_E_SUCCESS);
++}
++
++static void
++afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint32_t len)
++{
++	switch (op) {
++	case AFC_OP_DEVINFO:
++		afc_devinfo(conn, c);
++		break;
++	case AFC_OP_READ_DIR:
++		afc_read_dir(conn, c, (const char *)pl);
++		break;
++	case AFC_OP_FILE_INFO:
++		afc_file_info(conn, c, (const char *)pl);
++		break;
++	case AFC_OP_FILE_OPEN: {
++		size_t nlen = strlen((const char *)pl) + 1;
++		uint32_t mode;
++
++		if (len < nlen + 4) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		/* The AFC open payload is "path\0" followed by a little-endian u32. */
++		mode = (uint32_t)pl[nlen] | ((uint32_t)pl[nlen + 1] << 8) |
++		       ((uint32_t)pl[nlen + 2] << 16) | ((uint32_t)pl[nlen + 3] << 24);
++		afc_file_open(conn, c, (const char *)pl, mode);
++		break;
++	}
++	case AFC_OP_FILE_READ:
++		if (len < 16) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		afc_file_read(conn, c, apple_le64(pl), apple_le64(pl + 8));
++		break;
++	case AFC_OP_FILE_WRITE:
++		if (len < 8) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		afc_file_write(conn, c, apple_le64(pl), pl + 8, len - 8);
++		break;
++	case AFC_OP_FILE_CLOSE: {
++		struct afc_file *f;
++
++		if (len < 8) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		f = afc_file_get(c, apple_le64(pl));
++		if (f == NULL) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		vnode_close(f->vp, 0, vfs_context_kernel());
++		f->used = false;
++		f->vp = NULL;
++		afc_status(conn, c, AFC_E_SUCCESS);
++		break;
++	}
++	case AFC_OP_FILE_SEEK: {
++		struct afc_file *f;
++
++		if (len < 16) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		f = afc_file_get(c, apple_le64(pl));
++		if (f == NULL) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		f->off = apple_le64(pl + 8);
++		afc_status(conn, c, AFC_E_SUCCESS);
++		break;
++	}
++	case AFC_OP_FILE_TELL: {
++		struct afc_file *f;
++		uint8_t out[8];
++
++		if (len < 8) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		f = afc_file_get(c, apple_le64(pl));
++		if (f == NULL) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		apple_put_le64(out, f->off);
++		afc_reply(conn, c, AFC_OP_FILE_TELL_RES, out, sizeof(out));
++		break;
++	}
++	case AFC_OP_MAKE_DIR: {
++		char path[512];
++
++		if (afc_path((const char *)pl, path, sizeof(path)) != 0) {
++			afc_status(conn, c, AFC_E_PERM);
++			break;
++		}
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(pandora_mkdir(path, 0755)));
++		break;
++	}
++	case AFC_OP_REMOVE: {
++		char path[512];
++		vnode_t vp = NULLVP;
++		vfs_context_t vctx = vfs_context_kernel();
++		int err;
++
++		if (afc_path((const char *)pl, path, sizeof(path)) != 0) {
++			afc_status(conn, c, AFC_E_PERM);
++			break;
++		}
++		err = vnode_lookup(path, 0, &vp, vctx);
++		if (err != 0) {
++			afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++			break;
++		}
++		err = unlink1(vctx, vp, USER_ADDR_NULL, UIO_SYSSPACE, 0);
++		vnode_put(vp);
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		break;
++	}
++	case AFC_OP_RENAME: {
++		char from[512], to[512];
++		size_t n = strlen((const char *)pl) + 1;
++
++		if (afc_path((const char *)pl, from, sizeof(from)) != 0 ||
++		    afc_path((const char *)pl + n, to, sizeof(to)) != 0) {
++			afc_status(conn, c, AFC_E_PERM);
++			break;
++		}
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(pandora_rename(from, to)));
++		break;
++	}
++	default:
++		printf("APPLE AFC: unsupported operation 0x%llx\n", (unsigned long long)op);
++		afc_status(conn, c, AFC_E_UNKNOWN);
++		break;
++	}
++}
++
++static void
++afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
++{
++	struct afc_ctx *c = (struct afc_ctx *)ctx;
++
++	if (c == NULL) {
++		return;
++	}
++	if (len > AFC_BUF - c->len) {
++		printf("APPLE AFC: packet too large, dropping\n");
++		c->len = 0;
++		return;
++	}
++	memcpy(c->buf + c->len, buf, len);
++	c->len += len;
++
++	for (;;) {
++		uint64_t total, this_len, op;
++		uint32_t plen;
++
++		if (c->len < AFC_HDR) {
++			break;
++		}
++		if (memcmp(c->buf, "CFA6LPAA", 8) != 0) {
++			printf("APPLE AFC: bad magic, resync\n");
++			c->len = 0;
++			break;
++		}
++		total = apple_le64((const uint8_t *)c->buf + 8);
++		this_len = apple_le64((const uint8_t *)c->buf + 16);
++		op = apple_le64((const uint8_t *)c->buf + 32);
++		if (total < AFC_HDR || total > AFC_BUF || this_len < AFC_HDR ||
++		    this_len > total) {
++			printf("APPLE AFC: bad lengths %llu/%llu\n",
++			    (unsigned long long)total, (unsigned long long)this_len);
++			c->len = 0;
++			break;
++		}
++		if (c->len < total) {
++			break;
++		}
++		plen = (uint32_t)(this_len - AFC_HDR);
++		/* keep the request readable for the handler: it is NUL terminated
++		 * only when the host says so, so make sure of it */
++		if (plen != 0) {
++			c->buf[AFC_HDR + plen] = '\0';
++		}
++		afc_dispatch(conn, c, op, (const uint8_t *)c->buf + AFC_HDR, plen);
++		if (c->len > total) {
++			memmove(c->buf, c->buf + total, c->len - total);
++		}
++		c->len -= (uint32_t)total;
++	}
++}
++
++struct apple_service apple_afc_service = {
++	.name  = "afc",
++	.port  = APPLE_AFC_PORT,
++	.open  = afc_open,
++	.input = afc_input,
++	.close = afc_close,
++};
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -162,6 +162,8 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/apple_usbmux.c			standard
++bsd/dev/apple_services.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
