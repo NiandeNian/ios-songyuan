@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -241,11 +241,11 @@
+ 		out[n] = '\0';
+ 		return 1;
+ 	}
+-	if (p + 6 <= end && memcmp(p, "<true/>", 7) == 0) {
++	if (p + 7 <= end && memcmp(p, "<true/>", 7) == 0) {
+ 		snprintf(out, outcap, "1");
+ 		return 1;
+ 	}
+-	if (p + 7 <= end && memcmp(p, "<false/>", 8) == 0) {
++	if (p + 8 <= end && memcmp(p, "<false/>", 8) == 0) {
+ 		snprintf(out, outcap, "0");
+ 		return 1;
+ 	}
+@@ -493,7 +493,9 @@
+ 	}
+ 	end = (uint32_t)(p - c->buf) + (uint32_t)strlen("</plist>");
+ 	c->len = end;
+-	c->buf[c->len] = '\0';
++	if (c->len < LOCK_BUF) {
++		c->buf[c->len] = '\0';
++	}
+ 	lock_request(conn, c);
+ 	c->len = 0;
+ }
+@@ -1217,7 +1219,7 @@
+ 		plen = (uint32_t)(this_len - AFC_HDR);
+ 		/* keep the request readable for the handler: it is NUL terminated
+ 		 * only when the host says so, so make sure of it */
+-		if (plen != 0) {
++		if (plen != 0 && AFC_HDR + plen < AFC_BUF) {
+ 			c->buf[AFC_HDR + plen] = '\0';
+ 		}
+ 		afc_dispatch(conn, c, op, (const uint8_t *)c->buf + AFC_HDR, plen);
