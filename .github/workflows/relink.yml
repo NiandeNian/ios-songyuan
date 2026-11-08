@@ -60,19 +60,22 @@ jobs:
           echo "objects: $(find relink/ci/obj -name '*.o' | wc -l)"
           echo "drivers: $(ls relink/drivers/*.o | wc -l)"
 
-          # The four patched objects come from the CI build of the same patched
-          # source tree.  kern_cs is not in relink_nezha_kernel.py's replacement
-          # list, so it must be replaced inside the upstream object directory.
-          # The other three are also copied over the Nezha driver objects so the
-          # replacement path picks them up too.
+          # Only the USB gadget probe (0457) and the code-signing bypass
+          # (0458) are needed here.  Do NOT replace pandora_gpu.o: the local
+          # Nezha driver object carries the GPU MMIO setup that boots on this
+          # board, while the CI object faults at +0xf004 in GPU init.  0459
+          # (GPU fence recovery) is deliberately left out of this build.
+          # kern_cs is not in the script's replacement list, so it must be
+          # replaced inside the upstream object directory; the other two are
+          # also copied over the Nezha driver objects.
           D=relink/ci/obj/DEVELOPMENT_ARM64_PANDORA/bsd/DEVELOPMENT
-          for o in sweet_ufs kern_cs kern_exec pandora_gpu; do
+          for o in sweet_ufs kern_cs kern_exec; do
             test -f "relink/patched/bsd/DEVELOPMENT/$o.o"
             cp "relink/patched/bsd/DEVELOPMENT/$o.o" "$D/$o.o"
             driver=$(ls relink/drivers/*__$o.c.o 2>/dev/null || true)
             if [ -n "$driver" ]; then cp "relink/patched/bsd/DEVELOPMENT/$o.o" "$driver"; fi
           done
-          echo "patched objects installed"
+          echo "patched USB/sideload objects installed (pandora_gpu.o kept from Nezha drivers)"
 
       - name: Relink with Apple ld64
         run: |
