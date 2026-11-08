@@ -1,0 +1,259 @@
+Subject: [PATCH] runtime: reclaim all completed idle pools before command-buffer growth
+
+Share one warm-handle budget across idle pools and reclaim it on encoding threads
+before another allocation. A completed pool need not be reused itself to release
+its excess command streams. Active and pending pools remain untouched.
+Add allocation and idle-reclamation counters to distinguish retained from live work.
+
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2362,6 +2362,9 @@
+         if let Some(buffer) = pool.reuse(level) {
+             return Ok(buffer);
+         }
++        // Completed pools may have arrived while this command buffer was encoding. Reclaim
++        // their excess streams before growing this live pool; never touch its own recordings.
++        device.shared().spares.reclaim_completed(device.shared());
+         let info = vk::CommandBufferAllocateInfo::default()
+             .command_pool(pool.raw)
+             .level(level)
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -734,6 +734,9 @@
+             self.0.vk().allocate_command_buffers(info)
+         };
+         exit_guard::called(Call::AllocateCommandBuffers);
++        if let Ok(buffers) = &allocated {
++            self.0.counts.command_buffers_allocated(buffers.len() as u64);
++        }
+         allocated.map_err(super::error::vulkan)
+     }
+ }
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -13,7 +13,8 @@
+ //!   The spares stay bounded all the same: a command buffer makes a pool only where no spare of its
+ //!   queue's family is free, so the device holds at most as many as its command buffers held at
+ //!   once (Metal bounds those by each queue's `maxCommandBufferCount`). At reuse, only
+-//!   [`COMMAND_BUFFERS`] command buffer handles per pool stay warm; excess completed buffers
++//!   [`COMMAND_BUFFERS`] command buffer handles per pool stay warm. Before allocating another
++//!   handle, all idle pools together share that same bound; excess completed buffers
+ //!   are freed and the driver's pool cache trimmed on the encoding thread. A heavy frame must
+ //!   not retain thousands of command-stream BOs for the device's lifetime. Pools are taken
+ //!   oldest first so an idle large pool also reaches that reclamation point. Before, a pool
+@@ -54,7 +55,7 @@
+ /// The most descriptors the spare descriptor pools hold together.
+ pub(super) const DESCRIPTORS: u64 = 1 << 18;
+ 
+-/// The most completed command buffers kept warm in one spare pool, both levels together.
++/// The most completed command buffers kept warm across idle pools, both levels together.
+ pub(super) const COMMAND_BUFFERS: usize = 64;
+ 
+ /// The index of `level`'s list in a [`CommandPool`]: primary 0, secondary 1.
+@@ -107,12 +108,11 @@
+ 
+     /// Detach excess handles only after the pool's work completed. The caller frees these
+     /// through the release door before any of the kept handles is recorded again.
+-    pub(super) fn excess(&mut self) -> Vec<vk::CommandBuffer> {
+-        let mut room = COMMAND_BUFFERS;
++    pub(super) fn excess(&mut self, room: &mut usize) -> Vec<vk::CommandBuffer> {
+         let mut excess = Vec::new();
+         for buffers in &mut self.made {
+-            let keep = buffers.len().min(room);
+-            room -= keep;
++            let keep = buffers.len().min(*room);
++            *room -= keep;
+             excess.extend(buffers.drain(keep..));
+         }
+         excess
+@@ -134,6 +134,36 @@
+ }
+ 
+ impl Spares {
++    /// Reclaim excess handles from every completed pool before an encoding allocation grows
++    /// another pool. Keeping only the next pool bounded leaves other idle pools' command
++    /// streams resident during a heavy frame. The lock excludes takers and returners while
++    /// Vulkan frees the detached handles, preserving each pool's external synchronization.
++    pub(super) fn reclaim_completed(&self, device: &DeviceShared) {
++        if exit_guard::in_section() {
++            return;
++        }
++        let mut room = COMMAND_BUFFERS;
++        for pool in lock(&self.command_pools).iter_mut() {
++            let excess = pool.excess(&mut room);
++            if excess.is_empty() {
++                continue;
++            }
++            // SAFETY: only completed or unsubmitted pools are returned here. The spares lock
++            // prevents another thread from taking, resetting or recording in this pool.
++            unsafe {
++                release_in_section(
++                    device,
++                    release::CommandBuffers {
++                        pool: pool.raw,
++                        buffers: &excess,
++                    },
++                );
++            }
++            device.counts.command_buffers_trimmed(excess.len() as u64);
++            device.counts.idle_command_buffers_trimmed(excess.len() as u64);
++        }
++    }
++
+     /// A spare command pool of `device` made for queue family `family`, reset, whose command
+     /// buffers are in the initial state; `None` when there is none, or this thread is in a
+     /// section.
+@@ -145,6 +175,7 @@
+         if exit_guard::in_section() {
+             return Ok(None);
+         }
++        self.reclaim_completed(device);
+         let Some(mut pool) = take_command_pool(&mut lock(&self.command_pools), family) else {
+             return Ok(None);
+         };
+@@ -160,7 +191,8 @@
+             unsafe { release_in_section(device, pool.raw) };
+             return Err(vulkan(error));
+         }
+-        let excess = pool.excess();
++        let mut room = COMMAND_BUFFERS;
++        let excess = pool.excess(&mut room);
+         if !excess.is_empty() {
+             // SAFETY: the pool was returned after completion, is now exclusively ours, and
+             // its reset succeeded. None of these handles can still be pending or referenced
+--- a/crates/metal2vulkan-runtime/src/tests/spares.rs
++++ b/crates/metal2vulkan-runtime/src/tests/spares.rs
+@@ -130,7 +130,8 @@
+     for n in 0..80u64 {
+         pool.made(secondary, vk::CommandBuffer::from_raw(1000 + n));
+     }
+-    let excess = pool.excess();
++    let mut room = COMMAND_BUFFERS;
++    let excess = pool.excess(&mut room);
+     assert_eq!(excess.len(), 79);
+     assert_eq!(excess[0], vk::CommandBuffer::from_raw(1001));
+     pool.reset_handed();
+@@ -140,7 +141,57 @@
+     assert_eq!(pool.reuse(primary), None);
+     assert_eq!(pool.reuse(secondary), Some(vk::CommandBuffer::from_raw(1000)));
+     assert_eq!(pool.reuse(secondary), None);
+-    assert!(pool.excess().is_empty());
++    let mut room = COMMAND_BUFFERS;
++    assert!(pool.excess(&mut room).is_empty());
++}
++
++/// Idle pools share one warm budget, rather than multiplying it by the number of pools.
++/// Only detached completed handles are released; every pool and its queue family survive.
++#[test]
++fn idle_pools_share_one_completed_handle_budget() {
++    let primary = vk::CommandBufferLevel::PRIMARY;
++    let secondary = vk::CommandBufferLevel::SECONDARY;
++    let mut pools = Vec::new();
++    for n in 0..3u64 {
++        let mut pool = CommandPool::new(vk::CommandPool::from_raw(n + 1), n as u32);
++        for index in 0..COMMAND_BUFFERS as u64 {
++            pool.made(
++                if index % 2 == 0 { primary } else { secondary },
++                vk::CommandBuffer::from_raw(1 + n * 1000 + index),
++            );
++        }
++        pools.push(pool);
++    }
++    let mut room = COMMAND_BUFFERS;
++    let detached: Vec<_> = pools
++        .iter_mut()
++        .map(|pool| pool.excess(&mut room))
++        .collect();
++    assert_eq!(room, 0);
++    assert!(detached[0].is_empty());
++    assert_eq!(detached[1].len(), COMMAND_BUFFERS);
++    assert_eq!(detached[2].len(), COMMAND_BUFFERS);
++    for (index, pool) in pools.iter_mut().enumerate() {
++        assert_eq!(pool.raw, vk::CommandPool::from_raw(index as u64 + 1));
++        pool.reset_handed();
++        let mut reused = 0;
++        for level in [primary, secondary] {
++            while let Some(handle) = pool.reuse(level) {
++                assert!(!detached
++                    .iter()
++                    .flatten()
++                    .any(|released| *released == handle));
++                reused += 1;
++            }
++        }
++        assert_eq!(reused, if index == 0 { COMMAND_BUFFERS } else { 0 });
++    }
++    assert_eq!(
++        take_command_pool(&mut pools, 2)
++            .expect("family retained")
++            .raw,
++        vk::CommandPool::from_raw(3)
++    );
+ }
+ 
+ /// A set takes the newest spare descriptor pool with room for it, of its flags; past the bounds
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -15,6 +15,8 @@
+ pub(crate) struct Counters {
+     command_pools_made: AtomicU64,
+     command_buffers_trimmed: AtomicU64,
++    idle_command_buffers_trimmed: AtomicU64,
++    command_buffers_allocated: AtomicU64,
+     live_tables_uploaded: AtomicU64,
+     timeline_waits: AtomicU64,
+     timestamp_slots_taken: AtomicU64,
+@@ -160,6 +162,16 @@
+         self.command_buffers_trimmed.fetch_add(count, Ordering::Relaxed);
+     }
+ 
++    /// Completed handles reclaimed across all idle pools before an encoding allocation.
++    pub(crate) fn idle_command_buffers_trimmed(&self, count: u64) {
++        self.idle_command_buffers_trimmed.fetch_add(count, Ordering::Relaxed);
++    }
++
++    /// Handles returned by successful Vulkan command-buffer allocations, including barriers.
++    pub(crate) fn command_buffers_allocated(&self, count: u64) {
++        self.command_buffers_allocated.fetch_add(count, Ordering::Relaxed);
++    }
++
+     /// The live buffers' table was uploaded to a buffer made for it, no spare reused.
+     pub(crate) fn live_table_uploaded(&self) {
+         self.live_tables_uploaded.fetch_add(1, Ordering::Relaxed);
+@@ -637,8 +649,12 @@
+ pub struct WorkCounts {
+     /// `VkCommandPool`s made for command buffers, where no spare one was free.
+     pub command_pools_made: u64,
+-    /// Completed command buffer handles freed and trimmed beyond the per-pool warm bound.
++    /// Completed command buffer handles freed and trimmed beyond the warm bound.
+     pub command_buffers_trimmed: u64,
++    /// The subset reclaimed across all idle pools before an encoding allocation.
++    pub idle_command_buffers_trimmed: u64,
++    /// Handles returned by successful Vulkan command-buffer allocations, including barriers.
++    pub command_buffers_allocated: u64,
+     /// Buffers made to upload a live buffers' table to, where no spare one held it.
+     pub live_tables_uploaded: u64,
+     /// The completion thread's waits for a timeline's value, where the batch it waited for had
+@@ -999,6 +1015,8 @@
+         WorkCounts {
+             command_pools_made: counters.command_pools_made.load(Ordering::Relaxed),
+             command_buffers_trimmed: counters.command_buffers_trimmed.load(Ordering::Relaxed),
++            idle_command_buffers_trimmed: counters.idle_command_buffers_trimmed.load(Ordering::Relaxed),
++            command_buffers_allocated: counters.command_buffers_allocated.load(Ordering::Relaxed),
+             live_tables_uploaded: counters.live_tables_uploaded.load(Ordering::Relaxed),
+             timeline_waits: counters.timeline_waits.load(Ordering::Relaxed),
+             timestamp_slots_taken: counters.timestamp_slots_taken.load(Ordering::Relaxed),
+--- a/docs/FAST-PATHS.md
++++ b/docs/FAST-PATHS.md
+@@ -20,8 +20,9 @@
+ ## Fast defaults
+ 
+ Completed command pools retain at most 64 warm command buffer handles per pool across both
+-levels. Reuse rotates through the oldest idle pool; excess completed handles are freed and
+-the driver's recycled cache trimmed on the encoding thread. The pool itself stays alive.
++levels. Before an encoding allocation grows a pool, all idle pools share one 64-handle budget;
++excess completed handles are freed and the driver's recycled cache trimmed on that encoding
++thread. Reuse rotates through the oldest idle pool. The pools themselves stay alive.
+ This bounds command-stream storage retained after a heavy frame without changing recorded
+ commands or reclaiming anything pending on the GPU.
+ 

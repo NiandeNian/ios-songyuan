@@ -1,0 +1,120 @@
+Subject: [PATCH] runtime: bind dedicated pitched images at the import's start; name each shadow
+
+Turnip asks a dedicated allocation of its DRM_FORMAT_MOD_LINEAR images, which
+the runtime refused wholesale: every IOSurface-backed texture then took the
+shadow path and its copies at every use (97k copies in one 90 s desktop run).
+A dedicated image binds at offset 0 of the import, which an IOSurface's texels
+are, so the image is returned and bound there, refused only past the start.
+Each shadow's first makers name their format, extent, pitch and the alias's
+refusal on the console, so the next gap names itself.
+
+---
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -635,6 +635,9 @@
+     /// It is a `DRM_FORMAT_MOD_LINEAR` image laid out at Metal's pitches
+     /// ([`Device::host_pitched_image`]), not the driver's linear image.
+     pitched: bool,
++    /// The driver asks a dedicated allocation of the image: it binds at the import's
++    /// start only, which the caller checks before it binds.
++    dedicated: bool,
+ }
+ 
+ /// Why a texture over a buffer takes no linear image: the need that failed, which the
+@@ -2067,6 +2070,23 @@
+         // Its copies keep its own image, which it presents again once the bytes lie in pages.
+         self.stand_in_while_detached(&texels.buffer, &image)?;
+         let (offset, bytes_per_row) = (texels.layout.offset, texels.layout.row_pitch);
++        // The shadow's cost is the copies it takes at every use, so a texture that takes it is
++        // named on the console, bounded: the format, extent, pitch and the alias's refusal name
++        // what to fix for the texture to alias directly (`key_hash.rs`'s console carries these
++        // to the kernel log).
++        {
++            use std::sync::atomic::{AtomicU32, Ordering};
++            static NOTICED: AtomicU32 = AtomicU32::new(0);
++            if NOTICED.fetch_add(1, Ordering::Relaxed) < 8 {
++                eprintln!(
++                    "NEZHA shadow: a 2D {format:?} texture of {width}x{height} at offset {offset} \
++                     with rows of {bytes_per_row} bytes takes a shadow: {why}",
++                    format = descriptor.pixel_format,
++                    width = layout.extent[0],
++                    height = layout.extent[1],
++                );
++            }
++        }
+         self.degrade(Degradation::ShadowedTexture, || {
+             let format = descriptor.pixel_format;
+             let [width, height, _] = layout.extent;
+@@ -2295,6 +2315,7 @@
+             report,
+             initial,
+             pitched,
++            dedicated,
+         } = match made {
+             Ok(made) => made,
+             Err(why) => {
+@@ -2325,6 +2346,11 @@
+         } else if requirements.memory_type_bits & (1 << type_index) == 0 {
+             Some(format!(
+                 "{who}'s linear image of the texture takes no memory of the buffer's type"
++            ))
++        } else if dedicated && memory_offset != 0 {
++            Some(format!(
++                "the driver asks a dedicated allocation of the texture's image, which binds at \
++                 the buffer's import's start, where these texels are not (at {memory_offset})"
+             ))
+         } else {
+             None
+@@ -2707,6 +2733,7 @@
+             report,
+             initial: vk::ImageLayout::PREINITIALIZED,
+             pitched: false,
++            dedicated: false,
+         }))
+     }
+ 
+@@ -2763,6 +2790,7 @@
+             report,
+             initial: vk::ImageLayout::UNDEFINED,
+             pitched: false,
++            dedicated: false,
+         }))
+     }
+ 
+@@ -2915,14 +2943,20 @@
+         // SAFETY: `raw` is a live image of a DRM format modifier's tiling, whose one memory plane
+         // is plane 0 (`VUID-vkGetImageSubresourceLayout-tiling-09433`).
+         let report = unsafe { raw_device.get_image_subresource_layout(raw, memory_plane_0()) };
+-        let why = if dedicated.requires_dedicated_allocation != vk::FALSE {
+-            refused_image(layout);
+-            Some(format!(
+-                "it asks a dedicated allocation of a DRM_FORMAT_MOD_LINEAR image of {:?} for \
+-                 host allocations, which one bound at an offset of the buffer's import is not",
+-                plan.format
+-            ))
+-        } else if report.offset != 0
++        // A dedicated-allocation image binds at the import's start only; the caller knows the
++        // offset and refuses there, so the image is returned with `dedicated` set instead of
++        // refused here, where the surface's texels often lie at offset 0.
++        if dedicated.requires_dedicated_allocation != vk::FALSE {
++            return Ok(Ok(LinearMade {
++                raw,
++                requirements,
++                report,
++                initial: vk::ImageLayout::UNDEFINED,
++                pitched: true,
++                dedicated: true,
++            }));
++        }
++        let why = if report.offset != 0
+             || report.row_pitch != row_pitch
+             || (plan.layers > 1 && report.array_pitch != array_pitch)
+         {
+@@ -2954,6 +2988,7 @@
+             report,
+             initial: vk::ImageLayout::UNDEFINED,
+             pitched: true,
++            dedicated: false,
+         }))
+     }
+ 

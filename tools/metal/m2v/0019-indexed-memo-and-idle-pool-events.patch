@@ -1,0 +1,514 @@
+Subject: [PATCH] runtime: indexed exact LRU and event-driven idle-pool reclamation
+
+Hits update an indexed recency list without tree allocations. Reused slots carry
+insertion generations; byte accounting evicts before addition to avoid overflow.
+Only a returned pool can make the idle list require another reclamation scan.
+
+--- a/crates/metal2vulkan-runtime/src/pipeline/memo.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/memo.rs
+@@ -16,33 +16,28 @@
+ //!
+ //! [`ShaderCacheOptions::memory_capacity`]: crate::ShaderCacheOptions::memory_capacity
+ 
++use super::Variant;
+ use super::render::RenderVariant;
+-use super::Variant;
+ use crate::device::lock;
++use crate::key_hash::KeyMap;
+ use metal2vulkan::cache::PipelineKey;
+ use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
+ use metal2vulkan::pipeline::{ComputePipeline, RenderPipeline};
+-use crate::key_hash::KeyMap;
+-use std::collections::BTreeMap;
+ use std::hash::Hash;
+ use std::sync::{Arc, Mutex, Weak};
+ 
+ /// The most entries the device's memo holds, whatever their sizes.
+ pub(crate) const MEMO_ENTRIES: usize = 4096;
+ 
+-/// A map that keeps at most `max_weight` of its entries' weights and at most `max_entries`
+-/// entries, removing the least recently used past either. A lookup or an insert is a use.
++/// A bounded exact LRU, with reusable slots linked in recency order. A hit neither
++/// allocates a tree node nor searches by a timestamp.
+ pub(crate) struct Lru<K, V> {
+-    /// Each entry's number: the stamp of the insert that kept it. The runtime's own keys
+-    /// (variant and plan shapes), looked up at every draw, take the runtime's fast hasher
+-    /// (`key_hash.rs`) over the standard one.
+-    numbers: KeyMap<K, u64>,
+-    /// The entries, by number.
+-    entries: BTreeMap<u64, Slot<K, V>>,
+-    /// Each entry's number by its last use, oldest first.
+-    order: BTreeMap<u64, u64>,
+-    /// The next use's stamp.
+-    clock: u64,
++    numbers: KeyMap<K, usize>,
++    entries: Vec<Option<Slot<K, V>>>,
++    free: Vec<usize>,
++    oldest: Option<usize>,
++    newest: Option<usize>,
++    generation: u64,
+     weight: u64,
+     max_weight: u64,
+     max_entries: usize,
+@@ -52,22 +47,29 @@
+     key: K,
+     value: V,
+     weight: u64,
+-    used: u64,
+-}
+-
+-/// An entry of an [`Lru`], to look up again without its key ([`Lru::get_at`]) while it stays:
+-/// its number, which no other entry of the map takes.
++    generation: u64,
++    previous: Option<usize>,
++    next: Option<usize>,
++}
++
++/// An entry's position and insertion generation. Eviction or replacement invalidates
++/// its old handle even when the same key or physical slot is reused.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(crate) struct At(u64);
++pub(crate) struct At {
++    index: usize,
++    generation: u64,
++}
+ 
+ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
+-    /// An empty map bounded by `max_weight` and `max_entries`.
++    /// An empty map bounded by weight and entry count.
+     pub(crate) fn new(max_weight: u64, max_entries: usize) -> Lru<K, V> {
+         Lru {
+             numbers: KeyMap::default(),
+-            entries: BTreeMap::new(),
+-            order: BTreeMap::new(),
+-            clock: 0,
++            entries: Vec::new(),
++            free: Vec::new(),
++            oldest: None,
++            newest: None,
++            generation: 0,
+             weight: 0,
+             max_weight,
+             max_entries,
+@@ -84,86 +86,166 @@
+         self.get_mut(key).map(|value| &*value)
+     }
+ 
+-    /// The value of `key`, now the most recently used, to change in place (its weight stays).
+     fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+-        let number = *self.numbers.get(key)?;
+-        self.used(number).map(|slot| &mut slot.value)
+-    }
+-
+-    /// The value of `key`, now the most recently used, and where its entry lies.
++        let index = *self.numbers.get(key)?;
++        self.used(index).map(|slot| &mut slot.value)
++    }
++
++    /// The value of `key`, now the most recently used, and a handle to its entry.
+     pub(crate) fn get_with_at(&mut self, key: &K) -> Option<(At, &V)> {
+-        let number = *self.numbers.get(key)?;
+-        let slot = self.used(number)?;
+-        Some((At(number), &slot.value))
+-    }
+-
+-    /// The value of the entry at `at`, now the most recently used, while the entry stays: what
+-    /// [`get`](Self::get) of its key answers, and the same use of it.
++        let index = *self.numbers.get(key)?;
++        let slot = self.used(index)?;
++        Some((
++            At {
++                index,
++                generation: slot.generation,
++            },
++            &slot.value,
++        ))
++    }
++
++    /// The retained entry, now the most recently used. Stale handles name no new entry.
+     pub(crate) fn get_at(&mut self, at: At) -> Option<&V> {
+-        self.used(at.0).map(|slot| &slot.value)
+-    }
+-
+-    /// The entry numbered `number`, now the most recently used.
+-    fn used(&mut self, number: u64) -> Option<&mut Slot<K, V>> {
+-        let slot = self.entries.get_mut(&number)?;
+-        let stamp = self.clock;
+-        self.clock += 1;
+-        self.order.remove(&slot.used);
+-        slot.used = stamp;
+-        self.order.insert(stamp, number);
+-        Some(slot)
+-    }
+-
+-    /// Keep `value` under `key` with `weight`, as the most recently used, replacing what `key`
+-    /// held; then remove the least recently used entries until both bounds hold. A value heavier
+-    /// than the whole bound is not kept.
++        if self.entries.get(at.index)?.as_ref()?.generation != at.generation {
++            return None;
++        }
++        self.used(at.index).map(|slot| &slot.value)
++    }
++
++    /// Detach a live slot from recency order without releasing its key or value.
++    fn unlink(&mut self, index: usize) {
++        let slot = self.entries[index].as_ref().expect("a linked live slot");
++        let (previous, next) = (slot.previous, slot.next);
++        match previous {
++            Some(previous) => {
++                self.entries[previous]
++                    .as_mut()
++                    .expect("a live predecessor")
++                    .next = next
++            }
++            None => self.oldest = next,
++        }
++        match next {
++            Some(next) => {
++                self.entries[next]
++                    .as_mut()
++                    .expect("a live successor")
++                    .previous = previous
++            }
++            None => self.newest = previous,
++        }
++    }
++
++    fn used(&mut self, index: usize) -> Option<&mut Slot<K, V>> {
++        self.entries.get(index)?.as_ref()?;
++        if self.newest != Some(index) {
++            self.unlink(index);
++            let previous = self.newest;
++            if let Some(previous) = previous {
++                self.entries[previous]
++                    .as_mut()
++                    .expect("the live newest slot")
++                    .next = Some(index);
++            }
++            let slot = self.entries[index].as_mut().expect("the used live slot");
++            slot.previous = previous;
++            slot.next = None;
++            self.newest = Some(index);
++            if self.oldest.is_none() {
++                self.oldest = Some(index);
++            }
++        }
++        self.entries[index].as_mut()
++    }
++
++    /// Release a live entry. Its physical slot can be reused, its generation cannot.
++    fn remove_index(&mut self, index: usize) {
++        self.unlink(index);
++        let slot = self.entries[index].take().expect("the removed live slot");
++        self.numbers.remove(&slot.key);
++        self.weight -= slot.weight;
++        self.free.push(index);
++    }
++
++    /// Replace `key`, evicting oldest entries until both limits hold. Make room before
++    /// adding weight, so a `u64::MAX` byte bound cannot overflow its accounting.
+     pub(crate) fn insert(&mut self, key: K, value: V, weight: u64) {
+         self.remove(&key);
+         if weight > self.max_weight || self.max_entries == 0 {
+             return;
+         }
+-        let stamp = self.clock;
+-        self.clock += 1;
+-        self.numbers.insert(key.clone(), stamp);
+-        let slot = Slot {
++        while self.weight > self.max_weight - weight || self.numbers.len() >= self.max_entries {
++            self.remove_index(self.oldest.expect("a full cache has an oldest entry"));
++        }
++        let generation = self.generation;
++        self.generation = generation
++            .checked_add(1)
++            .expect("memo entry generation exhausted");
++        let index = match self.free.pop() {
++            Some(index) => index,
++            None => {
++                self.entries.push(None);
++                self.entries.len() - 1
++            }
++        };
++        self.numbers.insert(key.clone(), index);
++        self.entries[index] = Some(Slot {
+             key,
+             value,
+             weight,
+-            used: stamp,
+-        };
+-        self.entries.insert(stamp, slot);
+-        self.order.insert(stamp, stamp);
++            generation,
++            previous: self.newest,
++            next: None,
++        });
++        if let Some(previous) = self.newest {
++            self.entries[previous]
++                .as_mut()
++                .expect("the live newest slot")
++                .next = Some(index);
++        } else {
++            self.oldest = Some(index);
++        }
++        self.newest = Some(index);
+         self.weight += weight;
+-        while self.weight > self.max_weight || self.entries.len() > self.max_entries {
+-            let Some((_, oldest)) = self.order.pop_first() else {
+-                break;
+-            };
+-            if let Some(slot) = self.entries.remove(&oldest) {
+-                self.numbers.remove(&slot.key);
+-                self.weight -= slot.weight;
+-            }
+-        }
+     }
+ 
+     /// Remove `key`'s entry, if any.
+     pub(crate) fn remove(&mut self, key: &K) {
+-        let Some(number) = self.numbers.remove(key) else {
+-            return;
+-        };
+-        if let Some(slot) = self.entries.remove(&number) {
+-            self.order.remove(&slot.used);
+-            self.weight -= slot.weight;
+-        }
+-    }
+-
+-    /// The entries' total weight and their count, checked against the entries themselves.
++        if let Some(&index) = self.numbers.get(key) {
++            self.remove_index(index);
++        }
++    }
++
++    /// Check accounting, list connectivity and reusable-slot ownership.
+     #[cfg(test)]
+     pub(crate) fn footprint(&self) -> (u64, usize) {
+-        let weight: u64 = self.entries.values().map(|slot| slot.weight).sum();
++        let weight: u64 = self.entries.iter().flatten().map(|slot| slot.weight).sum();
+         assert_eq!(weight, self.weight, "the tracked weight is the entries'");
+-        assert_eq!(self.order.len(), self.entries.len(), "one stamp per entry");
+-        assert_eq!(self.numbers.len(), self.entries.len(), "one number per key");
+-        (weight, self.entries.len())
++        let mut seen = vec![false; self.entries.len()];
++        let (mut next, mut previous, mut count) = (self.oldest, None, 0);
++        while let Some(index) = next {
++            assert!(!seen[index], "recency order has no cycle");
++            seen[index] = true;
++            let slot = self.entries[index].as_ref().expect("a linked live slot");
++            assert_eq!(slot.previous, previous);
++            assert_eq!(self.numbers.get(&slot.key), Some(&index));
++            previous = Some(index);
++            next = slot.next;
++            count += 1;
++        }
++        assert_eq!(previous, self.newest);
++        assert_eq!(count, self.numbers.len(), "every live entry is linked");
++        for &index in &self.free {
++            assert!(!seen[index], "a free slot is unique and not live");
++            assert!(self.entries[index].is_none());
++            seen[index] = true;
++        }
++        assert!(
++            seen.into_iter().all(|seen| seen),
++            "every slot has one owner"
++        );
++        assert!(self.entries.len() <= self.max_entries);
++        (weight, count)
+     }
+ }
+ 
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -41,13 +41,14 @@
+ //!   back.
+ 
+ use super::descriptor_arena::{Room, SetNeeds};
+-use super::device::{lock, DeviceShared};
+-use super::error::{vulkan, Error};
++use super::device::{DeviceShared, lock};
++use super::error::{Error, vulkan};
+ use super::exit_guard;
+ use super::release::{self, Released};
+ use ash::vk;
+ use std::collections::VecDeque;
+ use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ /// The most spare descriptor pools a device keeps.
+ pub(super) const DESCRIPTOR_POOLS: usize = 32;
+@@ -129,6 +130,9 @@
+ #[derive(Default)]
+ pub(super) struct Spares {
+     command_pools: Mutex<Vec<CommandPool>>,
++    /// Only a returned pool can add idle handles. Allocation can avoid taking the pool lock
++    /// again until that happens; live pools never enter this reclamation path.
++    command_pools_changed: AtomicBool,
+     /// Oldest first.
+     descriptor_pools: Mutex<VecDeque<DescriptorPool>>,
+ }
+@@ -139,7 +143,7 @@
+     /// streams resident during a heavy frame. The lock excludes takers and returners while
+     /// Vulkan frees the detached handles, preserving each pool's external synchronization.
+     pub(super) fn reclaim_completed(&self, device: &DeviceShared) {
+-        if exit_guard::in_section() {
++        if exit_guard::in_section() || !self.command_pools_changed.swap(false, Ordering::AcqRel) {
+             return;
+         }
+         let mut room = COMMAND_BUFFERS;
+@@ -160,7 +164,9 @@
+                 );
+             }
+             device.counts.command_buffers_trimmed(excess.len() as u64);
+-            device.counts.idle_command_buffers_trimmed(excess.len() as u64);
++            device
++                .counts
++                .idle_command_buffers_trimmed(excess.len() as u64);
+         }
+     }
+ 
+@@ -198,10 +204,13 @@
+             // its reset succeeded. None of these handles can still be pending or referenced
+             // by a recorded command buffer. Keep the pool itself alive.
+             unsafe {
+-                release_in_section(device, release::CommandBuffers {
+-                    pool: pool.raw,
+-                    buffers: &excess,
+-                });
++                release_in_section(
++                    device,
++                    release::CommandBuffers {
++                        pool: pool.raw,
++                        buffers: &excess,
++                    },
++                );
+             }
+             device.counts.command_buffers_trimmed(excess.len() as u64);
+         }
+@@ -212,7 +221,11 @@
+     /// Keep `pool`, of a command buffer whose work ended or that was never submitted: nothing of
+     /// it is pending, and nothing else holds it. Never released here (the module docs).
+     pub(super) fn give_command_pool(&self, pool: CommandPool) {
+-        keep_command_pool(&mut lock(&self.command_pools), pool);
++        let mut pools = lock(&self.command_pools);
++        keep_command_pool(&mut pools, pool);
++        // Publish under the same lock as the pool. A concurrent reclaim either sees the
++        // returned pool in this pass or keeps this flag for its next pass; no return is lost.
++        self.command_pools_changed.store(true, Ordering::Release);
+     }
+ 
+     /// A spare descriptor pool of `device`, reset, with room for one set of `needs`, the newest
+--- a/crates/metal2vulkan-runtime/src/tests/memo.rs
++++ b/crates/metal2vulkan-runtime/src/tests/memo.rs
+@@ -3,15 +3,50 @@
+ //! stays within its capacity while pipelines come and go. Boundedness checks, not timings: every
+ //! step is deterministic.
+ 
+-use crate::pipeline::memo::{Lru, PipelineMemo, Remembered, MEMO_ENTRIES};
++use crate::pipeline::memo::{Lru, MEMO_ENTRIES, PipelineMemo, Remembered};
++use metal2vulkan::Budget;
+ use metal2vulkan::cache::{PipelineArtifact, VariantKey};
+ use metal2vulkan::device::{Device, DeviceDescription, DevicePolicy};
+ use metal2vulkan::library::{CompiledFunction, Library};
+ use metal2vulkan::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, Stage, StageSource};
+-use metal2vulkan::Budget;
+ use std::collections::HashSet;
+ use std::path::Path;
+ use std::sync::Arc;
++
++/// Measure the hot memo paths independently of shader compilation or driver time. Run in
++/// release mode with `--ignored --nocapture`; timing is reported, never asserted.
++#[test]
++#[ignore = "release-mode memo lookup measurement"]
++fn memo_lookup_cost() {
++    use std::hint::black_box;
++    use std::time::Instant;
++
++    const LOOKUPS: u64 = 2_000_000;
++    for size in [32, 256, 4096] {
++        let mut memo = Lru::counted(size);
++        for key in 0..size as u64 {
++            memo.insert(key, key, 1);
++        }
++        let start = Instant::now();
++        for step in 0..LOOKUPS {
++            black_box(memo.get(black_box(&(step % size as u64))));
++        }
++        println!(
++            "memo {size} rotating key: {:.1} ns/hit",
++            start.elapsed().as_nanos() as f64 / LOOKUPS as f64
++        );
++        let at = memo.get_with_at(&0).expect("entry retained").0;
++        let start = Instant::now();
++        for _ in 0..LOOKUPS {
++            black_box(memo.get_at(black_box(at)));
++        }
++        println!(
++            "memo {size} repeated handle: {:.1} ns/hit",
++            start.elapsed().as_nanos() as f64 / LOOKUPS as f64
++        );
++        assert_eq!(memo.footprint(), (size as u64, size));
++    }
++}
+ 
+ /// A fixed sequence of pseudo-random numbers (xorshift).
+ struct Sequence(u64);
+@@ -114,6 +149,37 @@
+     assert_eq!(lru.get_at(at), None, "a replaced entry lies elsewhere");
+     assert_eq!(lru.get(&"a"), Some(&5));
+     assert_eq!(lru.footprint(), (3, 3));
++}
++
++#[test]
++fn recycled_slots_do_not_revive_handles_or_retain_evicted_values() {
++    let value = Arc::new(());
++    let mut memo = Lru::counted(1);
++    memo.insert(1, Arc::clone(&value), 1);
++    let at = memo.get_with_at(&1).expect("retained").0;
++    assert_eq!(Arc::strong_count(&value), 2);
++    memo.insert(2, Arc::new(()), 1);
++    assert_eq!(
++        Arc::strong_count(&value),
++        1,
++        "eviction releases the resource"
++    );
++    assert!(
++        memo.get_at(at).is_none(),
++        "a reused physical slot is a different entry"
++    );
++    memo.remove(&2);
++    assert_eq!(memo.footprint(), (0, 0));
++}
++
++#[test]
++fn a_full_width_weight_budget_evicts_without_wrapping() {
++    let mut memo = Lru::new(u64::MAX, 4);
++    memo.insert(1, (), u64::MAX - 1);
++    memo.insert(2, (), 2);
++    assert!(memo.get(&1).is_none());
++    assert_eq!(memo.get(&2), Some(&()));
++    assert_eq!(memo.footprint(), (2, 1));
+ }
+ 
+ /// The owned `ob3_texture_array` kernel, from its committed AIR, compiled for the committed
+--- a/crates/metal2vulkan-runtime/README.md
++++ b/crates/metal2vulkan-runtime/README.md
+@@ -315,6 +315,18 @@
+ (`RuntimeGap` lists every gap; [docs/METAL-COVERAGE.md](../../docs/METAL-COVERAGE.md) maps the
+ whole Metal API).
+ 
++## Memo and command-pool reuse
++
++Pipeline and binding-plan memos maintain exact LRU order in reusable indexed slots. Lookups
++allocate no recency nodes; a cached entry handle carries an insertion generation, so eviction
++or replacement invalidates it even when the slot is reused. Both byte and entry limits apply
++before insertion, including byte limits spanning the full `u64` range.
++
++Completed command pools retain the existing global warm-handle budget. Reclamation scans run
++after a pool is returned; allocations do not repeatedly lock and scan an unchanged idle list.
++The return flag is published while holding the pool lock, so concurrent returns are included
++in the current scan or leave a scan pending. Live and in-flight pools are never reclaimed.
++
+ ## Further reading
+ 
+ - [docs/RUNTIME-PORTING.md](../../docs/RUNTIME-PORTING.md): Metal's calls, as Objective-C or

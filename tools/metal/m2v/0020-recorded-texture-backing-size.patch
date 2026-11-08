@@ -1,0 +1,66 @@
+Subject: [PATCH] runtime: expose recorded primary texture backing extent
+
+--- a/crates/metal2vulkan-runtime/src/texture/attributes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/attributes.rs
+@@ -25,14 +25,14 @@
+ //!   validation stops each ("Setting purgeability state directly on heap sub-allocated resources
+ //!   is not allowed"), as a buffer in a heap does.
+ 
+-use super::super::attributes::{set_purgeable, texture_allocation, PURGEABLE_ALLOCATION};
++use super::super::PurgeableState;
++use super::super::attributes::{PURGEABLE_ALLOCATION, set_purgeable, texture_allocation};
+ use super::super::buffer::Buffer;
+ use super::super::buffer_texture::TexelsHome;
+ use super::super::copy_plan::block_extent;
+ use super::super::device::lock;
+ use super::super::error::Error;
+ use super::super::values::StorageMode;
+-use super::super::PurgeableState;
+ use super::{Image, Owner, Storage, Texture};
+ use metal2vulkan::vk::ImageType;
+ use std::sync::Mutex;
+@@ -46,6 +46,29 @@
+ }
+ 
+ impl Texture {
++    /// The recorded byte extent of the primary backing, for a frontend's `allocatedSize`.
++    /// This is this device's allocation, not an estimate of Apple's GPU layout. Heap textures
++    /// report their reserved heap range; buffer textures their backing buffer; other owned
++    /// images their actual placement. Views share that backing. Hidden compatibility copies
++    /// are not additional Metal resources. Memoryless textures report zero.
++    ///
++    /// No direct Metal counterpart for `None`: a sparse mapping or caller-owned Vulkan image
++    /// has no allocation extent recorded here, so its frontend must not invent one.
++    pub fn backing_allocation_size(&self) -> Option<u64> {
++        if self.storage_mode() == StorageMode::Memoryless {
++            return Some(0);
++        }
++        if let Some(place) = self.0.storage.heap_place() {
++            return Some(place.size);
++        }
++        match &self.0.storage {
++            Storage::Image(image) => image.owner.releases().1.map(|placement| placement.size()),
++            Storage::Texels(texels)
++            | Storage::Alias { texels, .. }
++            | Storage::Shadow { texels, .. } => Some(texels.buffer.length()),
++        }
++    }
++
+     /// `setLabel:`: this texture object's label; no other object's changes (the module docs).
+     pub fn set_label(&self, label: &str) {
+         *lock(&self.0.label) = Some(label.to_owned());
+--- a/crates/metal2vulkan-runtime/README.md
++++ b/crates/metal2vulkan-runtime/README.md
+@@ -327,6 +327,12 @@
+ The return flag is published while holding the pool lock, so concurrent returns are included
+ in the current scan or leave a scan pending. Live and in-flight pools are never reclaimed.
+ 
++`Texture::backing_allocation_size` exposes the recorded primary backing extent for a frontend's
++resource accounting. Heap textures use their reserved range, ordinary owned images their
++placement, and textures over buffers their backing buffer. Views share that backing; hidden
++compatibility images are not extra Metal resources. Memoryless resources report zero. Sparse
++and caller-owned images without a recorded allocation return `None`, not an estimated size.
++
+ ## Further reading
+ 
+ - [docs/RUNTIME-PORTING.md](../../docs/RUNTIME-PORTING.md): Metal's calls, as Objective-C or

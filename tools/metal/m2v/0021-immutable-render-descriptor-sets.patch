@@ -1,0 +1,453 @@
+--- a/crates/metal2vulkan-runtime/README.md
++++ b/crates/metal2vulkan-runtime/README.md
+@@ -333,6 +333,15 @@
+ compatibility images are not extra Metal resources. Memoryless resources report zero. Sparse
+ and caller-owned images without a recorded allocation return `None`, not an estimated size.
+ 
++Render encoders reuse up to four immutable set-zero descriptor snapshots, each of at most
++32 writes. Matching includes the pipeline layout, descriptor type, binding and array element,
++and the complete resolved Vulkan buffer/image/texel-view descriptor. Cache hits do not rewrite
++sets; earlier draws retain their descriptors. Keys enter the memo only after a draw's refusal
++points, and ordinary resource retention keeps their handles alive. Rebinds are resolved before
++matching; replay starts an empty encoder. Push constants, heap-set updates, hazard tracking and
++shadow copies retain their ordinary paths. `WorkCounts` exposes arena allocations and render
++set reuse separately, for verification without interpreting queue submissions as frames.
++
+ ## Further reading
+ 
+ - [docs/RUNTIME-PORTING.md](../../docs/RUNTIME-PORTING.md): Metal's calls, as Objective-C or
+--- a/crates/metal2vulkan-runtime/src/binding.rs
++++ b/crates/metal2vulkan-runtime/src/binding.rs
+@@ -362,6 +362,33 @@
+     pub(super) held: Option<Keeper>,
+ }
+ 
++impl Write {
++    /// Exact set-zero contents, after binding resolved rebinds, views and upload offsets.
++    pub(super) fn descriptor(&self) -> crate::descriptor_memo::Descriptor {
++        use crate::descriptor_memo::{Descriptor, Value};
++        use ash::vk::Handle;
++        let value = match self.info {
++            Info::Buffer(info) => Value::Buffer {
++                handle: info.buffer.as_raw(),
++                offset: info.offset,
++                range: info.range,
++            },
++            Info::Image(info) => Value::Image {
++                view: info.image_view.as_raw(),
++                sampler: info.sampler.as_raw(),
++                layout: info.image_layout.as_raw(),
++            },
++            Info::Texel(view) => Value::Texel(view.as_raw()),
++        };
++        Descriptor {
++            binding: self.binding,
++            element: self.element,
++            kind: self.ty.as_raw(),
++            value,
++        }
++    }
++}
++
+ /// What a descriptor write holds.
+ #[derive(Clone, Copy)]
+ pub(super) enum Info {
+--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+@@ -225,6 +225,7 @@
+             .result()
+             .map_err(vulkan)?;
+         self.book.take(at, needs);
++        device.shared().counts.descriptor_set_allocated();
+         Ok(set)
+     }
+ 
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/descriptor_memo.rs
+@@ -0,0 +1,243 @@
++//! Immutable render descriptor sets already written in this encoder. The pool belongs to its
++//! command buffer, and successful draws retain every named object until completion. A hit reuses
++//! the set without updating it: earlier draws therefore keep their own descriptor contents.
++//! Only exact Vulkan descriptors match; buffer contents, push constants and heap-set updates
++//! still follow the ordinary draw path. A rebind changes the resolved handles or offsets, and
++//! replay starts a new encoder and an empty memo.
++
++/// A few recurring materials, bounded independently of the number of draws or bound resources.
++const SETS: usize = 4;
++/// Larger sets keep the ordinary allocation path, bounding both lookup work and stored keys.
++const WRITES: usize = 32;
++
++/// Everything written to one binding/array element of set zero. Raw Vulkan handles are identities,
++/// not hashes: the encoder's successful draws keep them alive for the memo's whole lifetime.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct Descriptor {
++    pub(super) binding: u32,
++    pub(super) element: u32,
++    pub(super) kind: i32,
++    pub(super) value: Value,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Value {
++    Buffer {
++        handle: u64,
++        offset: u64,
++        range: u64,
++    },
++    Image {
++        view: u64,
++        sampler: u64,
++        layout: i32,
++    },
++    Texel(u64),
++}
++
++struct Entry<S> {
++    layout: u64,
++    writes: Vec<Descriptor>,
++    set: S,
++}
++
++/// FIFO replacement suffices: the common one/two-material case never replaces an entry. No
++/// recency bookkeeping or key allocation is done on a hit. Stored key vectors are reused.
++pub(super) struct Memo<S> {
++    entries: [Option<Entry<S>>; SETS],
++    next: usize,
++}
++
++impl<S> Default for Memo<S> {
++    fn default() -> Self {
++        Self {
++            entries: std::array::from_fn(|_| None),
++            next: 0,
++        }
++    }
++}
++
++impl<S: Copy> Memo<S> {
++    pub(super) fn find(
++        &self,
++        layout: u64,
++        writes: impl ExactSizeIterator<Item = Descriptor> + Clone,
++    ) -> Option<S> {
++        if writes.len() > WRITES {
++            return None;
++        }
++        self.entries.iter().flatten().find_map(|entry| {
++            (entry.layout == layout && entry.writes.iter().copied().eq(writes.clone()))
++                .then_some(entry.set)
++        })
++    }
++
++    /// Called only after every refusal point, when the draw retains its objects. Remembering a
++    /// failed draw could let its handles die and be recycled while the key was still stored.
++    pub(super) fn remember(
++        &mut self,
++        layout: u64,
++        writes: impl ExactSizeIterator<Item = Descriptor>,
++        set: S,
++    ) {
++        if writes.len() > WRITES {
++            return;
++        }
++        match &mut self.entries[self.next] {
++            Some(entry) => {
++                // The memo is optional. If key storage cannot grow, leave the old entry
++                // intact and keep the newly written set on the ordinary draw path.
++                if entry
++                    .writes
++                    .try_reserve(writes.len().saturating_sub(entry.writes.len()))
++                    .is_err()
++                {
++                    return;
++                }
++                entry.layout = layout;
++                entry.set = set;
++                entry.writes.clear();
++                entry.writes.extend(writes);
++            }
++            slot @ None => {
++                let mut key = Vec::new();
++                if key.try_reserve(writes.len()).is_err() {
++                    return;
++                }
++                key.extend(writes);
++                *slot = Some(Entry {
++                    layout,
++                    set,
++                    writes: key,
++                })
++            }
++        }
++        self.next = (self.next + 1) % SETS;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn image() -> Descriptor {
++        Descriptor {
++            binding: 0,
++            element: 0,
++            kind: 1,
++            value: Value::Image {
++                view: 7,
++                sampler: 9,
++                layout: 1,
++            },
++        }
++    }
++
++    #[test]
++    fn every_descriptor_field_and_layout_are_part_of_the_key() {
++        let mut memo = Memo::default();
++        let descriptor = image();
++        memo.remember(11, [descriptor].into_iter(), 37);
++        assert_eq!(memo.find(11, [descriptor].into_iter()), Some(37));
++        assert_eq!(memo.find(12, [descriptor].into_iter()), None);
++        for different in [
++            Descriptor {
++                binding: 1,
++                ..descriptor
++            },
++            Descriptor {
++                element: 1,
++                ..descriptor
++            },
++            Descriptor {
++                kind: 2,
++                ..descriptor
++            },
++            Descriptor {
++                value: Value::Image {
++                    view: 8,
++                    sampler: 9,
++                    layout: 1,
++                },
++                ..descriptor
++            },
++            Descriptor {
++                value: Value::Image {
++                    view: 7,
++                    sampler: 10,
++                    layout: 1,
++                },
++                ..descriptor
++            },
++            Descriptor {
++                value: Value::Image {
++                    view: 7,
++                    sampler: 9,
++                    layout: 2,
++                },
++                ..descriptor
++            },
++            Descriptor {
++                value: Value::Texel(7),
++                ..descriptor
++            },
++        ] {
++            assert_eq!(memo.find(11, [different].into_iter()), None);
++        }
++        assert_eq!(memo.find(11, [descriptor, descriptor].into_iter()), None);
++    }
++
++    #[test]
++    fn buffer_ranges_rebinds_and_write_order_do_not_collide() {
++        let mut memo = Memo::default();
++        let a = Descriptor {
++            value: Value::Buffer {
++                handle: 7,
++                offset: 16,
++                range: 64,
++            },
++            ..image()
++        };
++        let b = image();
++        memo.remember(11, [a, b].into_iter(), 37);
++        assert_eq!(memo.find(11, [a, b].into_iter()), Some(37));
++        assert_eq!(memo.find(11, [b, a].into_iter()), None);
++        for value in [
++            Value::Buffer {
++                handle: 8,
++                offset: 16,
++                range: 64,
++            },
++            Value::Buffer {
++                handle: 7,
++                offset: 32,
++                range: 64,
++            },
++            Value::Buffer {
++                handle: 7,
++                offset: 16,
++                range: 128,
++            },
++        ] {
++            assert_eq!(
++                memo.find(11, [Descriptor { value, ..a }, b].into_iter()),
++                None
++            );
++        }
++    }
++
++    #[test]
++    fn replacement_is_bounded_and_large_sets_do_not_enter_the_memo() {
++        let mut memo = Memo::default();
++        for i in 0..SETS as u64 + 1 {
++            memo.remember(i, [image()].into_iter(), i + 10);
++        }
++        assert_eq!(memo.find(0, [image()].into_iter()), None);
++        for i in 1..SETS as u64 + 1 {
++            assert_eq!(memo.find(i, [image()].into_iter()), Some(i + 10));
++        }
++        memo.remember(90, [image(); WRITES + 1].into_iter(), 100);
++        assert_eq!(memo.find(90, [image(); WRITES + 1].into_iter()), None);
++        assert_eq!(memo.find(4, [image()].into_iter()), Some(14));
++    }
++}
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -64,6 +64,7 @@
+ mod depth_stencil_resolve;
+ mod depth_stencil_scratch;
+ mod descriptor_arena;
++mod descriptor_memo;
+ mod detach;
+ mod device;
+ #[cfg(unix)]
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -2098,6 +2098,7 @@
+             uses_room: Vec::new(),
+             argument_samplers_room: Vec::new(),
+             bind_memo: crate::binding::BindMemo::default(),
++            descriptor_memo: crate::descriptor_memo::Memo::default(),
+             last_retained: Default::default(),
+         }
+     }
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -318,6 +318,7 @@
+ use super::used_resources::EncoderKind;
+ use super::visibility::{self, Continuation, Visibility, VisibilityResultMode};
+ use ash::vk;
++use ash::vk::Handle;
+ pub(super) use executions::DeferredPass;
+ use executions::{PassInstance, PassStorage, RenderExecution, RunPasses};
+ use extended_shadow::ExtendedShadows;
+@@ -1130,6 +1131,8 @@
+     argument_samplers_room: Vec<SamplerState>,
+     /// The views and sampler descriptions its draws' binds made or found (`binding::BindMemo`).
+     bind_memo: binding::BindMemo,
++    /// Immutable set-zero snapshots of this encoder's successful draws.
++    descriptor_memo: crate::descriptor_memo::Memo<vk::DescriptorSet>,
+     /// What its last draw retained of its own ([`LastRetained`]).
+     last_retained: LastRetained,
+ }
+@@ -1401,6 +1404,7 @@
+             uses_room: Vec::new(),
+             argument_samplers_room: Vec::new(),
+             bind_memo: binding::BindMemo::default(),
++            descriptor_memo: crate::descriptor_memo::Memo::default(),
+             last_retained: LastRetained::default(),
+         })
+     }
+@@ -6707,11 +6711,24 @@
+         // Set 0 per draw; set 1 the device's (written below, once nothing refuses).
+         let mut writes = bound.writes;
+         let heap_writes: Vec<_> = writes.extract_if(.., |write| write.set > 0).collect();
+-        let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
+-        // SAFETY: the set was just allocated and no command uses it yet; every buffer, view
+-        // and sampler written is live (the command buffer retains them below, and a refusal
+-        // leaves the set unused in its pool).
+-        unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++        let descriptor_layout = objects.layout().as_raw();
++        let reused = self.descriptor_memo.find(
++            descriptor_layout,
++            writes.iter().map(binding::Write::descriptor),
++        );
++        let set = match reused {
++            Some(set) => {
++                device.shared().counts.render_descriptor_set_reused();
++                Some(set)
++            }
++            None => {
++                let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
++                // SAFETY: only a newly allocated set is written. Reused sets are immutable,
++                // so earlier draws retain their descriptors. Resources are retained below.
++                unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++                set
++            }
++        };
+         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
+         // pass's one.
+         let sized = device.shared().sized_index_bind;
+@@ -7020,6 +7037,13 @@
+         // A draw that rasterizes nothing reaches no tile: it changes nothing the capture finds.
+         let rasterizes = !graphics.rasterizer_discard;
+         // Recording starts here: nothing below can be refused.
++        if let (None, Some(set)) = (reused, set) {
++            self.descriptor_memo.remember(
++                descriptor_layout,
++                writes.iter().map(binding::Write::descriptor),
++                set,
++            );
++        }
+         self.driver_restarts |= tessellated;
+         if let Some(made) = made {
+             self.shadow = Some(made);
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -87,6 +87,8 @@
+     linear_passes_through_copies: AtomicU64,
+     kept_bytes_passes: AtomicU64,
+     draw_states_recorded: AtomicU64,
++    descriptor_sets_allocated: AtomicU64,
++    render_descriptor_sets_reused: AtomicU64,
+     host_deallocators_delayed: AtomicU64,
+     dma_buf_imports: AtomicU64,
+     dma_buf_sparse_buffers: AtomicU64,
+@@ -472,6 +474,18 @@
+             self.draw_states_recorded
+                 .fetch_add(count, Ordering::Relaxed);
+         }
++    }
++
++    /// One new set from a command buffer's descriptor arena.
++    pub(crate) fn descriptor_set_allocated(&self) {
++        self.descriptor_sets_allocated
++            .fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// A render draw reused an immutable set-zero snapshot without writing it again.
++    pub(crate) fn render_descriptor_set_reused(&self) {
++        self.render_descriptor_sets_reused
++            .fetch_add(1, Ordering::Relaxed);
+     }
+ 
+     /// A no-copy buffer's deallocator, given no keep-alive, waits past its release for the
+@@ -914,6 +928,10 @@
+     /// states. None for a command that sets what its command buffer already holds from an
+     /// earlier draw there.
+     pub draw_states_recorded: u64,
++    /// New sets allocated from command buffers' descriptor arenas.
++    pub descriptor_sets_allocated: u64,
++    /// Render draws that reused exactly matching immutable set-zero descriptors.
++    pub render_descriptor_sets_reused: u64,
+     /// No-copy buffers and heaps released with a deallocator and no keep-alive whose deallocator
+     /// waited past the release for the import of their pages, which something else held (a
+     /// command buffer submitted before a texture over them went, through the texture's image):
+@@ -1116,6 +1134,10 @@
+                 .load(Ordering::Relaxed),
+             kept_bytes_passes: counters.kept_bytes_passes.load(Ordering::Relaxed),
+             draw_states_recorded: counters.draw_states_recorded.load(Ordering::Relaxed),
++            descriptor_sets_allocated: counters.descriptor_sets_allocated.load(Ordering::Relaxed),
++            render_descriptor_sets_reused: counters
++                .render_descriptor_sets_reused
++                .load(Ordering::Relaxed),
+             host_deallocators_delayed: counters.host_deallocators_delayed.load(Ordering::Relaxed),
+             dma_buf_imports: counters.dma_buf_imports.load(Ordering::Relaxed),
+             dma_buf_sparse_buffers: counters.dma_buf_sparse_buffers.load(Ordering::Relaxed),

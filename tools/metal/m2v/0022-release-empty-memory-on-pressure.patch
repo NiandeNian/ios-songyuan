@@ -1,0 +1,183 @@
+--- a/crates/metal2vulkan-runtime/README.md
++++ b/crates/metal2vulkan-runtime/README.md
+@@ -360,3 +360,9 @@
+ [LICENSE](LICENSE) is the notice; [LICENSE-GPL-2.0](LICENSE-GPL-2.0),
+ [LICENSE-LGPL-3.0](LICENSE-LGPL-3.0) and [LICENSE-GPL-3.0](LICENSE-GPL-3.0) (which the LGPL v3
+ incorporates) are the texts.
++
++When a device-memory allocation fails, the allocator releases completely empty pooled spares
++of every memory type, then retries only if memory was actually returned. It performs at most
++one such reclamation pass per placement; the existing smaller-growth-block fallback remains.
++Live placements, pending work and caller imports are never reclaimed, and block indices remain
++stable. WorkCounts exposes reclaimed empty blocks and bytes; system process limits are unchanged.
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -390,6 +390,18 @@
+         self.blocks.drain(..).flatten().map(|block| block.payload)
+     }
+ 
++    /// Return only completely unused pooled blocks under memory pressure. Stable slots keep
++    /// every live Placement's block index valid; dedicated/imported allocations are untouched.
++    pub(super) fn drain_empty(&mut self) -> impl Iterator<Item = T> + '_ {
++        self.blocks.iter_mut().filter_map(|slot| {
++            if slot.as_ref().is_some_and(|block| !block.dedicated && block.ranges.is_empty()) {
++                slot.take().map(|block| block.payload)
++            } else {
++                None
++            }
++        })
++    }
++
+     /// The number of live blocks.
+     #[cfg(test)]
+     pub(super) fn blocks(&self) -> usize {
+@@ -423,6 +435,10 @@
+     pub(super) dedicated: u64,
+     /// The caller's host memory imported ([`Memory::import_host`]), a block each.
+     pub(super) imported: u64,
++    /// Completely empty spare blocks released after allocation failure, cumulatively.
++    pub(super) reclaimed_empty: u64,
++    /// Bytes returned by those blocks, cumulatively.
++    pub(super) reclaimed_bytes: u64,
+ }
+ 
+ /// A host pointer the runtime may send between threads: the mapping of a block it owns.
+@@ -684,6 +700,8 @@
+     families: Vec<u32>,
+     /// The bytes of the blocks allocated so far ([`Memory::allocated`]).
+     allocated: u64,
++    reclaimed_empty: u64,
++    reclaimed_bytes: u64,
+ }
+ 
+ impl Memory {
+@@ -711,6 +729,8 @@
+             unified,
+             families,
+             allocated: 0,
++            reclaimed_empty: 0,
++            reclaimed_bytes: 0,
+         }
+     }
+ 
+@@ -722,7 +742,11 @@
+ 
+     /// Its live blocks, by kind.
+     pub(super) fn census(&self) -> Census {
+-        let mut census = Census::default();
++        let mut census = Census {
++            reclaimed_empty: self.reclaimed_empty,
++            reclaimed_bytes: self.reclaimed_bytes,
++            ..Census::default()
++        };
+         for pool in &self.pools {
+             pool.count_into(&mut census, |block| block.imported);
+         }
+@@ -1128,6 +1152,23 @@
+         );
+     }
+ 
++    /// Release empty spares of every memory type before retrying a failed allocation. The
++    /// allocator lock excludes new placements while they are removed. Live resources and
++    /// pending commands retain their placements, so none can name one of these empty blocks.
++    fn release_empty(&mut self, device: &ash::Device) -> bool {
++        let mut released = 0;
++        for pool in &mut self.pools {
++            for block in pool.drain_empty() {
++                released += 1;
++                self.reclaimed_bytes += block.size;
++                // SAFETY: no placement remains, as for the existing empty-block release.
++                unsafe { block.release(device) };
++            }
++        }
++        self.reclaimed_empty += released;
++        released != 0
++    }
++
+     /// Free every block: the device is being destroyed and no resource is left.
+     pub(super) fn destroy(&mut self, device: &ash::Device) {
+         for pool in &mut self.pools {
+@@ -1401,6 +1442,8 @@
+     }
+     let dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
+     let mut failure = Error::OutOfMemory(MemoryKind::Device);
++    // At most one reclamation pass per placement, across all candidate memory types.
++    let mut reclaimed = false;
+     for type_index in candidates {
+         let pool = (holds, type_index);
+         let block_size = if dedicated { size } else { lock(memory).next_block_bytes(pool, size) };
+@@ -1421,6 +1464,23 @@
+                         pool, block, allocation_size, allocation_dedicated, size,
+                     );
+                     return Ok(memory.placement(pool, index, 0, size, addressed.is_some()));
++                }
++                Err(Error::OutOfMemory(MemoryKind::Device))
++                    if !reclaimed =>
++                {
++                    reclaimed = true;
++                    if lock(memory).release_empty(device) {
++                        // A warm spare has no correctness obligation. Retry the same request
++                        // only after actually freeing memory, never by suppressing an error.
++                        continue;
++                    }
++                    if !allocation_dedicated && allocation_size > size {
++                        allocation_size = size;
++                        allocation_dedicated = true;
++                    } else {
++                        failure = Error::OutOfMemory(MemoryKind::Device);
++                        break;
++                    }
+                 }
+                 Err(Error::OutOfMemory(MemoryKind::Device))
+                     if !allocation_dedicated && allocation_size > size =>
+--- a/crates/metal2vulkan-runtime/src/tests/memory.rs
++++ b/crates/metal2vulkan-runtime/src/tests/memory.rs
+@@ -270,6 +270,26 @@
+     assert_eq!(pool.blocks(), 0);
+ }
+ 
++#[test]
++fn pressure_releases_only_empty_spares_and_preserves_live_block_indices() {
++    let mut pool: Pool<&str> = Pool::default();
++    let empty = pool.add(256, false, "empty", 0);
++    let live = pool.add(256, false, "live", 64);
++    let dedicated = pool.add(1000, true, "dedicated", 1000);
++    assert_eq!(pool.drain_empty().collect::<Vec<_>>(), ["empty"]);
++    assert_eq!(pool.blocks(), 2);
++    assert_eq!(pool.payload(live), Some(&"live"));
++    assert_eq!(pool.payload(dedicated), Some(&"dedicated"));
++    assert_eq!(pool.payload(empty), None);
++    assert_eq!(pool.place(192, 1), Some((live, 64)));
++    assert_eq!(pool.drain_empty().next(), None);
++    assert_eq!(pool.release(live, 0, 64), None);
++    assert_eq!(pool.release(live, 64, 192), None);
++    assert_eq!(pool.drain_empty().collect::<Vec<_>>(), ["live"]);
++    assert_eq!(pool.release(dedicated, 0, 1000), Some("dedicated"));
++    assert_eq!(pool.add(128, false, "reused-slot", 1), empty);
++}
++
+ /// A pool has room for a placement where a pooled block holds a free range that long at the
+ /// largest alignment asked of the pool so far; a dedicated block's room counts for none.
+ #[test]
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -787,6 +787,10 @@
+     pub memory_blocks_live: u64,
+     /// Its live pooled blocks with no placement, kept for the next.
+     pub empty_memory_blocks_live: u64,
++    /// Completely empty memory-pool spares released after an allocation failed.
++    pub empty_memory_blocks_reclaimed: u64,
++    /// Bytes returned by those empty spares; live and pending allocations are untouched.
++    pub empty_memory_bytes_reclaimed: u64,
+     /// Its live dedicated blocks: a placement larger than half a block, or one placed apart.
+     pub dedicated_memory_blocks_live: u64,
+     /// Its live imports of the caller's host memory, a block each (`Memory::import_host`).
+@@ -1079,6 +1083,8 @@
+             device_memory_allocated: allocated,
+             memory_blocks_live: census.pooled,
+             empty_memory_blocks_live: census.empty,
++            empty_memory_blocks_reclaimed: census.reclaimed_empty,
++            empty_memory_bytes_reclaimed: census.reclaimed_bytes,
+             dedicated_memory_blocks_live: census.dedicated,
+             host_imports_live: census.imported,
+             stand_ins_made: counters.stand_ins_made.load(Ordering::Relaxed),

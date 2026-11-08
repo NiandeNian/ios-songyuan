@@ -1,0 +1,49 @@
+Subject: [PATCH] runtime: retry a refused pool block at the resource size
+
+A pooled growth allocation can fail while its resource would still fit.
+Retry once with the actual Vulkan memory requirement and release that
+independent block when its placement ends. Dedicated requests and
+non-device-memory failures retain their existing behavior.
+
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -1411,14 +1411,32 @@
+                 return Ok(placement);
+             }
+         }
+-        match maker.make(device, type_index, block_size, addressed) {
+-            Ok(block) => {
+-                let mut memory = lock(memory);
+-                let index = memory.add_block(pool, block, block_size, dedicated, size);
+-                return Ok(memory.placement(pool, index, 0, size, addressed.is_some()));
++        let mut allocation_size = block_size;
++        let mut allocation_dedicated = dedicated;
++        loop {
++            match maker.make(device, type_index, allocation_size, addressed) {
++                Ok(block) => {
++                    let mut memory = lock(memory);
++                    let index = memory.add_block(
++                        pool, block, allocation_size, allocation_dedicated, size,
++                    );
++                    return Ok(memory.placement(pool, index, 0, size, addressed.is_some()));
++                }
++                Err(Error::OutOfMemory(MemoryKind::Device))
++                    if !allocation_dedicated && allocation_size > size =>
++                {
++                    // A pool's growth block can exceed the remaining budget even when the
++                    // resource fits. Retry its actual requirement once, without keeping an
++                    // empty spare after release. No smaller-than-required allocation is used.
++                    allocation_size = size;
++                    allocation_dedicated = true;
++                }
++                Err(error @ Error::OutOfMemory(_)) => {
++                    failure = error;
++                    break;
++                }
++                Err(error) => return Err(error),
+             }
+-            Err(error @ Error::OutOfMemory(_)) => failure = error,
+-            Err(error) => return Err(error),
+         }
+     }
+     Err(failure)

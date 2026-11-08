@@ -1,0 +1,153 @@
+Subject: [PATCH] container: load Core Image kernel libraries without exposing kernels as entry points
+
+Based on AdrenoMetal's Core Image library parser change (0010 in 8160223).
+Core Image kernel entries retain the existing range and metadata validation;
+only TYPE 5 enumeration is omitted. Loading is separate from stitching and
+execution support, which this change does not provide.
+
+--- a/crates/metal2vulkan-air/src/container/mtlb.rs
++++ b/crates/metal2vulkan-air/src/container/mtlb.rs
+@@ -4,7 +4,8 @@
+ //! Layout (little-endian, packed), as observed in Apple output of formats 2.7–2.9:
+ //!
+ //! - Header (0x58 bytes): `MTLB`, `platform u16`, `version u16 u16`, `file_type u8` (0 an
+-//!   executable library, 2 a dynamic library), `os u8`, `os_version u16 u16`, then `u64`
++//!   executable library, 1 Core Image kernels, 2 a dynamic library), `os u8`, `os_version u16 u16`,
++//!   then `u64`
+ //!   `file_size` and `(offset, size)` pairs for the function list, public metadata, private
+ //!   metadata, and bitcode sections.
+ //! - Function list: `u32 count`, then `count` entries of `u32 entry_size` (counting itself) and a
+@@ -16,9 +17,8 @@
+ //! - No two functions share or overlap a public-metadata record, a private-metadata record, or a
+ //!   bitcode range. Apple output never does, and requiring it keeps parsing (and the parsed
+ //!   result) linear in the file size: otherwise many entries could re-parse one large record.
+-//!   The one exception is a dynamic library (`MTLLibraryTypeDynamic`): Apple's toolchain lists each
+-//!   function it exports (`TYPE` 3, its symbol as `NAME`) over the library's one module, so its
+-//!   functions may share exactly one bitcode range, hashed once.
++//!   Dynamic exports (`TYPE` 3) and Core Image kernels (`TYPE` 5 in a type-1 library) can share
++//!   exactly one bitcode range, checked once. Metadata records remain disjoint.
+ //! - The extended header's `HDYN` and `ILST` tags each hold an `(offset, size)` of a region of
+ //!   the file. `HDYN`'s is a tag list: `NAME`, the library's install name (a dynamic library's
+ //!   `installName`; an executable's file name), and one `DYNL` per dynamic library it was linked
+@@ -41,6 +41,11 @@
+ const FILE_TYPE_EXECUTABLE: u8 = 0;
+ /// `file_type` of a dynamic library (`MTLLibraryTypeDynamic`).
+ const FILE_TYPE_DYNAMIC: u8 = 2;
++/// Core Image kernel library (`metal -cikernel`). Its TYPE 5 kernels are not
++/// entry points exposed through MTLLibrary.functionNames.
++const FILE_TYPE_CI_KERNELS: u8 = 1;
++/// Function-table TYPE of a Core Image kernel.
++const TYPE_CI_KERNEL: u8 = 5;
+ 
+ /// A metallib's library type (`MTLLibraryType`), from its header's `file_type`.
+ #[non_exhaustive]
+@@ -248,7 +253,10 @@
+             6,
+         ));
+     }
+-    if header.file_type != FILE_TYPE_EXECUTABLE && header.file_type != FILE_TYPE_DYNAMIC {
++    if header.file_type != FILE_TYPE_EXECUTABLE
++        && header.file_type != FILE_TYPE_DYNAMIC
++        && header.file_type != FILE_TYPE_CI_KERNELS
++    {
+         return Err(InputError::new(
+             InputErrorKind::Unsupported(Feature::LibraryKind(header.file_type)),
+             Location::container(10),
+@@ -330,8 +338,7 @@
+     }
+ 
+     // Function bitcode ranges are disjoint, so verifying every hash is linear in the file size. A
+-    // dynamic library's functions may share one range exactly, which is hashed once.
+-    let shared = header.file_type == FILE_TYPE_DYNAMIC;
++    // Dynamic exports and Core Image kernels may share one range exactly.
+     let mut ranges: Vec<(u64, u64, u64, usize)> = parsed
+         .iter()
+         .enumerate()
+@@ -339,7 +346,12 @@
+         .collect();
+     ranges.sort_unstable();
+     for pair in ranges.windows(2) {
+-        if let [(a, a_len, _, _), (b, b_len, b_entry, _)] = pair {
++        if let [(a, a_len, _, a_index), (b, b_len, b_entry, b_index)] = pair {
++            let shared = header.file_type == FILE_TYPE_DYNAMIC
++                || (header.file_type == FILE_TYPE_CI_KERNELS
++                    && [*a_index, *b_index].into_iter().all(|index| {
++                        parsed[index].function.stage == FunctionStage::Other(TYPE_CI_KERNEL)
++                    }));
+             let same = shared && a == b && a_len == b_len;
+             if a + a_len > *b && !same {
+                 return Err(container_error(ContainerError::BadOffset, *b_entry));
+@@ -382,6 +394,12 @@
+         f.public = public_metadata(&public)?;
+         f.private = private.into_iter().map(|t| t.raw).collect();
+         functions.push(f);
++    }
++    // Keep every entry in the validation above: a hidden Core Image kernel must
++    // still have valid bitcode and metadata ranges. Only the public function
++    // enumeration omits TYPE 5, matching Metal's executable-library view.
++    if header.file_type == FILE_TYPE_CI_KERNELS {
++        functions.retain(|f| f.stage != FunctionStage::Other(TYPE_CI_KERNEL));
+     }
+ 
+     Ok(Metallib {
+--- a/crates/metal2vulkan-air/src/container/tests.rs
++++ b/crates/metal2vulkan-air/src/container/tests.rs
+@@ -593,14 +593,56 @@
+     b.version = (1, 2);
+     assert!(parse(&b.build()).is_ok());
+     let mut b = sample();
+-    b.file_type = 1;
++    b.file_type = 3;
+     match parse(&b.build()).unwrap_err() {
+         Error::Unsupported(Unsupported {
+-            feature: Feature::LibraryKind(1),
++            feature: Feature::LibraryKind(3),
+             ..
+         }) => {}
+         other => panic!("{other:?}"),
+     }
++}
++
++#[test]
++fn core_image_kernels_are_validated_but_not_enumerated_as_entry_points() {
++    let mut b = sample();
++    b.file_type = 1;
++    for f in &mut b.functions {
++        f.type_code = 5;
++    }
++    let bytes = b.build();
++    let library = metallib(&bytes);
++    assert_eq!(library.library_type(), LibraryType::Executable);
++    assert!(library.functions.is_empty());
++
++    // Ordinary entry points in the same container remain visible.
++    b.functions[1].type_code = 2;
++    let bytes = b.build();
++    let library = metallib(&bytes);
++    assert_eq!(library.functions.len(), 1);
++    assert_eq!(library.functions[0].name, b.functions[1].name);
++
++    // Core Image's TYPE 5 records share the library's one module exactly.
++    b.functions[1].type_code = 5;
++    b.shared_bitcode = true;
++    let module = b.functions[0].bitcode.clone();
++    for function in &mut b.functions {
++        function.bitcode = module.clone();
++    }
++    assert!(metallib(&b.build()).functions.is_empty());
++    b.functions[1].type_code = 2;
++    assert_eq!(
++        container_kind(&parse(&b.build()).unwrap_err()),
++        ContainerError::BadOffset
++    );
++    b.functions[1].type_code = 5;
++
++    // Hiding TYPE 5 must not skip the normal container validation.
++    b.functions[0].omit.push(*b"OFFT");
++    assert_eq!(
++        container_kind(&parse(&b.build()).unwrap_err()),
++        ContainerError::MissingTag
++    );
+ }
+ 
+ #[test]

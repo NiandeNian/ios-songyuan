@@ -1,0 +1,32 @@
+Subject: [PATCH] turnip: linear and modifier external images need no dedicated allocation
+
+Every externally-imported image reported requiresDedicatedAllocation, so a
+Vulkan client importing host pages or dma-bufs at a pitch the driver's own
+layout already matches (Metal's IOSurfaces: 1125-wide BGRA at 4608 bytes is
+exactly fd6's align(4500, 256)) could not bind its image at an offset of that
+import, and fell back to per-use shadow copies of the whole surface: 1,460
+shadowed textures and 108,922 copies in one 90-second desktop session.
+
+Linear and DRM-modifier layouts are fixed-pitch: they bind at any offset the
+image's alignment allows inside the import, so only tiled external images
+keep the dedicated requirement.
+
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -1169,8 +1169,15 @@
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *req =
+             (VkMemoryDedicatedRequirements *) ext;
++         /* Linear and DRM-modifier images are laid out at fixed pitches and
++          * bind at any offset their alignment allows inside an imported
++          * allocation; only tiled external images (AHB's compressed layouts)
++          * need the allocation to themselves.
++          */
+          req->requiresDedicatedAllocation =
+-            image->vk.external_handle_types != 0;
++            image->vk.external_handle_types != 0 &&
++            image->vk.tiling != VK_IMAGE_TILING_LINEAR &&
++            image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
+          break;
+       }
