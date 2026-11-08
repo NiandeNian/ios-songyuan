@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -548,6 +548,15 @@
+ 	ud_sync(UD_RX, ud.rx_req);
+ 	if (ud.personality == UD_APPLE) {
+ 		if (len != 0 && len <= ud.rx_req) {
++			/* first frames only: enough to see the handshake and the
++			 * first TCP connect without flooding the ring */
++			if (ud.rx_frames < 12) {
++				const uint8_t *p = (const uint8_t *)(ud.dma + UD_RX);
++				printf("SWEET USB: bulk rx %u bytes %02x %02x %02x %02x "
++				    "%02x %02x %02x %02x\n", len, p[0], p[1], p[2], p[3],
++				    p[4], p[5], p[6], p[7]);
++			}
++			ud.rx_frames++;
+ 			apple_usbmux_input((const uint8_t *)(ud.dma + UD_RX), len);
+ 		}
+ 		ud_apple_tx_kick();
+@@ -781,7 +790,23 @@
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
++			/*
++			 * A reset drops every non-EP0 endpoint the controller had.
++			 * Clearing ud.configured is what makes the next
++			 * SET_CONFIGURATION rebuild them: without it the gadget
++			 * answers on EP0 only and bulk never comes back (seen in
++			 * the field when Windows re-enumerated the device after
++			 * the driver install).  The mux link goes down with it so
++			 * the host starts from a fresh version handshake.
++			 */
++			ud.configured = false;
++			ud.tx_busy = false;
++			ud.rx_req = 0;
++			ud.state = EP0_SETUP;
++			if (ud.personality == UD_APPLE) {
++				apple_usbmux_link_down();
++			}
++			printf("SWEET USB: bus reset (endpoints rebuilt on next SET_CONFIGURATION)\n");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+--- a/bsd/dev/apple_usbmux.c
++++ b/bsd/dev/apple_usbmux.c
+@@ -357,6 +357,7 @@
+ 	plen = len - hlen;
+ 
+ 	if (flags & TH_RST) {
++		printf("APPLE MUX: tcp rst %u -> %u\n", sport, dport);
+ 		c = conn_find(dport, sport);
+ 		if (c != NULL) {
+ 			conn_release(c);
+@@ -364,6 +365,7 @@
+ 		return;
+ 	}
+ 	if (flags & TH_SYN) {
++		printf("APPLE MUX: tcp syn %u -> %u seq %u\n", sport, dport, seq);
+ 		amux_syn(sport, dport, seq);
+ 		return;
+ 	}
