@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -99,6 +99,10 @@
+ #define WIFI_IOVA 0x20000000ull
+ #define WIFI_DMA_BYTES 0x920000u
+ #define WIFI_DMA_LIMIT 0x28000000ull
++/* Peach firmware validates the DDR geometry through the IPA window's end,
++ * as CNSS host_cap does on this phone. This publishes an address range;
++ * allocations stay capped above and SMMU entries exist only for owned pages. */
++#define WIFI_IOVA_LIMIT 0xb0010000ull
+ #define WIFI_TABLE_BYTES 0x50000u
+ #define WIFI_MSI_OFFSET 0x808000u
+ #define WIFI_TRY(expr) do { int err_ = (expr); if (err_) return err_; } while (0)
+@@ -750,7 +754,7 @@
+ static void wifi_wlfw_log(void *c, const char *s, uint32_t a, uint32_t b)
+ { (void)c; printf("NEZHA WIFI: %s %#x %#x\n", s, a, b); }
+ static const PeachWlfwOps wifi_wlfw_ops = {NULL, wifi_allocate_dma, wifi_wlfw_file,
+-    wifi_wlfw_log, WIFI_IOVA, WIFI_DMA_LIMIT - WIFI_IOVA};
++    wifi_wlfw_log, WIFI_IOVA, WIFI_IOVA_LIMIT - WIFI_IOVA};
+ 
+ /* Peach hif_io32.h: target register window through BAR0+0x80000, selected
+  * by BAR0+0x3278. One worker owns this selector; MHI uses only low BAR offsets. */

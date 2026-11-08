@@ -1,0 +1,29 @@
+Subject: [PATCH] IOSurface: report the limits already enforced by surface creation
+
+iOS 16 reads the selector-13 result at +8/+12/+16 as maximum row bytes,
+width and height. BaseBoard refuses a surface before creation
+when its dimensions exceed these answers. Zero answers prevented PosterBoard
+from creating otherwise supported preview surfaces.
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -7,6 +7,8 @@
+  *
+  *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
+  *           +0 offset alignment mask, +4 bytes-per-row alignment mask
++ *           +8 maximum row bytes, +0xc maximum width, +0x10 maximum height
++ *           (the same limits enforced when creating the surface)
+  *   sel 0   create: scalar [parent id], struct in = serialized property
+  *           dictionary (binary or XML), struct out = lock result (0xa68)
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
+@@ -1003,6 +1005,10 @@
+ 		uint8_t limits[0x18] = { 0 };
+ 		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+ 		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
++		/* A positive-height row cannot exceed the allocation ceiling. */
++		put32(limits, 0x8, SWEET_SURFACE_MAX_ALLOC);
++		put32(limits, 0xc, SWEET_SURFACE_MAX_DIM);
++		put32(limits, 0x10, SWEET_SURFACE_MAX_DIM);
+ 		limits[0x16] = 1;
+ 		sweet_surf_log_once("sel", selector);
+ 		return sweet_struct_out(args, limits, sizeof(limits));

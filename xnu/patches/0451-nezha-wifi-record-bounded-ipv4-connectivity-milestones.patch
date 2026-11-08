@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -33,7 +33,7 @@
+ static PeachNetRequest net_request;
+ static mbuf_t net_queue[TX_QUEUE], net_pending;
+ static unsigned net_head, net_count, net_online;
+-static unsigned net_trace[2];
++static unsigned net_trace[2], net_seen[2];
+ static unsigned char net_frame[1518]; /* worker-owned, never exposed as DMA */
+ static errno_t control_connect(kern_ctl_ref c, struct sockaddr_ctl *s, void **p)
+ { (void)c; (void)s; *p = NULL; return 0; }
+@@ -180,6 +180,7 @@
+     lck_mtx_lock(&net_lock); net_info_data.current = *b; net_info_data.security = security;
+     lck_mtx_unlock(&net_lock);
+     net_trace[0] = net_trace[1] = 0;
++    net_seen[0] = net_seen[1] = 0;
+ }
+ void peach_net_info(PeachNetInfo *out)
+ {
+@@ -324,10 +325,10 @@
+  * Runs on the protocol worker, without packet payloads or key material. */
+ static void trace_frame(unsigned incoming, const unsigned char *p, size_t bytes)
+ {
+-    if (bytes < 14 || net_trace[incoming] >= 8) return;
+-    net_trace[incoming]++;
++    if (bytes < 14 || (net_trace[incoming] >= 8 && net_seen[incoming] == 15)) return;
+     unsigned type = p[12] * 256u + p[13], protocol = 0, source = 0, dest = 0;
+-    if (type == 0x800 && bytes >= 34 && (p[14] >> 4) == 4) {
++    unsigned ipv4 = type == 0x800 && bytes >= 34 && (p[14] >> 4) == 4;
++    if (ipv4) {
+         unsigned header = (p[14] & 15) * 4u;
+         protocol = p[23];
+         if (header >= 20 && bytes >= 14 + header + 4 &&
+@@ -336,8 +337,17 @@
+             dest = p[16 + header] * 256u + p[17 + header];
+         }
+     }
++    unsigned kind = type == 0x806 ? 1 :
++        source == 67 || source == 68 || dest == 67 || dest == 68 ? 2 :
++        source == 53 || dest == 53 ? 4 :
++        source == 443 || dest == 443 || source == 80 || dest == 80 ? 8 : 0;
++    if (net_trace[incoming] >= 8 && (!kind || (net_seen[incoming] & kind))) return;
++    net_trace[incoming]++; net_seen[incoming] |= kind;
+     printf("NEZHA WIFI: %s Ethernet type %#x bytes %lu IP protocol %u ports %u/%u\n",
+         incoming ? "RX" : "TX", type, (unsigned long)bytes, protocol, source, dest);
++    if (ipv4)
++        printf("NEZHA WIFI: %s IPv4 %u.%u.%u.%u -> %u.%u.%u.%u\n", incoming ? "RX" : "TX",
++            p[26], p[27], p[28], p[29], p[30], p[31], p[32], p[33]);
+ }
+ int peach_net_transmit(PeachTx *tx)
+ {

@@ -1,0 +1,81 @@
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -62,6 +62,22 @@
+     if (!p || n < 4 || (n & 3)) { h->error = PeachCeProtocol; return; }
+     uint32_t word = u32(p);
+     h->last_message = word;
++    if ((word & 255) == 0x24) {
++        unsigned pdev = (word >> 8) & 255, kind = (word >> 16) & 255, ring = word >> 24;
++        if (!h->confirmed || n != 12 || kind > 1 ||
++            (kind ? !pdev || pdev > 3 || ring >= 13 : pdev || ring >= 18)) {
++            h->error = PeachCeProtocol; return;
++        }
++        /* Vendor dp_htt_bkp_event_alert: a diagnostic after 100ms of ring
++         * pressure, repeated while it persists. Keep servicing the real
++         * rings; these reported indices never complete or release DMA. */
++        if (h->backpressure_reports < 8) {
++            h->backpressure_reports++;
++            if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
++                "HTT backpressure ring/time ms", word >> 8, u32(p + 8));
++        }
++        return;
++    }
+     if ((word & 255) == 0xb) { /* htt_sec_ind: 7 words, not a key ACK */
+         unsigned type = (word >> 8) & 127, unicast = (word >> 15) & 1;
+         if (!h->confirmed || n != 28 || (type && type != 6)) {
+@@ -100,15 +116,27 @@
+     unsigned seen = 0;
+     for (size_t off = 4; off < n;) {
+         word = u32(p + off);
+-        unsigned tag = word & 255, bytes = (word >> 8) & 255, value = word >> 16;
+-        /* HTT option length includes its header, unlike a WMI TLV length. */
+-        if (bytes < 4 || (bytes & 3) || bytes > n - off || (tag < 32 && (seen & (1u << tag)))) {
++        unsigned tag = word & 255, length = (word >> 8) & 255, value = word >> 16;
++        /* Legacy options count the complete TLV in four-byte words (see
++         * htt_h2t.c's MAX_TX_QUEUE_GROUPS). The current Peach dp_htt.c
++         * instead emits TCL_METADATA_VER with byte length 4. Accept that
++         * documented scalar's word/byte forms, without changing other tags. */
++        unsigned bytes = tag == 5 && length == 4 ? 4 : length * 4;
++        if (!bytes || bytes > n - off || (tag < 32 && (seen & (1u << tag)))) {
+             h->error = PeachCeProtocol; return;
+         }
+         if (tag < 32) seen |= 1u << tag;
+         if (tag == 1) {
+             if (bytes != 4 || value > 1) { h->error = PeachCeProtocol; return; }
+             h->address_bits = value ? 64 : 32;
++        } else if (tag == 2 || tag == 3) {
++            /* Preserve individual completions; no firmware TX queue groups.
++             * Neither option may silently enable an unimplemented path. */
++            if (bytes != 4 || value) { h->error = PeachCeProtocol; return; }
++        } else if (tag == 4) {
++            /* Target support for extended TX descriptors does not require
++             * their use. The existing path leaves its extension bit clear. */
++            if (bytes != 4 || value > 1) { h->error = PeachCeProtocol; return; }
+         } else if (tag == 5) {
+             if (bytes != 4 || value != 1) { h->error = PeachCeProtocol; return; }
+             h->metadata_version = value;
+@@ -151,9 +179,11 @@
+ int peach_htt_negotiate(PeachHtt *h)
+ {
+     if (!h || !h->htc || !h->htc->started || h->requested) return PeachMhiInvalid;
+-    uint32_t request = 0;
++    /* Without MAX_TX_QUEUE_GROUPS the protocol defaults to four groups.
++     * This host has no flow-group handlers, so explicitly negotiate zero. */
++    const uint32_t request[] = {0, 3u | 1u << 8};
+     h->requested = 1;
+-    int err = send_message(h, &request, sizeof(request));
++    int err = send_message(h, request, sizeof(request));
+     return err ? err : wait_flag(h, &h->confirmed);
+ }
+ static int dma_valid(const PeachHtt *h, PeachMhiDma d, size_t n, unsigned alignment)
+--- a/bsd/dev/qcom/PeachHtt.h
++++ b/bsd/dev/qcom/PeachHtt.h
+@@ -23,7 +23,7 @@
+     unsigned requested, confirmed, major, minor, address_bits, metadata_version;
+     unsigned setup_pending, setup_sent, setup_done, setup_pdev, setup_id, setup_status;
+     uint32_t configured[4];
+-    unsigned rx_config_sent, rx_pdev;
++    unsigned rx_config_sent, rx_pdev, backpressure_reports;
+     uint32_t peer_generation;
+     PeachHttPeer peers[PEACH_HTT_PEERS];
+     uint32_t last_message;

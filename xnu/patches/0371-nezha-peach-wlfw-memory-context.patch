@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -86,6 +86,8 @@
+         uint32_t bytes = u32(v), type = u32(v + 4);
+         unsigned cfg = v[8];
+         v += 9; len -= 9;
++        report(w, "requested memory type/bytes", type, bytes);
++        if (cfg) report(w, "requested memory type/configs", type, cfg);
+         /* MSA/LPASS and pageable/MLO memory need additional ownership or
+          * protocols. Do not advertise those capabilities or invent support. */
+         if (!bytes || type < 1 || type > 12 || type == 6 || type == 8 ||
+@@ -96,6 +98,8 @@
+             uint64_t offset = u64(v);
+             uint32_t size = u32(v + 8);
+             if (v[12] || offset > bytes || size > bytes - offset) {
++                report(w, "unsupported memory config offset/size", (uint32_t)offset, size);
++                report(w, "unsupported memory config type/secure", type, v[12]);
+                 w->error = PeachWlfwUnsupported; return;
+             }
+         }

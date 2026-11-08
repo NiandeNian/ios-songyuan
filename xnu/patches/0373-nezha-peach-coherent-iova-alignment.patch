@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -633,6 +633,12 @@
+     size_t rounded = round_page(bytes);
+     if (!out || !bytes || rounded < bytes || wifi_allocations >= WIFI_DMA_ALLOCATIONS ||
+         wifi_dma_next >= WIFI_DMA_LIMIT || rounded > WIFI_DMA_LIMIT - wifi_dma_next) return ENOMEM;
++    /* Match coherent IOVA allocation alignment. Q6 maps the firmware DDR
++     * with large TLB pages; a merely 4K-aligned base exhausts that mapping. */
++    uint64_t alignment = PAGE_SIZE;
++    while (alignment < rounded) alignment <<= 1;
++    uint64_t iova = (wifi_dma_next + alignment - 1) & ~(alignment - 1);
++    if (iova >= WIFI_DMA_LIMIT || rounded > WIFI_DMA_LIMIT - iova) return ENOMEM;
+     vm_offset_t va = 0;
+     if (kmem_alloc(kernel_map, &va, rounded, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+         VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return ENOMEM;
+@@ -640,7 +646,6 @@
+     wifi_nocache(va, rounded);
+     pandora_apps_smmu_lock();
+     int err = wifi_dma_health();
+-    uint64_t iova = wifi_dma_next;
+     for (size_t off = 0; !err && off < rounded; off += 0x1000) {
+         uint64_t address = iova + off;
+         uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, va + off)) + ((va + off) & PAGE_MASK);
+@@ -669,7 +674,7 @@
+     __asm__ volatile("dsb sy" ::: "memory");
+     if (!err) {
+         *out = (PeachMhiDma){(void *)va, iova, bytes};
+-        wifi_dma_next += rounded;
++        wifi_dma_next = iova + rounded;
+     }
+     pandora_apps_smmu_unlock();
+     return err;
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -300,6 +300,7 @@
+         unsigned char *v = p + 4 + i * 17;
+         p64(v, m->dma.iova); p32(v + 8, m->size); p32(v + 12, m->type); v[16] = 0;
+         report(w, "firmware memory", m->type, m->size);
++        report(w, "firmware memory IOVA", m->type, (uint32_t)m->dma.iova);
+     }
+     WTRY(request(w, 0x36, 4 + w->memory_count * 17));
+     w->memory_responded = 1;

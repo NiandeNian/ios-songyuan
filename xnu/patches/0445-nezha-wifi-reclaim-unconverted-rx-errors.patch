@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/qcom/PeachRx.c b/bsd/dev/qcom/PeachRx.c
+--- a/bsd/dev/qcom/PeachRx.c
++++ b/bsd/dev/qcom/PeachRx.c
+@@ -294,14 +294,17 @@
+ }
+ static int reap_wbm(PeachRx *r, const uint32_t d[8])
+ {
+-    /* wbm2sw_completion_ring_rx, not the TX completion layout. RXDMA/REO
+-     * may return error buffers without a completed MSDU_END tag. */
+-    unsigned source = d[2] & 7;
++    /* RXDMA/REO error buffers need no completed MSDU_END tag. Like TX,
++     * WBM retains buffer_addr_info in DWORDs0/1 when CC is disabled;
++     * converted RX completions retain physical address/cookie at 6/7. */
++    unsigned source = d[2] & 7, converted = !!(d[2] & (1u << 16));
++    unsigned rbm = converted ? (d[2] >> 9) & 15 : (d[1] >> 8) & 15;
+     if ((source != 1 && source != 2) || (d[2] & 0x80000000u) ||
+-        ((d[2] >> 6) & 7) != 0 || ((d[2] >> 9) & 15) != RX_RBM ||
+-        (d[2] & (1u << 16))) return invalid(r);
++        ((d[2] >> 6) & 7) != 0 || rbm != RX_RBM) return invalid(r);
+     unsigned i;
+-    RTRY(r, buffer_index(r, d[6], d[7] & 255, (d[7] >> 8) & 0xfffff, &i));
++    RTRY(r, buffer_index(r, converted ? d[6] : d[0],
++        (converted ? d[7] : d[1]) & 255,
++        converted ? (d[7] >> 8) & 0xfffff : d[1] >> 12, &i));
+     r->released++; release(r, i);
+     return 0;
+ }

@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -245,6 +245,13 @@
+      * it still emits real DONE for HOST1, HOST4 and the RXDMA destination. */
+     unsigned no_reply = h->minor == 143 && r->id == 0 && r->type == PeachHttSwToHw;
+     command[12] = no_reply ? 0 : 1u << 19;
++    if (no_reply) {
++        /* This ring is filled by firmware. Native RXMAC setup retains
++         * its device low-watermark wakeup even though the host polls.
++         * Captured 4096-entry ring: timer 0x40, low threshold 0x400. */
++        command[11] = 0x40u << 16;
++        command[12] = r->entries / 4;
++    }
+     h->setup_pending = 1; h->setup_sent = h->setup_done = 0;
+     h->setup_pdev = r->pdev; h->setup_id = r->id; h->setup_status = 0xffffffffu;
+     h->htc->ce->ops.barrier(h->htc->ce->ops.context);

@@ -1,0 +1,47 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -380,6 +380,7 @@
+ #if defined(PANDORA)
+ 	bool          fFill;                    /* sweetfb_fill=1: scale to the whole panel */
+ 	uint16_t      fFillX[2048];             /* panel x -> logical x */
++	uint32_t      fFillRow[2048];           /* cached source row for scaled copies */
+ #endif
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -1034,7 +1035,7 @@
+ 	 */
+ 	int fill = 0;
+ 	PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
+-	fFill = fill != 0 && fLogicalW != fWidth && fWidth <= 2048;
++	fFill = fill != 0 && fLogicalW != fWidth && fWidth <= 2048 && fLogicalW <= 2048;
+ 	for (uint32_t x = 0; fFill && x < fWidth; x++) {
+ 		fFillX[x] = (uint16_t)((uint64_t)x * fLogicalW / fWidth);
+ 	}
+@@ -1929,18 +1930,25 @@
+ 				uint32_t py1 = (uint32_t)MIN(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH,
+ 				    (uint64_t)fHeight);
+ 				uint32_t k = sweet_fb_dim;
++				uint32_t lastY = ~0u;
+ 				for (uint32_t Y = py0; Y < py1; Y++) {
+ 					uint32_t ly = (uint32_t)((uint64_t)Y * fLogicalH / fHeight);
+ 					const uint32_t *srow = (const uint32_t *)(src + s->offset +
+ 					    (uint64_t)(sy + (int32_t)ly - dy) * s->bytesPerRow);
++					/* GPU output is mapped non-cacheably. Bulk reads avoid one bus
++					 * access per scaled pixel, including duplicated rows/columns. */
++					if (ly != lastY) {
++						memcpy(fFillRow, srow + sx, (size_t)w * 4);
++						lastY = ly;
++					}
+ 					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)Y * fRowBytes);
+ 					if (k >= 256) {
+ 						for (uint32_t X = px0; X < px1; X++) {
+-							drow[X] = srow[sx + (int32_t)fFillX[X] - dx];
++							drow[X] = fFillRow[(int32_t)fFillX[X] - dx];
+ 						}
+ 					} else {
+ 						for (uint32_t X = px0; X < px1; X++) {
+-							drow[X] = sweet_fb_scale(srow[sx + (int32_t)fFillX[X] - dx], k);
++							drow[X] = sweet_fb_scale(fFillRow[(int32_t)fFillX[X] - dx], k);
+ 						}
+ 					}
+ 				}

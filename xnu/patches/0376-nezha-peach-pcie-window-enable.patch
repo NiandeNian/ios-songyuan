@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -756,19 +756,22 @@
+ static const PeachWlfwOps wifi_wlfw_ops = {NULL, wifi_allocate_dma, wifi_wlfw_file,
+     wifi_wlfw_log, WIFI_IOVA, WIFI_IOVA_LIMIT - WIFI_IOVA};
+ 
+-/* Peach hif_io32.h: target register window through BAR0+0x80000, selected
++/* Peach cnss2/pci.c: target register window through BAR0+0x80000, selected
+  * by BAR0+0x3278. One worker owns this selector; MHI uses only low BAR offsets. */
+ static int wifi_target_offset(uint32_t target, uint32_t *bar)
+ {
+     if ((target & 3) || target >= 0x2000000) return EINVAL;
+     WIFI_TRY(wifi_dma_health());
+     if (target < 0x80000) { *bar = target; return 0; }
+-    uint32_t window = 0x80000000u | ((target >> 19) & 0x3f);
++    uint32_t window = 0x40000000u | ((target >> 19) & 0x3f);
+     if (window != wifi_target_window) {
+         uint32_t check;
+         WIFI_TRY(wifi_wr(W_BAR, 0x3278, window));
+         WIFI_TRY(wifi_rd(W_BAR, 0x3278, &check));
+-        if (check != window) return EIO;
++        if (check != window) {
++            printf("NEZHA WIFI: target window wanted %#x read %#x\n", window, check);
++            return EIO;
++        }
+         wifi_target_window = window;
+     }
+     *bar = 0x80000 + (target & 0x7ffff);

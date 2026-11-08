@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -131,6 +131,9 @@
+  * successful START_RESP. No authentication/association or network link. */
+ int peach_wmi_vdev_start(PeachWmi *, unsigned bss_index, unsigned pmf);
+ int peach_wmi_vdev_stop(PeachWmi *);
++/* Program four EDCA queues from the AP's WMM parameters, or defaults
++ * for a legacy AP. No U-APSD or MU-EDCA is enabled. */
++int peach_wmi_wmm(PeachWmi *, const unsigned char *ies, size_t bytes);
+ /* One retained pass-by-reference buffer. Reuse only after matching real
+  * MGMT_TX_COMPLETION. RX frames are copied out of CE before callback return.
+  * These primitives do not manufacture auth/association responses. */
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -994,6 +994,39 @@
+     WTRY(w, send_command(w, 0x5006, 12)); w->vdev_stop_sent = 1;
+     return wait_flag(w, &w->vdev_stopped);
+ }
++int peach_wmi_wmm(PeachWmi *w, const unsigned char *ies, size_t bytes)
++{
++    if (!w || !w->vdev_started || w->vdev_stop_sent || (!ies && bytes)) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    const unsigned char *params = NULL;
++    while (bytes >= 2 && ies[1] <= bytes - 2) {
++        if (ies[0] == 221 && ies[1] == 24 &&
++            !memcmp(ies + 2, "\x00\x50\xf2\x02\x01\x01", 6)) params = ies + 10;
++        size_t n = ies[1] + 2u; ies += n; bytes -= n;
++    }
++    static const unsigned defaults[4][4] = {
++        {15,1023,3,0}, {15,1023,7,0}, {7,15,2,94}, {3,7,2,47}
++    };
++    memset(w->command, 0, 128); unsigned char *p = w->command + 4;
++    tlv(p, 199, 120); /* VDEV_SET_WMM_PARAMS fixed 124B, EDCA type 0 */
++    for (unsigned ac = 0; ac < 4; ac++) {
++        unsigned char *q = p + 8 + ac * 28; tlv(q, 199, 24);
++        for (unsigned field = 0; field < 4; field++) p32(q + 4 + field * 4, defaults[ac][field]);
++    }
++    unsigned seen = 0;
++    if (params) for (unsigned i = 0; i < 4; i++) {
++        const unsigned char *q = params + i * 4;
++        unsigned ac = (q[0] >> 5) & 3, min = q[1] & 15, max = q[1] >> 4;
++        if ((seen & (1u << ac)) || !(q[0] & 15) || min > max) return PeachMhiInvalid;
++        seen |= 1u << ac;
++        unsigned char *d = p + 8 + ac * 28;
++        p32(d + 4, (1u << min) - 1); p32(d + 8, (1u << max) - 1);
++        p32(d + 12, q[0] & 15); p32(d + 16, u16(q + 2)); p32(d + 20, (q[0] >> 4) & 1);
++    }
++    WTRY(w, send_command(w, 0x500d, 128));
++    report(w, "WMI EDCA queues/AP parameters submitted", 4, !!params);
++    return 0;
++}
+ int peach_wmi_mgmt_tx(PeachWmi *w, const void *packet, size_t bytes)
+ {
+     const unsigned char *frame = packet;
+diff --git a/bsd/dev/qcom/PeachStation.c b/bsd/dev/qcom/PeachStation.c
+--- a/bsd/dev/qcom/PeachStation.c
++++ b/bsd/dev/qcom/PeachStation.c
+@@ -261,6 +261,8 @@
+     STRY(s, peach_wmi_peer_queue(s->wmi, s->htt, s->bssid, 16, peach_rx_queue(s->rx, 16)));
+     s->phase = PeachStationAuth; STRY(s, authenticate(s));
+     s->phase = PeachStationAssoc; STRY(s, associate(s, b));
++    STRY(s, peach_wmi_wmm(s->wmi, s->association.qos ? s->received.frame + 30 : NULL,
++        s->association.qos ? s->received.bytes - 30 : 0));
+     if (s->association.qos)
+         STRY(s, peach_wmi_peer_queue(s->wmi, s->htt, s->bssid, 6, peach_rx_queue(s->rx, 6)));
+     STRY(s, peach_wmi_peer_assoc(s->wmi, s->htt, &s->association));

@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -994,16 +994,17 @@
+     WIFI_TRY(wifi_dma_health());
+     int capture = 0;
+     (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
+-    if (capture == 1) {
++    if (capture == 1 || capture == 2) {
+         /* Reuse the pinned diagnostic slot; no new disk mapping or writer.
+          * Disable frame captures for this diagnostic boot to retain it. */
+         uint32_t capacity = 0;
+         uint8_t *saved = pandora_fbdump_begin(&capacity);
+         if (saved) {
+             uint32_t length = capacity < bytes ? capacity : (uint32_t)bytes;
+-            memcpy(saved, wifi_rddm.bytes, length);
++            uint32_t offset = capture == 2 ? (uint32_t)bytes - length : 0;
++            memcpy(saved, (uint8_t *)wifi_rddm.bytes + offset, length);
+             pandora_fbdump_commit(length);
+-            printf("NEZHA WIFI: RDDM diagnostic prefix queued, %#x of %#lx bytes\n", length, bytes);
++            printf("NEZHA WIFI: RDDM diagnostic range offset %#x bytes %#x of %#lx\n", offset, length, bytes);
+         }
+     }
+     /* cnss2 rddm_header: two u32s followed by at most twelve 64-byte entries.

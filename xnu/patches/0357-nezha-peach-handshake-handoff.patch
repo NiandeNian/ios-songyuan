@@ -1,0 +1,142 @@
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -145,9 +145,11 @@
+ static void link_event(unsigned up)
+ {
+     _Alignas(struct kern_event_msg) unsigned char message[
+-        sizeof(struct kern_event_msg) + sizeof(struct net_event_data)] = {0};
++        KEV_MSG_HEADER_SIZE + sizeof(struct net_event_data)] = {0};
+     struct kern_event_msg *header = (void *)message;
+-    struct net_event_data *data = (void *)(header + 1);
++    /* kern_event_msg includes a trailing event_data[1] placeholder. Its
++     * sizeof is four bytes larger than the actual wire header. */
++    struct net_event_data *data = (void *)(message + KEV_MSG_HEADER_SIZE);
+     header->total_size = sizeof(message); header->vendor_code = KEV_VENDOR_APPLE;
+     header->kev_class = KEV_NETWORK_CLASS; header->kev_subclass = KEV_DL_SUBCLASS;
+     header->event_code = up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF;
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -128,33 +128,45 @@
+     int valid = equal(saved, expected, 16);
+     erase(saved, sizeof(saved)); erase(expected, sizeof(expected)); return valid;
+ }
+-int peach_rsn_start(PeachRsn *r, PeachStation *s, const unsigned char pmk[32])
+-{
+-    if (!r || !s || !pmk || s->phase != PeachStationAwaitKeys || s->error ||
+-        s->security != PeachStationWpa2Psk || !s->rsn_bytes) return PeachMhiInvalid;
++int peach_rsn_prepare(PeachRsn *r, PeachStation *s, unsigned bss_index, const unsigned char pmk[32])
++{
++    if (!r || !s || !pmk || r->phase != PeachRsnIdle ||
++        s->phase != PeachStationIdle || s->error || !s->wmi ||
++        !s->wmi->scan_done || s->wmi->scan_active || bss_index >= s->wmi->bss_count)
++        return PeachMhiInvalid;
++    const PeachWmiBss *b = &s->wmi->bss[bss_index];
++    int err = peach_station_candidate(b, PeachStationWpa2Psk);
++    if (err) return err;
+     memset(r, 0, sizeof(*r)); r->station = s;
+-    for (unsigned i = 0; i < s->wmi->bss_count; i++) {
+-        const PeachWmiBss *b = &s->wmi->bss[i];
+-        if (memcmp(b->bssid, s->bssid, 6)) continue;
+-        for (size_t off = 0; off + 2 <= b->ie_bytes;) {
+-            unsigned n = b->ies[off + 1];
+-            if (n > b->ie_bytes - off - 2) return PeachCeProtocol;
+-            if (b->ies[off] == 48) {
+-                r->ap_rsn_bytes = n + 2; memcpy(r->ap_rsn, b->ies + off, n + 2);
+-            }
+-            off += n + 2;
+-        }
+-        break;
++    for (size_t off = 0; off + 2 <= b->ie_bytes;) {
++        unsigned n = b->ies[off + 1];
++        if (n > b->ie_bytes - off - 2) return PeachCeProtocol;
++        if (b->ies[off] == 48) {
++            r->ap_rsn_bytes = n + 2; memcpy(r->ap_rsn, b->ies + off, n + 2);
++        }
++        off += n + 2;
+     }
+     if (!r->ap_rsn_bytes) return PeachMhiInvalid;
+-    memcpy(r->pmk, pmk, 32); r->phase = PeachRsnM1; r->deadline = now(r) + 10000000;
++    memcpy(r->ap_bssid, b->bssid, 6); memcpy(r->pmk, pmk, 32);
++    r->phase = PeachRsnPrepared;
++    return 0;
++}
++int peach_rsn_start(PeachRsn *r)
++{
++    if (!r || !r->station || r->phase != PeachRsnPrepared) return PeachMhiInvalid;
++    PeachStation *s = r->station;
++    if (s->phase != PeachStationAwaitKeys || s->error ||
++        s->security != PeachStationWpa2Psk || !s->rsn_bytes || !s->tx->bound ||
++        memcmp(s->bssid, r->ap_bssid, 6)) return PeachMhiInvalid;
++    r->phase = PeachRsnM1; r->deadline = now(r) + 10000000;
+     return 0;
+ }
+ static int receive_security(PeachRsn *r, const PeachRxInfo *info)
+ {
+     PeachStation *s = r->station;
+     const PeachHttPeer *p = peach_htt_peer(s->htt, 0, s->bssid);
+-    if (!p || p->generation != s->peer_generation || p->peer != info->peer ||
++    if (memcmp(s->bssid, r->ap_bssid, 6) ||
++        !p || p->generation != s->peer_generation || p->peer != info->peer ||
+         memcmp(info->transmitter, s->bssid, 6)) return 0;
+     if (!info->encrypted) return 1; /* only EAPOL is allowed clear below */
+     unsigned slot = info->multicast ? info->key_index + 1 : 0;
+@@ -258,7 +270,7 @@
+ }
+ int peach_rsn_poll(PeachRsn *r)
+ {
+-    if (!r || !r->station || r->phase == PeachRsnIdle) return 0;
++    if (!r || !r->station || r->phase == PeachRsnIdle || r->phase == PeachRsnPrepared) return 0;
+     if (r->error) return r->error;
+     PeachStation *s = r->station;
+     if (s->error || s->wmi->error || s->htt->error || s->tx->error)
+--- a/bsd/dev/qcom/PeachRsn.h
++++ b/bsd/dev/qcom/PeachRsn.h
+@@ -5,7 +5,7 @@
+ 
+ #define PEACH_RSN_PACKET 640u
+ #define PEACH_RSN_QUEUE 4u
+-enum { PeachRsnIdle, PeachRsnM1, PeachRsnM3, PeachRsnKeys,
++enum { PeachRsnIdle, PeachRsnPrepared, PeachRsnM1, PeachRsnM3, PeachRsnKeys,
+        PeachRsnConnected, PeachRsnFailed };
+ 
+ typedef struct {
+@@ -16,7 +16,7 @@
+     uint32_t expected_security[2], pn_generation[5];
+     uint64_t pn[5][17]; /* separate key generations and QoS/non-QoS replay spaces */
+     unsigned char pmk[32], ptk[48], snonce[32], anonce[32], gtk[16];
+-    unsigned char ap_rsn[257], response_digest[20];
++    unsigned char ap_bssid[6], ap_rsn[257], response_digest[20];
+     unsigned ap_rsn_bytes, reply_bytes, packet_bytes[PEACH_RSN_QUEUE];
+     unsigned char reply[PEACH_RSN_PACKET], packets[PEACH_RSN_QUEUE][PEACH_RSN_PACKET];
+     unsigned char plain[PEACH_RSN_PACKET];
+@@ -26,7 +26,11 @@
+ /* WPA2-PSK/CCMP128, descriptor v2. PMK is supplied by the connection owner;
+  * password derivation/UI are outside the firmware protocol. No WPA1/3, FT,
+  * enterprise, PMF, aggregation or opportunistic security downgrade. */
+-int peach_rsn_start(PeachRsn *, PeachStation *, const unsigned char pmk[32]);
++/* Prepare before association so WMI waits can retain the AP's first EAPOL.
++ * Start after association/TX binding; it preserves that queue and starts the
++ * handshake deadline. Preparation never permits TX or ordinary data. */
++int peach_rsn_prepare(PeachRsn *, PeachStation *, unsigned bss_index, const unsigned char pmk[32]);
++int peach_rsn_start(PeachRsn *);
+ /* Called only by the single protocol worker. RX copies EAPOL into a bounded
+  * queue; it never sends, installs a key, or recursively progresses HTC. The
+  * return value is 1 only for ordinary, authenticated Ethernet data. */
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -997,11 +997,13 @@
+     int err = 0;
+     if (selected == PEACH_WMI_BSS_ENTRIES) peach_net_status(&wifi_wmi, PeachNetReady, ENOENT);
+     else {
++        if (j->security == PeachStationWpa2Psk)
++            err = peach_rsn_prepare(&wifi_rsn, &wifi_station, selected, j->pmk);
+         wifi_step = "802.11 authentication/association";
+-        err = peach_station_associate(&wifi_station, selected, j->security);
++        if (!err) err = peach_station_associate(&wifi_station, selected, j->security);
+         if (!err && j->security == PeachStationWpa2Psk) {
+             wifi_step = "RSN four-way handshake";
+-            err = peach_rsn_start(&wifi_rsn, &wifi_station, j->pmk);
++            err = peach_rsn_start(&wifi_rsn);
+             if (!err) {
+                 wifi_net_state = PeachNetHandshake;
+                 peach_net_status(&wifi_wmi, wifi_net_state, 0);

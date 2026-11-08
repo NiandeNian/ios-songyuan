@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -892,13 +892,15 @@
+     return 0;
+ }
+ /* Android's actual HTT stream configures HOST1/SW-to-SW and, separately,
+- * RXDMA_HOST_BUF/SW-to-HW for both advertised PHYs. The firmware moves
++ * RXDMA_HOST_BUF/SW-to-HW for each active PHY. The firmware moves
+  * buffers between them. These intermediate rings remain firmware-owned;
+  * the host neither seeds them nor consumes their entries. */
+ static int wifi_setup_rxmac(void)
+ {
+     enum { entries = 4096, bytes = entries * 8 + 128 };
+-    wifi_rxmac_count = wifi_wmi.regulatory[1].valid ? 2 : 1;
++    /* Regulatory capabilities also describe inactive PHYs. The selected
++     * SINGLE mode has exactly one PHY; do not configure the DBS sibling. */
++    wifi_rxmac_count = 1;
+     PeachMhiDma memory;
+     WIFI_TRY(wifi_allocate_dma(NULL, bytes * wifi_rxmac_count, &memory));
+     memset(memory.bytes, 0, bytes * wifi_rxmac_count);
+diff --git a/bsd/dev/qcom/PeachHtt.h b/bsd/dev/qcom/PeachHtt.h
+--- a/bsd/dev/qcom/PeachHtt.h
++++ b/bsd/dev/qcom/PeachHtt.h
+@@ -37,8 +37,9 @@
+ /* Real VERSION_REQ/CONF, retaining implicit V1 TCL metadata. A completed
+  * negotiation is not a configured DP path or evidence of packet exchange. */
+ int peach_htt_negotiate(PeachHtt *);
+-/* Serialized SRING_SETUP -> matching successful SRING_SETUP_DONE. Does not
+- * post buffers or imply that the remaining DP/association path is ready. */
++/* Serialized SRING_SETUP -> matching successful SRING_SETUP_DONE. Native
++ * HTT 3.143 RXMAC buffer setup is submission-only, as that command has no
++ * completion. Neither result proves that RX or association is working. */
+ int peach_htt_setup_ring(PeachHtt *, const PeachHttRing *);
+ /* Full Peach RX_MSDU_END + RX_MPDU_START, 4-byte tags, no packet-header
+  * TLV/word compaction. RXDMA ring 0 is distinct from host refill ring 5.

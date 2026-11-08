@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -29,7 +29,7 @@
+ static PeachNetInfo net_info_data;
+ static PeachWmiBss net_bss[PEACH_WMI_BSS_ENTRIES];
+ static PeachWmiScanChannel net_channels[PEACH_WMI_SCAN_CHANNELS];
+-static unsigned net_channel_count, net_join_pending;
++static unsigned net_channel_count, net_join_pending, net_scan_pending;
+ static PeachNetRequest net_request;
+ static mbuf_t net_queue[TX_QUEUE], net_pending;
+ static unsigned net_head, net_count, net_online;
+@@ -59,12 +59,14 @@
+     lck_mtx_lock(&net_lock);
+     int err = net_snapshot.state == PeachNetFailed ? ENXIO :
+         (net_snapshot.state != PeachNetReady && net_snapshot.state != PeachNetOnline) ||
+-        net_request.action ? EBUSY : 0;
++        net_request.action || net_scan_pending ? EBUSY : 0;
+     if (!err) {
+         net_request = *request;
+         if (opt == PeachControlJoin) { net_join_pending = 1; net_info_data.result = 0; }
++        unsigned associated_scan = opt == PeachControlScan && net_snapshot.state == PeachNetOnline;
++        if (opt == PeachControlScan) net_scan_pending = 1;
+         net_snapshot.state = opt == PeachControlJoin ? PeachNetAssociating :
+-            opt == PeachControlScan ? PeachNetScanning : PeachNetRecovering;
++            opt == PeachControlScan ? (associated_scan ? PeachNetOnline : PeachNetScanning) : PeachNetRecovering;
+         net_snapshot.error = 0;
+     }
+     lck_mtx_unlock(&net_lock);
+@@ -116,9 +118,10 @@
+ void peach_net_status(const PeachWmi *w, unsigned state, int error)
+ {
+     lck_mtx_lock(&net_lock);
+-    unsigned scan_done = (net_snapshot.state == PeachNetScanning || net_snapshot.state == PeachNetRecovering) &&
++    unsigned scan_done = (net_scan_pending || net_snapshot.state == PeachNetRecovering) &&
+         (state == PeachNetReady || state == PeachNetOnline ||
+          state == PeachNetFailed || state == PeachNetRecovering);
++    if (scan_done) net_scan_pending = 0;
+     unsigned join_done = net_join_pending &&
+         (state == PeachNetOnline || state == PeachNetReady || state == PeachNetFailed || state == PeachNetRecovering);
+     net_snapshot.state = state; net_snapshot.error = error;

@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -805,12 +805,27 @@
+ {
+     int enabled = 0;
+     (void)PE_parse_boot_argn("nezha_wifi_fw_diag", &enabled, sizeof(enabled));
++    if (enabled == 2) {
++        /* Stock mhi.ko:mhi_force_rddm_mode writes MHICTRL[15:8]=0xff,
++         * then waits for EE=3. Capture the already armed dump after INIT;
++         * no further CE/datapath accesses may run after this transition. */
++        if (!wifi_rddm.bytes || !wifi_rddm_session) return EINVAL;
++        uint32_t control;
++        wifi_step = "V1A controlled firmware snapshot after READY";
++        printf("NEZHA WIFI: V1A snapshot requested after READY; firmware stop is intentional\n");
++        WIFI_TRY(wifi_rd(W_BAR, 0x38, &control));
++        WIFI_TRY(wifi_wr(W_BAR, 0x38, (control & ~0xff00u) | 0xff00u));
++        WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 3, 10000));
++        return ECANCELED; /* existing failure path saves RDDM, then asserts PERST */
++    }
+     if (enabled != 1) return 0;
+     /* Fixed to the collected Nezha amss20 image. A PCIe read of this SRAM
+      * returned all ones followed by memss_security: never repeat that probe.
+-     * Ask the running firmware instead, after WMI READY, using ATHDIAG space 0. */
++     * Ask the running firmware instead, after WMI READY. Stock ath_procfs.c
++     * splits legacy addresses into an 8-bit memory type and 24-bit offset. */
+     uint32_t getter = 0;
+-    int err = peach_wlfw_read_word(&wifi_wlfw, 0x015598b4, 0, &getter);
++    const uint32_t address = 0x015598b4;
++    int err = peach_wlfw_read_word(&wifi_wlfw, address & 0xffffff, address >> 24, &getter);
+     if (err) {
+         printf("NEZHA WIFI: V1A QMI readback unavailable %d result/error %u/%u; proof pending\n",
+             err, wifi_wlfw.result, wifi_wlfw.remote_error);

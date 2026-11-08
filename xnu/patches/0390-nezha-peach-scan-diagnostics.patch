@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -282,6 +282,12 @@
+     unsigned bytes = u32(p + 20), frequency = u32(p + 68);
+     if (n - off < 4 || u32(p + off) >> 16 != 17 ||
+         bytes > (u32(p + off) & 0xffff)) { bad(w); return; }
++    static unsigned reported;
++    if (reported < 3) {
++        reported++;
++        report(w, "WMI RX mgmt status/pdev", u32(p + 24), u32(p + 64));
++        report(w, "WMI RX mgmt frequency/bytes", frequency, bytes);
++    }
+     if (u32(p + 24) || u32(p + 64) != w->radio.pdev || bytes < 24) return;
+     const unsigned char *frame = p + off + 4;
+     unsigned fc = u16(frame);
+@@ -602,6 +608,8 @@
+     for (unsigned i = 0; i < sizeof(five_ghz) / sizeof(five_ghz[0]); i++)
+         WTRY(w, scan_channel(w, 5000 + five_ghz[i] * 5, 2));
+     if (!w->channel_count) return bad(w);
++    report(w, "WMI passive scan channels/country", w->channel_count,
++        w->regulatory[w->radio.phy].alpha2);
+     memset(w->command, 0, sizeof(w->command));
+     unsigned char *p = w->command + 4;
+     tlv(p, TAG_CHANNELS, 12); p32(p + 4, w->channel_count);

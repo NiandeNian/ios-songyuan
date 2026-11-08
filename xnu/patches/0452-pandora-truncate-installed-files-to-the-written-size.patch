@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -111,6 +111,15 @@
+ 			error = EIO;
+ 		}
+ 	}
++	/* vnode_open does not perform open(2)'s O_TRUNC processing. Set the
++	 * final size explicitly so replacing a shorter file cannot retain its
++	 * old tail (in particular a stale binary-plist trailer). */
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_data_size, e->size);
++		error = vnode_setattr(vp, &va, ctx);
++	}
+ 	int cerr = vnode_close(vp, FWRITE, ctx);
+ 	return error ? error : cerr;
+ }

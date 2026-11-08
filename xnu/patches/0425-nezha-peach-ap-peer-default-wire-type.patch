@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -892,7 +892,9 @@
+     if (!s) return PeachCeFull;
+     /* Current fixed struct is 32B, followed by empty non-MLO array. */
+     memset(w->command, 0, 40); tlv(w->command + 4, TAG_PEER_CREATE, 28);
+-    peer_mac(w->command + 12, mac); p32(w->command + 20, type);
++    /* type is this host's self/remote ownership marker. Native STA AP
++     * peers use WMI_PEER_TYPE_DEFAULT=0, not that internal role value. */
++    peer_mac(w->command + 12, mac); p32(w->command + 20, 0);
+     tlv(w->command + 36, TAG_ARRAY, 0);
+     memset(s, 0, sizeof(*s)); s->used = 1; s->type = type; memcpy(s->mac, mac, 6);
+     WTRY(w, send_command(w, 0x6001, 40)); s->create_sent = 1;

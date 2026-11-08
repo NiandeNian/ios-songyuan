@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/qcom/PeachMhiFirmware.h b/bsd/dev/qcom/PeachMhiFirmware.h
+--- a/bsd/dev/qcom/PeachMhiFirmware.h
++++ b/bsd/dev/qcom/PeachMhiFirmware.h
+@@ -36,6 +36,7 @@
+     uint64_t (*now_us)(void *);
+     void (*sleep_us)(void *, unsigned);
+     uint32_t bar_bytes;
++    uint64_t dma_base, dma_bytes; /* isolated IOVA aperture, including firmware */
+ } PeachMhiIo;
+ 
+ typedef struct {
+diff --git a/bsd/dev/qcom/PeachMhiHost.c b/bsd/dev/qcom/PeachMhiHost.c
+--- a/bsd/dev/qcom/PeachMhiHost.c
++++ b/bsd/dev/qcom/PeachMhiHost.c
+@@ -68,7 +68,11 @@
+         !io->now_us || !io->sleep_us || !barrier || !memory.bytes ||
+         ((uintptr_t)memory.bytes & 7) || (memory.iova & 0xfff) ||
+         memory.capacity < PEACH_MHI_HOST_BYTES || memory.iova >= 0x100000000ull ||
+-        PEACH_MHI_HOST_BYTES > 0x100000000ull - memory.iova || io->bar_bytes < 0x1000)
++        PEACH_MHI_HOST_BYTES > 0x100000000ull - memory.iova || io->bar_bytes < 0x1000 ||
++        !io->dma_bytes || io->dma_base >= 0x100000000ull ||
++        io->dma_bytes > 0x100000000ull - io->dma_base || memory.iova < io->dma_base ||
++        memory.iova - io->dma_base >= io->dma_bytes ||
++        PEACH_MHI_HOST_BYTES > io->dma_bytes - (memory.iova - io->dma_base))
+         return PeachMhiInvalid;
+     memset(h, 0, sizeof(*h));
+     h->memory = memory; h->io = io; h->barrier = barrier;
+@@ -107,10 +111,13 @@
+     HOST_TRY(db(h, 0x58, dma(h, CHCTX)));
+     HOST_TRY(db(h, 0x60, dma(h, EVCTX)));
+     HOST_TRY(db(h, 0x68, dma(h, CMDCTX)));
+-    HOST_TRY(db(h, 0x80, memory.iova));
+-    HOST_TRY(db(h, 0x98, memory.iova));
+-    HOST_TRY(db(h, 0x88, memory.iova + PEACH_MHI_HOST_BYTES - 1));
+-    HOST_TRY(db(h, 0xa0, memory.iova + PEACH_MHI_HOST_BYTES - 1));
++    /* MHI's host aperture also covers retained BHIe images/pageable code,
++     * crash reception and later WLFW allocations, as mhi_init_mmio does.
++     * SMMU mappings, not this address envelope, grant actual DMA access. */
++    HOST_TRY(db(h, 0x80, io->dma_base));
++    HOST_TRY(db(h, 0x98, io->dma_base));
++    HOST_TRY(db(h, 0x88, io->dma_base + io->dma_bytes - 1));
++    HOST_TRY(db(h, 0xa0, io->dma_base + io->dma_bytes - 1));
+     uint32_t cfg, control;
+     HOST_TRY(rd(h, 0x10, &cfg));
+     HOST_TRY(wr(h, 0x10, (cfg & 0x0000ffffu) | 2u << 16));
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -701,7 +701,7 @@
+     __asm__ volatile("dsb sy" ::: "memory");
+ }
+ static PeachMhiIo wifi_mhi_io = {NULL, wifi_bar_read, wifi_bar_write, wifi_dma_sync,
+-    wifi_now, wifi_sleep, 0x200000};
++    wifi_now, wifi_sleep, 0x200000, WIFI_IOVA, WIFI_DMA_LIMIT - WIFI_IOVA};
+ static void wifi_barrier(void *c)
+ { (void)c; __asm__ volatile("dsb sy" ::: "memory"); }
+ 

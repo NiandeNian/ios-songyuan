@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -399,12 +399,14 @@
+     }
+     case 0x5001: /* WMI_VDEV_START_RESP_EVENTID */
+         if (tag == TAG_STARTED && len >= 36) {
+-            report(w, "WMI vdev start status/MAC", u32(p + 16), u32(p + 28));
++            report(w, "WMI vdev start status/pdev", u32(p + 16), u32(p + 28));
++            report(w, "WMI vdev start vdev/requestor", u32(p + 4), u32(p + 8));
++            report(w, "WMI vdev start response/expected requestor", u32(p + 12), w->vdev_request);
+             report(w, "WMI vdev start TX/RX streams", u32(p + 32), u32(p + 36));
+         }
+         if (tag != TAG_STARTED || len < 36 || !w->vdev_start_sent || w->vdev_started ||
+             u32(p + 4) || u32(p + 8) != w->vdev_request || u32(p + 12) || u32(p + 16) ||
+-            u32(p + 28) != w->radio.lmac || u32(p + 32) != 1 || u32(p + 36) != 1) {
++            u32(p + 28) != w->radio.pdev || u32(p + 32) != 1 || u32(p + 36) != 1) {
+             bad(w); return;
+         }
+         w->vdev_started = 1;
+@@ -954,7 +956,9 @@
+      * No HT/VHT/HE/EHT or MLO capability is advertised by this start. */
+     memset(w->command, 0, sizeof(w->command));
+     unsigned char *p = w->command + 4;
+-    tlv(p, TAG_START, 140); p32(p + 8, ++w->vdev_request);
++    /* Peach's vendor start command leaves requestor_id zero. One start
++     * per boot is allowed; match that zero with the pending vdev below. */
++    tlv(p, TAG_START, 140); p32(p + 8, w->vdev_request);
+     p32(p + 12, b->beacon_interval); p32(p + 16, b->dtim_period);
+     p32(p + 20, pmf << 1); p32(p + 76, 1); p32(p + 80, 1);
+     p32(p + 132, 1); p32(p + 136, 1);

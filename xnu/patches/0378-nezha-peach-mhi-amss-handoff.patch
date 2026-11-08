@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/qcom/PeachMhiHost.c b/bsd/dev/qcom/PeachMhiHost.c
+--- a/bsd/dev/qcom/PeachMhiHost.c
++++ b/bsd/dev/qcom/PeachMhiHost.c
+@@ -252,7 +252,18 @@
+     uint32_t ee;
+     HOST_TRY(rd(h, h->bhi + 0x28, &ee));
+     if (ee != 2) return PeachMhiWrongEnvironment;
+-    h->environment = ee;
++    /* BHI can advertise AMSS before its control-ring handoff completes.
++     * As in mhi_pm_mission_mode_transition, consume that real EE event
++     * and reach M0 before a client submits its first START command. */
++    uint64_t end = h->io->now_us(h->io->context) + 10000000;
++    do {
++        HOST_TRY(peach_mhi_host_poll(h, 32));
++        if (h->environment == 2 && h->state == 2) break;
++        h->io->sleep_us(h->io->context, 1000);
++    } while (h->io->now_us(h->io->context) < end);
++    if (h->environment != 2 || h->state != 2) {
++        h->poisoned = 1; return PeachMhiTimeout;
++    }
+     HOST_TRY(start_channel(h, 20));
+     HOST_TRY(start_channel(h, 21));
+     for (unsigned i = 0; i < 63; i++) HOST_TRY(recycle_rx(h));

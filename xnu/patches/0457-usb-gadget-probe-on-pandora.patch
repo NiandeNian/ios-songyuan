@@ -1,0 +1,11 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1587,6 +1587,9 @@ static int sweet_ufs_probe(void)
+ 	/* USB controller handover state, read only, boot-arg pandora_usb (bsd/dev/pandora_usb.c). */
+ 	pandora_usb_init();
++	/* USB gadget probe / start, boot-arg sweetusb (bsd/dev/sweet_usb.c).
++	 * Previously only called on non-FUXI boards; Nezha needs it too for device-mode USB. */
++	sweet_usb_probe();
+ #endif
+ 	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
+ 	fuxi_keys_init();

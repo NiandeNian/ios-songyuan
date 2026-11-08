@@ -1,0 +1,71 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -182,7 +182,13 @@
+             if (d[2] & 0x80000000u) return invalid(t);
+             continue;
+         }
+-        unsigned cookie = (d[2] >> 18) & 4095 | ((d[7] >> 20) & 255) << 12;
++        /* With CC disabled, native hal_tx_comp_get_desc_id reads the
++         * original buffer_addr_info in DWORDs 0/1. Only converted records
++         * move the cookie/RBM into the completion metadata. */
++        unsigned converted = !!(d[2] & 0x40000000u);
++        unsigned cookie = converted ?
++            ((d[2] >> 18) & 4095) | ((d[7] >> 20) & 255) << 12 : d[1] >> 12;
++        unsigned rbm = converted ? (d[2] >> 9) & 15 : (d[1] >> 8) & 15;
+         unsigned peer = (source == 3 ? d[5] : d[7]) & 65535;
+         if (t->acked + t->dropped < 3 && t->htt->htc->ops.log) {
+             t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion source/status", source, status);
+@@ -191,7 +197,7 @@
+         /* Peach bit30 reports cookie conversion, not an internal error.
+          * Keep using our cookie table; never dereference the returned VA. */
+         if ((source != 0 && source != 3) || ((d[2] >> 6) & 7) != 0 ||
+-            ((d[2] >> 9) & 15) != TX_RBM || (d[2] & 0x80000000u)) return invalid(t);
++            rbm != TX_RBM || (d[2] & 0x80000000u)) return invalid(t);
+         /* FW reinject/inspect return ownership too (dp_tx_*_handler),
+          * but are dropped by this STA path and never counted as ACKs.
+          * Their overlay is not the OK/DROP/TTL peer-status layout. */
+@@ -205,6 +211,8 @@
+         unsigned i = cookie & (PEACH_TX_BUFFERS - 1);
+         if (!t->bound || !t->owned[i] || cookie != t->cookies[i] ||
+             ((source == 0 || (status < 3 && (d[5] & (1u << 21)))) && peer != t->peer)) return invalid(t);
++        if (!converted && (d[0] | (uint64_t)(d[1] & 255) << 32) !=
++            t->memory.iova + i * PEACH_TX_BUFFER_BYTES + 2) return invalid(t);
+         /* A source TP advance did not release this buffer. Only this
+          * validated completion permits reuse, including failed TX. */
+         t->owned[i] = 0; t->in_flight--;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1083,6 +1083,7 @@
+     }
+     if (wifi_tx.error) {
+         const uint32_t *d = wifi_tx.last_descriptor;
++        printf("NEZHA WIFI: TX last completion DWORDs0..1 %#x %#x\n", d[0], d[1]);
+         printf("NEZHA WIFI: TX last completion DWORDs2..7 %#x %#x %#x %#x %#x %#x\n",
+             d[2], d[3], d[4], d[5], d[6], d[7]);
+     }
+@@ -1380,11 +1381,20 @@
+     for (unsigned i = 0; i < wifi_wmi.bss_count; i++) {
+         const PeachWmiBss *b = &wifi_wmi.bss[i];
+         if (b->ssid_bytes != j->ssid_bytes || memcmp(b->ssid, j->ssid, j->ssid_bytes) ||
+-            (j->bssid_valid && memcmp(b->bssid, j->bssid, 6)) ||
+-            peach_station_candidate(b, j->security)) continue;
++            (j->bssid_valid && memcmp(b->bssid, j->bssid, 6))) continue;
++        int rejected = peach_station_candidate(b, j->security);
++        if (rejected) {
++            printf("NEZHA WIFI: candidate rejected %d MHz %u capability %#x DTIM %u IE bytes/truncated %u/%u\n",
++                rejected, b->frequency, b->capability, b->dtim_period, b->ie_bytes, b->ies_truncated);
++            continue;
++        }
+         if (selected == PEACH_WMI_BSS_ENTRIES || b->rssi > wifi_wmi.bss[selected].rssi) selected = i;
+     }
+-    if (selected == PEACH_WMI_BSS_ENTRIES) peach_net_status(&wifi_wmi, PeachNetReady, ENOENT);
++    if (selected == PEACH_WMI_BSS_ENTRIES) {
++        printf("NEZHA WIFI: no usable candidate in %u BSS, scan dropped %u\n",
++            wifi_wmi.bss_count, wifi_wmi.bss_dropped);
++        peach_net_status(&wifi_wmi, PeachNetReady, ENOENT);
++    }
+     else {
+         peach_net_selection(&wifi_wmi.bss[selected], j->security);
+         const PeachWmiBss *b = &wifi_wmi.bss[selected];

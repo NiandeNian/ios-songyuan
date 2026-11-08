@@ -1,0 +1,212 @@
+diff --git a/bsd/dev/qcom/PeachMhiFirmware.h b/bsd/dev/qcom/PeachMhiFirmware.h
+--- a/bsd/dev/qcom/PeachMhiFirmware.h
++++ b/bsd/dev/qcom/PeachMhiFirmware.h
+@@ -60,4 +60,10 @@
+  * enter M0 and wait for EE=SBL. This call checks EE; it cannot replace that
+  * host state machine. The caller must verify EE=AMSS after it succeeds. */
+ int peach_mhi_download_amss(PeachMhiFirmware *, const PeachMhiIo *, uint32_t session);
++/* Prearm RDDM in SBL before AMSS, as mhi_prepare_for_power_up does. Both
++ * storage and vectors remain mapped through containment, also on failure. */
++int peach_mhi_prepare_rddm(PeachMhiFirmware *, const PeachMhiIo *, PeachMhiDma dump,
++                           PeachMhiDma vectors, uint32_t session);
++/* Receive an already-crashed target's dump. No forced crash or reset. */
++int peach_mhi_read_rddm(PeachMhiFirmware *, const PeachMhiIo *, uint32_t session);
+ #endif
+diff --git a/bsd/dev/qcom/PeachMhiFirmware.c b/bsd/dev/qcom/PeachMhiFirmware.c
+--- a/bsd/dev/qcom/PeachMhiFirmware.c
++++ b/bsd/dev/qcom/PeachMhiFirmware.c
+@@ -152,3 +152,43 @@
+     if (!error) f->phase = 3;
+     return error;
+ }
++
++int peach_mhi_prepare_rddm(PeachMhiFirmware *f, const PeachMhiIo *io, PeachMhiDma dump,
++                           PeachMhiDma vectors, uint32_t session)
++{
++    if (!f || !valid_io(io, session) || io->bar_bytes < 0x7c ||
++        f->bhie > io->bar_bytes - 0x7c || !dump.capacity ||
++        dump.capacity > PEACH_MHI_MAX_SEGMENTS * PEACH_MHI_SEGMENT_BYTES ||
++        !valid_dma(&dump, dump.capacity)) return PeachMhiInvalid;
++    unsigned count = (unsigned)((dump.capacity + PEACH_MHI_SEGMENT_BYTES - 1) / PEACH_MHI_SEGMENT_BYTES);
++    if (!valid_dma(&vectors, count * 16)) return PeachMhiInvalid;
++    uint32_t ee;
++    if (io->read32(io->context, f->bhi + 0x28, &ee)) return PeachMhiIoError;
++    if (ee != 1) return PeachMhiWrongEnvironment;
++    size_t offset = 0;
++    for (unsigned i = 0; i < count; i++) {
++        size_t bytes = dump.capacity - offset;
++        if (bytes > PEACH_MHI_SEGMENT_BYTES) bytes = PEACH_MHI_SEGMENT_BYTES;
++        put64((uint8_t *)vectors.bytes + i * 16, dump.iova + offset);
++        put64((uint8_t *)vectors.bytes + i * 16 + 8, bytes);
++        offset += bytes;
++    }
++    io->sync(io->context, &dump, dump.capacity);
++    io->sync(io->context, &vectors, count * 16);
++    int error;
++    if ((error = write32(io, f->bhie + 0x64, (uint32_t)(vectors.iova >> 32))) ||
++        (error = write32(io, f->bhie + 0x60, (uint32_t)vectors.iova)) ||
++        (error = write32(io, f->bhie + 0x68, count * 16)) ||
++        (error = write32(io, f->bhie + 0x70, session))) return error;
++    return 0;
++}
++
++int peach_mhi_read_rddm(PeachMhiFirmware *f, const PeachMhiIo *io, uint32_t session)
++{
++    if (!f || !valid_io(io, session) || io->bar_bytes < 0x7c ||
++        f->bhie > io->bar_bytes - 0x7c) return PeachMhiInvalid;
++    uint32_t ee;
++    if (io->read32(io->context, f->bhi + 0x28, &ee)) return PeachMhiIoError;
++    if (ee != 3) return PeachMhiWrongEnvironment;
++    return wait_status(f, io, f->bhie + 0x78, session);
++}
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -73,6 +73,8 @@
+ static ArmSmmu4KStreamState wifi_stream;
+ static ArmSmmu4KStreamResult wifi_stream_result;
+ static PeachMhiFirmware wifi_firmware;
++static PeachMhiDma wifi_rddm;
++static uint32_t wifi_rddm_session;
+ static PeachMhiHost wifi_host;
+ static PeachWlfw wifi_wlfw;
+ static PeachCe wifi_ce;
+@@ -865,6 +867,71 @@
+ }
+ 
+ static int
++wifi_rddm_reason(void)
++{
++    /* This phone's qcom,wlan-ramdump-dynamic is 6 MiB. The dump was prearmed
++     * in SBL and remains in its isolated mapping through containment. */
++    const size_t bytes = 0x600000;
++    if (!wifi_rddm.bytes || !wifi_rddm_session) return ENOENT;
++    wifi_check_at = 0;
++    WIFI_TRY(wifi_dma_health());
++    int err = peach_mhi_read_rddm(&wifi_firmware, &wifi_mhi_io, wifi_rddm_session);
++    printf("NEZHA WIFI: RDDM result %d status %#x\n", err, wifi_firmware.last_status);
++    if (err) return EIO;
++    wifi_barrier(NULL);
++    wifi_check_at = 0;
++    WIFI_TRY(wifi_dma_health());
++    /* cnss2 rddm_header: two u32s followed by at most twelve 64-byte entries.
++     * File contents follow the header in table order, not at target PAs. */
++    uint32_t header[2];
++    memcpy(header, wifi_rddm.bytes, sizeof(header));
++    printf("NEZHA WIFI: RDDM version %u header %#x\n", header[0], header[1]);
++    if (header[1] < 8 || header[1] > 8 + 12 * 64 || (header[1] - 8) % 64) return EINVAL;
++    size_t offset = header[1];
++    for (unsigned i = 0; i < (header[1] - 8) / 64; i++) {
++        const unsigned char *entry = (unsigned char *)wifi_rddm.bytes + 8 + i * 64;
++        uint64_t size;
++        memcpy(&size, entry + 16, sizeof(size));
++        if (size > bytes - offset) return EINVAL;
++        printf("NEZHA WIFI: RDDM file %.20s size %#llx\n", entry + 44, size);
++        if (!memcmp(entry + 44, "Q6-SFR.bin", 11)) {
++            unsigned length = size > 1024 ? 1024 : (unsigned)size;
++            printf("NEZHA WIFI: firmware reason %.*s\n", length, (char *)wifi_rddm.bytes + offset);
++            return 0;
++        }
++        offset += (size_t)size;
++    }
++    return ENOENT;
++}
++
++static void wifi_mhi_failure(void)
++{
++    if (wifi_phase < 6 || wifi_fault) return;
++    uint32_t status = 0, debug[6] = {0};
++    (void)wifi_rd(W_BAR, 0x48, &status);
++    printf("NEZHA WIFI: MHI state %u EE %u status %#x ring %#llx event %#llx %#x %#x\n",
++        wifi_host.state, wifi_host.environment, status,
++        wifi_host.last_ring_pointer, wifi_host.last_event_pointer,
++        wifi_host.last_event_data[0], wifi_host.last_event_data[1]);
++    for (unsigned i = 0; i < 6; i++)
++        if (wifi_rd(W_BAR, wifi_firmware.bhi + 0x28 + i * 4, &debug[i])) return;
++    printf("NEZHA WIFI: BHI EE/status/error/debug %#x %#x %#x %#x %#x %#x, TX %u/%u RX %u/%u\n",
++        debug[0], debug[1], debug[2], debug[3], debug[4], debug[5],
++        wifi_host.tx_rp, wifi_host.tx_wp, wifi_host.rx_rp, wifi_host.rx_wp);
++    if (wifi_host.memory.bytes) for (unsigned ch = 20; ch <= 21; ch++) {
++        uint32_t ctx[11], tre[4] = {0};
++        memcpy(ctx, (unsigned char *)wifi_host.memory.bytes + ch * 44, sizeof(ctx));
++        if (ctx[3] >= wifi_host.memory.iova &&
++            ctx[3] - wifi_host.memory.iova <= wifi_host.memory.capacity - sizeof(tre))
++            memcpy(tre, (unsigned char *)wifi_host.memory.bytes + ctx[3] - wifi_host.memory.iova, sizeof(tre));
++        printf("NEZHA WIFI: MHI ch%u cfg/type/er %#x/%#x/%#x base/len/rp/wp %#x/%#x/%#x/%#x first TRE %#x:%#x %#x %#x\n",
++            ch, ctx[0], ctx[1], ctx[2], ctx[3], ctx[5], ctx[7], ctx[9],
++            tre[1], tre[0], tre[2], tre[3]);
++    }
++    if (debug[0] == 3) (void)wifi_rddm_reason();
++}
++
++static int
+ wifi_start(void)
+ {
+     for (unsigned i = 0; i < W_NWIN; i++) WIFI_TRY(wifi_map(i));
+@@ -890,6 +957,18 @@
+         wifi_dma_part(0x810000, PEACH_MHI_HOST_BYTES), wifi_barrier);
+     if (err) return EIO;
+     WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 1, 10000));
++    wifi_step = "prearm firmware crash reason";
++    WIFI_TRY(wifi_allocate_dma(NULL, 0x601000, &wifi_rddm));
++    PeachMhiDma dump = {wifi_rddm.bytes, wifi_rddm.iova, 0x600000};
++    PeachMhiDma vectors = {(unsigned char *)wifi_rddm.bytes + 0x600000,
++        wifi_rddm.iova + 0x600000, 0x1000};
++    read_random(&wifi_rddm_session, sizeof(wifi_rddm_session));
++    wifi_rddm_session = (wifi_rddm_session & 0x3fffffffu) | 1;
++    err = peach_mhi_prepare_rddm(&wifi_firmware, &wifi_mhi_io, dump, vectors, wifi_rddm_session);
++    if (err) {
++        printf("NEZHA WIFI: RDDM prepare failed: %d\n", err);
++        return EIO;
++    }
+     wifi_phase = 7;
+     wifi_step = "BHIe AMSS download";
+     read_random(&session, sizeof(session));
+@@ -902,32 +981,16 @@
+     WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 2, 10000));
+     wifi_step = "MHI IPCR channels";
+     if (peach_wlfw_init(&wifi_wlfw, &wifi_host, &wifi_wlfw_ops)) return EIO;
+-    if (peach_mhi_host_open_ipcr(&wifi_host)) return EIO;
++    err = peach_mhi_host_open_ipcr(&wifi_host);
++    if (err) {
++        printf("NEZHA WIFI: MHI IPCR open failed: %d\n", err);
++        return EIO;
++    }
+     wifi_phase = 8;
+     wifi_step = "QRTR/WLFW bootstrap";
+     err = peach_wlfw_bootstrap(&wifi_wlfw);
+     if (err) {
+         printf("NEZHA WIFI: WLFW phase %u failed: %d\n", wifi_wlfw.phase, err);
+-        printf("NEZHA WIFI: MHI state %u EE %u status %#x ring %#llx event %#llx %#x %#x\n",
+-            wifi_host.state, wifi_host.environment, wifi_host.last_status,
+-            wifi_host.last_ring_pointer, wifi_host.last_event_pointer,
+-            wifi_host.last_event_data[0], wifi_host.last_event_data[1]);
+-        uint32_t debug[6] = {0};
+-        for (unsigned i = 0; i < 6; i++)
+-            if (wifi_rd(W_BAR, wifi_host.bhi + 0x28 + i * 4, &debug[i])) break;
+-        printf("NEZHA WIFI: BHI EE/status/error/debug %#x %#x %#x %#x %#x %#x, TX %u/%u RX %u/%u\n",
+-            debug[0], debug[1], debug[2], debug[3], debug[4], debug[5],
+-            wifi_host.tx_rp, wifi_host.tx_wp, wifi_host.rx_rp, wifi_host.rx_wp);
+-        for (unsigned ch = 20; ch <= 21; ch++) {
+-            uint32_t ctx[11], tre[4] = {0};
+-            memcpy(ctx, (unsigned char *)wifi_host.memory.bytes + ch * 44, sizeof(ctx));
+-            if (ctx[3] >= wifi_host.memory.iova &&
+-                ctx[3] - wifi_host.memory.iova <= wifi_host.memory.capacity - sizeof(tre))
+-                memcpy(tre, (unsigned char *)wifi_host.memory.bytes + ctx[3] - wifi_host.memory.iova, sizeof(tre));
+-            printf("NEZHA WIFI: MHI ch%u cfg/type/er %#x/%#x/%#x base/len/rp/wp %#x/%#x/%#x/%#x first TRE %#x:%#x %#x %#x\n",
+-                ch, ctx[0], ctx[1], ctx[2], ctx[3], ctx[5], ctx[7], ctx[9],
+-                tre[1], tre[0], tre[2], tre[3]);
+-        }
+         return EIO;
+     }
+     wifi_phase = 9;
+@@ -1099,7 +1162,8 @@
+         }
+         if (!err) wifi_sleep(NULL, wifi_tx.bound ? 1000 : 5000);
+     }
+-    peach_net_stop(err); peach_rsn_clear(&wifi_rsn); wifi_contain();
++    peach_net_stop(err); peach_rsn_clear(&wifi_rsn);
++    wifi_mhi_failure(); wifi_contain();
+     printf("NEZHA WIFI: phase %u stopped in %s: %d; data link down\n",
+         wifi_phase, wifi_step, err);
+     thread_terminate(current_thread());

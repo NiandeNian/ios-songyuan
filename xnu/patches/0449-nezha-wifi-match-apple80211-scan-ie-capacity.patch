@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -37,7 +37,7 @@
+     unsigned frequency, ssid_bytes, ie_bytes, ies_truncated, dtim_period;
+     uint64_t seen_us;
+     int rssi;
+-    unsigned char bssid[6], ssid[32], ies[512];
++    unsigned char bssid[6], ssid[32], ies[1024]; /* Apple80211 scan IE capacity */
+     uint16_t capability, beacon_interval;
+ } PeachWmiBss;
+ 

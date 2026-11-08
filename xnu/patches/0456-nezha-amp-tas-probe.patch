@@ -1,0 +1,908 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/fuxi_touch.c			standard
+ bsd/dev/pandora_touch.c			standard
+ bsd/dev/pandora_amp.c			standard
++bsd/dev/pandora_amp_tas.c		standard
+ bsd/dev/pandora_csfw.c			standard
+ bsd/dev/pandora_gpi.c			standard
+ bsd/dev/pandora_therm.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -61,6 +61,7 @@
+ #if defined(PANDORA)
+ extern void pandora_touch_init(void);
+ extern void pandora_amp_init(void);
++extern void pandora_amp_tas_init(void);
+ extern void pandora_selftest_init(void);
+ extern void pandora_adsp_init(void);
+ extern void pandora_files_init(void);
+@@ -1570,6 +1571,8 @@
+ 	pandora_touch_init();
+ 	/* Speaker amplifiers, I2C probe only (bsd/dev/pandora_amp.c). */
+ 	pandora_amp_init();
++	/* Nezha TAS25xx amplifiers, I2C probe (bsd/dev/pandora_amp_tas.c). */
++	pandora_amp_tas_init();
+ 	/* Input self-test, boot-arg pandora_selftest (bsd/dev/pandora_selftest.c). */
+ 	pandora_selftest_init();
+ 	/* Audio DSP bring-up, boot-arg pandora_adsp (bsd/dev/pandora_adsp.c). */
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1792,6 +1792,7 @@
+ /* ---- level 3: the speaker graph (0262) ---- */
+ extern uint8_t *pandora_fw_file(const char *name, uint32_t *size);   /* pandora_amp.c: a file of the pinned pack */
+ extern void pandora_amp_tdm(void);                                    /* pandora_amp.c */
++extern void pandora_amp_tas_tdm(int);                                /* Nezha TAS25xx */
+ 
+ static void
+ spk_put16(uint8_t *p, uint32_t v)
+@@ -1914,6 +1915,7 @@
+ static void
+ spk_graph_begin(void)
+ {
++	pandora_amp_tas_tdm(0);
+ 	uint32_t size = 0;
+ 	const char *file = spk_cur == SpkReceiver ? "rcvgraph.bin" : "spkgraph.bin";
+ 	uint8_t *f = pandora_fw_file(file, &size);
+@@ -2071,6 +2073,7 @@
+ static void
+ spk_graph_end(bool started)
+ {
++	pandora_amp_tas_tdm(0);
+ 	spk.ncmd = spk.icmd = 0;
+ 	spk.closing = true;
+ 	if (started) {
+@@ -2107,6 +2110,7 @@
+ 			spk_amp_started = true;           /* 0300: the amps' first play, once */
+ 			pandora_amp_tdm();
+ 		}
++		pandora_amp_tas_tdm(spk_cur == SpkSpeaker);
+ 	} else if (spk.opened) {
+ 		spk_graph_end(false);
+ 	} else {
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -1038,9 +1038,13 @@
+  * Waits up to WAIT_MS for it. 0 when they are as asked, ENODEV when the power thread does not run (yet), ETIMEDOUT,
+  * EIO. */
+ int pandora_amp_io(int mode, unsigned wait_ms);
++extern bool pandora_amp_tas_live(void);
++extern int pandora_amp_tas_io(int, unsigned);
++extern void pandora_amp_tas_final(const char *);
+ int
+ pandora_amp_io(int mode, unsigned wait_ms)
+ {
++	if (pandora_amp_tas_live()) return pandora_amp_tas_io(mode, wait_ms);
+ 	pa_want = mode >= PA_OFF && mode <= PA_RECEIVER ? (uint32_t)mode : PA_OFF;
+ 	const uint32_t req = __atomic_add_fetch(&pa_req, 1, __ATOMIC_ACQ_REL);
+ 	thread_wakeup((event_t)&pa_req);
+@@ -1063,6 +1067,7 @@
+ void
+ pandora_amp_final(const char *why)
+ {
++	if (pandora_amp_tas_live()) { pandora_amp_tas_final(why); return; }
+ 	if (!pa_follow) {
+ 		return;
+ 	}
+--- /dev/null
++++ b/bsd/dev/pandora_amp_tas.c
+@@ -0,0 +1,818 @@
++/*
++ * NEZHA speaker amplifiers: TI TAS25xx, two chips on QUPv3 wrapper 3 SE0 I2C
++ * (0x01980000, Android i2c-13) - the same controller the 17 Pro's CS35L43s use.
++ * Per this board's live device tree (tas25xx@4a under i2c@1980000):
++ *   - channel 0 at 0x4a, released by reset-gpio TLMM GPIO 54;
++ *   - channel 1 at 0x48, released by reset-gpio2 TLMM GPIO 56;
++ *   - shared ti,irq-gpio GPIO 47 (nothing listens to it here);
++ *   - shutdown lines spkr_02_sd_n = GPIO 76, spkr_13_sd_n = GPIO 77
++ *     (active = output high; idle = pull-down input; Android drives them
++ *     high through the pinctrl states when the speaker path assembles).
++ * Android's tas25xx_dlkm talks 8-bit book:page:register, one byte per write;
++ * the collected trace is device/private/phone/wifi-audio-bootlog.txt and the
++ * authoritative reset sequence comes from disassembling this board's own
++ * tas25xx_dlkm.ko (tas25xx_hw_reset: both resets low, msleep 20 ms, both
++ * high, usleep 10 ms; XRESET is active low).
++ * Mode 1 samples GPIO47 and reads the two chips. Mode 2 additionally loads
++ * the phone's original tismartpa_driver_tuning.bin, initializes each chip,
++ * and plays for 10 seconds after the Nezha ADSP speaker graph is running.
++ * No new PMIC votes are needed: both chips ACK before any audio rail vote.
++ * Historical err 22 reports were rejected combined I2C calls, not NACKs.
++ */
++#if defined(PANDORA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern uint8_t *pandora_fw_file(const char *, uint32_t *);
++void pandora_amp_tas_init(void);
++void pandora_amp_tas_tdm(int);
++bool pandora_amp_tas_live(void);
++int pandora_amp_tas_io(int, unsigned);
++void pandora_amp_tas_final(const char *);
++
++#define TA_GCC_PA   0x00100000u
++#define TA_SE_PA    0x01980000u      /* wrapper 3 SE0: the TAS amps' bus */
++#define TA_TLMM_PA  0x0f100000u
++#define TA_GPIO(n)  ((uint32_t)(n) * 0x1000u)
++#define TA_VOTE     0x52018u         /* wrapper 3 votes */
++#define TA_VOTE_BITS (0x1fu << 8)
++#define TA_RCG      0xa8014u         /* wrapper 3 SE0 RCG (cmd) */
++#define SE_STATUS   0x040u
++#define SE_MCLK     0x048u
++#define SE_IF_DIS   0x064u
++#define SE_FW       0x068u
++#define SE_CLK_SEL  0x07cu
++#define SE_DMA      0x258u
++#define SE_TX_LEN   0x26cu
++#define SE_RX_LEN   0x270u
++#define SE_SCL      0x278u
++#define SE_CMD      0x600u
++#define SE_CTRL     0x604u
++#define SE_IRQ      0x610u
++#define SE_IRQ_EN   0x614u
++#define SE_IRQ_CLR  0x618u
++#define SE_TX       0x700u
++#define SE_RX       0x780u
++#define SE_TX_COUNT 0x800u
++#define SE_RX_COUNT 0x804u
++#define SE_TX_WM    0x80cu
++#define SE_HW_TX    0xe24u
++#define SE_HW_RX    0xe28u
++#define TA_MAX      128u    /* at most one TAS register page per I2C message */
++#define SE_DONE     (1u << 0)
++#define SE_NACK     (1u << 10)
++#define SE_ERRORS   (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | \
++                     (3u << 24) | (3u << 28))
++#define SE_TX_WM_IRQ (1u << 30)
++#define SE_EVENTS   (SE_DONE | SE_ERRORS | (1u << 26) | (1u << 27) | SE_TX_WM_IRQ)
++#define SE_PACK0    0x0007f8feu
++#define SE_PACK1    0x000ffefeu
++
++static vm_offset_t ta_gcc, ta_se, ta_tlmm, ta_se_cur;
++static int ta_chan;          /* sleep wchan, one per driver */
++static int ta_level;
++static unsigned ta_txw = 1;
++static uint32_t ta_tdm_running;
++static uint32_t ta_req, ta_done, ta_want, ta_mode, ta_ready, ta_final, ta_event;
++static int ta_last_error;
++static const uint8_t ta_addresses[] = {0x4a, 0x48};
++static int ta_book[2] = {-1, -1}, ta_page[2] = {-1, -1};
++
++static void
++ta_notify(void)
++{
++	__atomic_add_fetch(&ta_event, 1, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&ta_event);
++}
++
++static uint32_t
++ta_rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++ta_wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++ta_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ta_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++ta_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int out)
++{
++	if (out >= 0) {
++		ta_wr(ta_tlmm, TA_GPIO(n) + 4, out ? 2u : 0u);
++	}
++	uint32_t ctl = ta_rd(ta_tlmm, TA_GPIO(n)) & ~0x3ffu;
++	ctl |= pull | (func << 2) | ((ma / 2 - 1) << 6) | (out >= 0 ? 0x200u : 0u);
++	if (ctl & (1u << 11)) {
++		ctl |= 1u << 12;
++	}
++	ta_wr(ta_tlmm, TA_GPIO(n), ctl);
++}
++
++/* GPIO47 is the TAS25xx open-drain INT line. Following both pulls means
++ * high impedance: this includes powered, idle chips and cannot prove loss
++ * of power. A constant low also needs comparison with the Android baseline.
++ * Restore the inherited configuration so this observation has no lasting
++ * effect on the shared IRQ line. */
++static void
++ta_irq_sample(void)
++{
++	uint32_t saved = ta_rd(ta_tlmm, TA_GPIO(47));
++	ta_gpio(47, 0, 3, 2, -1); /* input, pull-up */
++	ta_sleep(1);
++	uint32_t up = ta_rd(ta_tlmm, TA_GPIO(47) + 4);
++	ta_gpio(47, 0, 1, 2, -1); /* input, pull-down */
++	ta_sleep(1);
++	uint32_t down = ta_rd(ta_tlmm, TA_GPIO(47) + 4);
++	printf("PANDORA AMP TAS: IRQ GPIO47 pull-up raw=%#x level=%u; pull-down raw=%#x level=%u\n",
++	    up, up & 1u, down, down & 1u);
++	ta_wr(ta_tlmm, TA_GPIO(47), saved);
++}
++
++static bool
++ta_on(uint32_t cbcr)
++{
++	return !(ta_rd(ta_gcc, cbcr) & 0x80000000u);
++}
++
++/* Wrapper 3 SE0 clocks, as pandora_amp.c (gcc-kaanapali anchors). */
++static int
++ta_clocks_w3(unsigned *level)
++{
++	ta_wr(ta_gcc, TA_VOTE, ta_rd(ta_gcc, TA_VOTE) | TA_VOTE_BITS);
++	static const uint32_t br[] = {0x233f0, 0x233f4, 0x233f8, 0x2340c};
++	for (unsigned i = 0; i < 4; i++) {
++		for (unsigned t = 0; t < 10000 && !ta_on(br[i]); t++) {
++			delay(1);
++		}
++		if (!ta_on(br[i])) {
++			printf("PANDORA AMP TAS: wrapper 3 clock %#x off (%#x)\n", br[i], ta_rd(ta_gcc, br[i]));
++			return EIO;
++		}
++	}
++	*level = 0;
++	if (ta_rd(ta_gcc, TA_RCG + 0x14) & 1u) {
++		while (*level < 8 && (ta_rd(ta_gcc, TA_RCG + 0x1c + 4 * *level) & 0x371fu) != 1u) {
++			(*level)++;
++		}
++		if (*level == 8) {
++			printf("PANDORA AMP TAS: no XO DFS level\n");
++			return EIO;
++		}
++	} else {
++		ta_wr(ta_gcc, TA_RCG + 4, (ta_rd(ta_gcc, TA_RCG + 4) & ~(0x371fu | (1u << 20))) | 1u);
++		ta_wr(ta_gcc, TA_RCG, ta_rd(ta_gcc, TA_RCG) | 1u);
++		for (unsigned t = 0; t < 5000 && (ta_rd(ta_gcc, TA_RCG) & 1u); t++) {
++			delay(1);
++		}
++	}
++	return 0;
++}
++
++static void
++ta_abort(void)
++{
++	ta_wr(ta_se_cur, SE_CTRL, 2);
++	for (unsigned i = 0; i < 5000 && !(ta_rd(ta_se_cur, SE_IRQ) & (1u << 5)); i++) {
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (ta_rd(ta_se_cur, SE_RX_COUNT) & 0x1ffffffu); i++) {
++		(void)ta_rd(ta_se_cur, SE_RX);
++	}
++	ta_wr(ta_se_cur, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* One I2C message on ta_se_cur, as pandora_amp.c's pa_xfer (i2c-qcom-geni.c). */
++static int
++ta_xfer(uint8_t addr, const uint8_t *hdr, unsigned nh, uint8_t *rx, unsigned nr, bool stretch)
++{
++	const unsigned nt = nh;
++	if (nt > TA_MAX || nr > TA_MAX || (nt && nr) || (!nt && !nr)) {
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < 5000 && (ta_rd(ta_se_cur, SE_STATUS) & 1u); i++) {
++		delay(1);
++	}
++	if (ta_rd(ta_se_cur, SE_STATUS) & 1u) {
++		return EBUSY;
++	}
++	ta_wr(ta_se_cur, SE_IRQ_CLR, 0xffffffffu);
++	ta_wr(ta_se_cur, SE_TX_WM, nt ? 1u : 0u);
++	ta_wr(ta_se_cur, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	ta_wr(ta_se_cur, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	unsigned got = 0, put = 0;
++	uint64_t deadline;
++	clock_interval_to_deadline(20000u + 200u * (nt + nr), NSEC_PER_USEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint32_t irq = ta_rd(ta_se_cur, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			int err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); j++) {
++				delay(1);
++				irq = ta_rd(ta_se_cur, SE_IRQ);
++			}
++			if (!(irq & SE_DONE) || (ta_rd(ta_se_cur, SE_STATUS) & 1u)) {
++				ta_abort();
++			}
++			ta_wr(ta_se_cur, SE_IRQ_CLR, 0xffffffffu);
++			return err;
++		}
++		if (put < nt && (irq & SE_TX_WM_IRQ)) {
++			for (unsigned k = 0; k < ta_txw && put < nt; k++) {
++				uint32_t w = 0;
++				for (unsigned j = 0; j < 4 && put < nt; j++, put++) {
++					w |= (uint32_t)hdr[put] << (8u * j);
++				}
++				ta_wr(ta_se_cur, SE_TX, w);
++			}
++			if (put == nt) {
++				ta_wr(ta_se_cur, SE_TX_WM, 0);
++			}
++		}
++		uint32_t wc = ta_rd(ta_se_cur, SE_RX_COUNT) & 0x1ffffffu;
++		while (wc--) {
++			uint32_t w = ta_rd(ta_se_cur, SE_RX);
++			for (unsigned j = 0; j < 4 && got < nr; j++) {
++				rx[got++] = (uint8_t)(w >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			ta_wr(ta_se_cur, SE_IRQ_CLR, 0xffffffffu);
++			return (got == nr && put == nt) ? 0 : EIO;
++		}
++		ta_wr(ta_se_cur, SE_IRQ_CLR, irq & ((1u << 26) | (1u << 27) | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	ta_abort();
++	return ETIMEDOUT;
++}
++
++/* TI 8-bit protocol: the register byte with a repeated start, then one byte. */
++static int
++ta_read(uint8_t addr, uint8_t reg, uint8_t *val)
++{
++	/* ta_xfer implements one GENI command, not a combined write/read.
++	 * STOP_STRETCH retains the bus after the register-address write; the
++	 * read command emits the repeated START and releases it with STOP.
++	 * Passing both lengths to one call returns EINVAL before any bus I/O. */
++	int err = ta_xfer(addr, &reg, 1, NULL, 0, true);
++	return err ? err : ta_xfer(addr, NULL, 0, val, 1, false);
++}
++
++static void
++ta_scan(uint8_t lo, uint8_t hi)
++{
++	unsigned acks = 0, nacks = 0, other = 0;
++	int first_error = 0;
++	for (unsigned a = lo; a <= hi; a++) {
++		uint8_t v = 0;
++		int err = ta_read((uint8_t)a, 0x00, &v);
++		if (!err) {
++			printf("PANDORA AMP TAS: scan: %#x ACK reg00 %02x\n", a, v);
++			acks++;
++		} else if (err == ENXIO) {
++			nacks++;
++		} else {
++			other++;
++			if (!first_error) first_error = err;
++		}
++	}
++	printf("PANDORA AMP TAS: scan done: %u acks, %u address NACKs, %u other failures (first err %d)\n",
++	    acks, nacks, other, first_error);
++}
++
++static void
++ta_probe_chip(uint8_t addr, const char *name)
++{
++	static const uint8_t regs[] = {0x00, 0x02, 0x03, 0x04, 0x09, 0x0c, 0x0d, 0x0e,
++	    0x0f, 0x25, 0x5b, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64};
++	printf("PANDORA AMP TAS: %s at %#x:\n", name, addr);
++	for (unsigned i = 0; i < sizeof(regs); i++) {
++		uint8_t v = 0;
++		int err = ta_read(addr, regs[i], &v);
++		printf("PANDORA AMP TAS:   reg %02x -> err %d value %02x\n", regs[i], err, err ? 0 : v);
++	}
++}
++
++/* The GENI FIFO I2C bring-up for one SE (i2c-qcom-geni.c), as pandora_amp.c. */
++static bool
++ta_se_init(vm_offset_t se, unsigned level)
++{
++	uint32_t fw = ta_rd(se, SE_FW), rxp = ta_rd(se, SE_HW_RX), txp = ta_rd(se, SE_HW_TX);
++	ta_txw = ((txp >> 16) & 0x3fu) > 1 ? ((txp >> 16) & 0x3fu) - 1u : 1u;
++	printf("PANDORA AMP TAS: SE fw=%#x if_disable=%#x status=%#x hw_tx=%#x hw_rx=%#x level=%u, %u TX words per refill\n",
++	    fw, ta_rd(se, SE_IF_DIS), ta_rd(se, SE_STATUS), txp, rxp, level, ta_txw);
++	if (((fw >> 8) & 0xff) != 3 || (ta_rd(se, SE_IF_DIS) & 1u)) {
++		printf("PANDORA AMP TAS: SE is not FIFO I2C\n");
++		return false;
++	}
++	ta_wr(se, 0xe18, 0);
++	ta_wr(se, 0xe1c, 0);
++	ta_wr(se, 0x644, 0);
++	ta_wr(se, SE_IRQ_CLR, 0xffffffffu);
++	ta_wr(se, 0x648, 0xffffffffu);
++	ta_wr(se, SE_DMA, 0);
++	ta_wr(se, 0x28, ta_rd(se, 0x28) | 0x7fu);
++	ta_wr(se, 0xe30, ta_rd(se, 0xe30) | 0x0fu);
++	ta_wr(se, 0x24, 0x7f);
++	ta_wr(se, 0x20, 1);
++	ta_wr(se, SE_CLK_SEL, level);
++	ta_wr(se, SE_MCLK, (7u << 4) | 1u);
++	ta_wr(se, SE_SCL, (10u << 20) | (12u << 10) | 26u);    /* 100 kHz from 19.2 MHz */
++	ta_wr(se, 0x254, 0);
++	ta_wr(se, 0x260, SE_PACK0);
++	ta_wr(se, 0x264, SE_PACK1);
++	ta_wr(se, 0x284, SE_PACK0);
++	ta_wr(se, 0x288, SE_PACK1);
++	ta_wr(se, SE_TX_WM, 0);
++	ta_wr(se, 0x810, 0);
++	ta_wr(se, 0x814, ((rxp >> 16) & 0x3fu) > 1 ? ((rxp >> 16) & 0x3fu) - 1u : 1u);
++	ta_wr(se, SE_IRQ_EN, SE_EVENTS);
++	return true;
++}
++
++/*
++ * Original phone tuning file: repeated {char tag[5], le32 bytes, payload}.
++ * INITP is a command stream. PROFP has u8 count, then 64-byte names, le32
++ * flags, and four length-prefixed streams (pre/post up, pre/post down).
++ * BLKOP contains nested tags; RXFMT/TXFMT contain named command streams.
++ * These layouts and opcodes are checked against this phone's
++ * tas25xx_process_block / tas25xx_fw_ready, not another board's register
++ * coefficients. All selected streams are validated before the first write.
++ */
++struct ta_block {
++	const uint8_t *data;
++	uint32_t size;
++};
++
++struct ta_tuning {
++	struct ta_block init, reset, rx, tx, power[4];
++};
++
++static uint32_t
++ta_le32(const uint8_t *p)
++{
++	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* The caller bounds ch and addr before entering this register access path.
++ * Each channel owns independent book/page selectors on the shared SE. */
++static int
++ta_write_raw(unsigned ch, uint8_t reg, const uint8_t *data, unsigned n)
++{
++	uint8_t bytes[TA_MAX];
++	if (!n || n >= sizeof(bytes)) return EINVAL;
++	bytes[0] = reg;
++	memcpy(bytes + 1, data, n);
++	return ta_xfer(ta_addresses[ch], bytes, n + 1, NULL, 0, false);
++}
++
++static int
++ta_select(unsigned ch, uint32_t addr)
++{
++	uint8_t book = (uint8_t)(addr >> 15), page = (uint8_t)(addr >> 7);
++	int err = 0;
++	if (ta_book[ch] != book) {
++		uint8_t zero = 0;
++		err = ta_write_raw(ch, 0, &zero, 1);
++		if (!err) err = ta_write_raw(ch, 0x7f, &book, 1);
++		if (!err) {
++			ta_book[ch] = book;
++			ta_page[ch] = 0;
++		}
++	}
++	if (!err && ta_page[ch] != page) {
++		err = ta_write_raw(ch, 0, &page, 1);
++		if (!err) ta_page[ch] = page;
++	}
++	if (err) ta_book[ch] = ta_page[ch] = -1;
++	return err;
++}
++
++static int
++ta_update(unsigned ch, uint32_t addr, uint8_t mask, uint8_t value)
++{
++	uint8_t old = 0;
++	int err = ta_select(ch, addr);
++	if (!err) err = ta_read(ta_addresses[ch], addr & 0x7fu, &old);
++	if (!err) {
++		uint8_t next = (old & ~mask) | (value & mask);
++		err = ta_write_raw(ch, addr & 0x7fu, &next, 1);
++	}
++	return err;
++}
++
++/* execute=false performs the same bounded parse without touching hardware.
++ * Unknown opcodes, page-crossing bursts and excessive delays are rejected. */
++static int
++ta_block(unsigned ch, struct ta_block block, bool execute)
++{
++	uint32_t pos = 0;
++	while (pos < block.size) {
++		const uint8_t *p = block.data + pos;
++		unsigned op = p[0], header = op == 1 ? 9 : op == 2 ? 7 : op == 0 ? 6 : 5;
++		if (op > 3 || block.size - pos < header) return EINVAL;
++		uint32_t addr = ta_le32(p + 1);
++		if (op == 3) {
++			if (addr > 1000) return EINVAL;
++			if (execute && addr) ta_sleep(addr);
++			pos += 5;
++			continue;
++		}
++		unsigned n = op == 1 ? ta_le32(p + 5) : 1;
++		if (addr >= 0x800000u || !n || n >= TA_MAX ||
++		    n > 128u - (addr & 127u) || (op == 1 && n > block.size - pos - header)) {
++			return EINVAL;
++		}
++		if (execute) {
++			int err;
++			if (op == 2) {
++				err = ta_update(ch, addr, p[5], p[6]);
++			} else {
++				err = ta_select(ch, addr);
++				if (!err) err = ta_write_raw(ch, addr & 127u, p + (op == 1 ? 9 : 5), n);
++			}
++			if (err) {
++				printf("PANDORA AMP TAS: ch%u command offset %u op %u reg %#x failed %d\n", ch, pos, op, addr, err);
++				return err;
++			}
++		}
++		pos += header + (op == 1 ? n : 0);
++	}
++	return 0;
++}
++
++static int
++ta_profile(struct ta_block table, struct ta_tuning *t)
++{
++	if (!table.size) return EINVAL;
++	unsigned count = table.data[0], pos = 1;
++	bool found = false;
++	for (unsigned i = 0; i < count; i++) {
++		if (table.size - pos < 68) return EINVAL;
++		bool selected = memcmp(table.data + pos, "music_18dB_stereo\0", 18) == 0;
++		pos += 68; /* name[64], native profile flags[4] */
++		for (unsigned j = 0; j < 4; j++) {
++			if (table.size - pos < 4) return EINVAL;
++			unsigned size = ta_le32(table.data + pos);
++			pos += 4;
++			if (size > table.size - pos) return EINVAL;
++			if (selected) t->power[j] = (struct ta_block){table.data + pos, size};
++			pos += size;
++		}
++		if (selected && found) return EINVAL;
++		found |= selected;
++	}
++	return found && pos == table.size ? 0 : EINVAL;
++}
++
++static int
++ta_format(struct ta_block table, unsigned width, const char *name, struct ta_block *out)
++{
++	if (table.size < 4) return EINVAL;
++	unsigned count = ta_le32(table.data), pos = 4;
++	bool found = false;
++	if (strlen(name) != width) return EINVAL;
++	for (unsigned i = 0; i < count; i++) {
++		if (table.size - pos < width + 4) return EINVAL;
++		bool selected = memcmp(table.data + pos, name, width) == 0;
++		unsigned n = ta_le32(table.data + pos + width);
++		pos += width + 4;
++		if (n > table.size - pos) return EINVAL;
++		if (selected) {
++			if (found) return EINVAL;
++			*out = (struct ta_block){table.data + pos, n};
++			found = true;
++		}
++		pos += n;
++	}
++	return found && pos == table.size ? 0 : EINVAL;
++}
++
++static int
++ta_operations(struct ta_block table, struct ta_tuning *t)
++{
++	if (table.size < 4) return EINVAL;
++	unsigned count = ta_le32(table.data), pos = 4;
++	for (unsigned i = 0; i < count; i++) {
++		if (table.size - pos < 9) return EINVAL;
++		const uint8_t *p = table.data + pos;
++		unsigned n = ta_le32(p + 5);
++		pos += 9;
++		if (n > table.size - pos) return EINVAL;
++		struct ta_block b = {table.data + pos, n};
++		int err = 0;
++		if (!memcmp(p, "SWRST", 5)) t->reset = b;
++		if (!memcmp(p, "RXFMT", 5)) err = ta_format(b, 5, "32BIT", &t->rx);
++		if (!memcmp(p, "TXFMT", 5)) err = ta_format(b, 14, "24_I2S_02_12_1", &t->tx);
++		if (err) return err;
++		pos += n;
++	}
++	return pos == table.size ? 0 : EINVAL;
++}
++
++static int
++ta_parse_tuning(const uint8_t *f, unsigned size, struct ta_tuning *t)
++{
++	if (size < 9 || memcmp(f, "HEADR", 5)) return EINVAL;
++	unsigned pos = 0, channels = 0;
++	while (pos < size) {
++		if (size - pos < 9) return EINVAL;
++		const uint8_t *p = f + pos;
++		unsigned n = ta_le32(p + 5);
++		pos += 9;
++		if (n > size - pos) return EINVAL;
++		struct ta_block b = {f + pos, n};
++		if (!memcmp(p, "INITP", 5)) {
++			if (channels >= 2) return EINVAL;
++			t[channels++].init = b;
++		} else if (!memcmp(p, "PROFP", 5) || !memcmp(p, "BLKOP", 5)) {
++			if (!channels) return EINVAL;
++			int err = !memcmp(p, "PROFP", 5) ? ta_profile(b, &t[channels - 1]) : ta_operations(b, &t[channels - 1]);
++			if (err) return err;
++		}
++		pos += n;
++	}
++	if (channels != 2) return EINVAL;
++	for (unsigned ch = 0; ch < 2; ch++) {
++		struct ta_block blocks[] = {t[ch].init, t[ch].reset, t[ch].rx, t[ch].tx,
++		    t[ch].power[0], t[ch].power[1], t[ch].power[2], t[ch].power[3]};
++		for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
++			if (!blocks[i].data || ta_block(ch, blocks[i], false)) return EINVAL;
++		}
++	}
++	return 0;
++}
++
++/* ADSP only signals from its poll thread; all sleeping I2C work stays on
++ * the amplifier thread, so GLINK/GPR completion processing never blocks. */
++void
++pandora_amp_tas_tdm(int running)
++{
++	__atomic_store_n(&ta_tdm_running, running != 0, __ATOMIC_RELEASE);
++	ta_notify();
++}
++
++bool
++pandora_amp_tas_live(void)
++{
++	return ta_level == 3;
++}
++
++/* Same route contract as pandora_amp_io: 0 off, 1 speaker. The receiver has
++ * no validated nezha route. Requests only publish state; the single worker
++ * owns firmware, register selectors and SE I/O throughout its lifetime. */
++int
++pandora_amp_tas_io(int mode, unsigned wait_ms)
++{
++	if (mode != 0 && mode != 1) return ENOTSUP;
++	if (__atomic_load_n(&ta_final, __ATOMIC_ACQUIRE) && mode) return EBUSY;
++	__atomic_store_n(&ta_want, (uint32_t)mode, __ATOMIC_RELEASE);
++	uint32_t req = __atomic_add_fetch(&ta_req, 1, __ATOMIC_ACQ_REL);
++	ta_notify();
++	if (!__atomic_load_n(&ta_ready, __ATOMIC_ACQUIRE)) return ENODEV;
++	if (!wait_ms) return 0;
++	uint64_t deadline;
++	clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
++	for (;;) {
++		(void)assert_wait_deadline((event_t)&ta_done, THREAD_UNINT, deadline);
++		if ((int32_t)(__atomic_load_n(&ta_done, __ATOMIC_ACQUIRE) - req) >= 0) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			break;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
++			if ((int32_t)(__atomic_load_n(&ta_done, __ATOMIC_ACQUIRE) - req) < 0) return ETIMEDOUT;
++			break;
++		}
++	}
++	int err = __atomic_load_n(&ta_last_error, __ATOMIC_ACQUIRE);
++	return err ? err : __atomic_load_n(&ta_mode, __ATOMIC_ACQUIRE) == (uint32_t)mode ? 0 : EIO;
++}
++
++void
++pandora_amp_tas_final(const char *why)
++{
++	if (__atomic_exchange_n(&ta_final, 1, __ATOMIC_ACQ_REL) &&
++	    __atomic_load_n(&ta_mode, __ATOMIC_ACQUIRE) == 0) return;
++	int err = pandora_amp_tas_io(0, 1000);
++	printf("PANDORA AMP TAS: %s shutdown -> %d\n", why, err);
++}
++
++static int
++ta_power_up(struct ta_tuning *tuning)
++{
++	int err = 0;
++	for (unsigned ch = 0; ch < 2 && !err; ch++) {
++		err = ta_update(ch, 0x25, 2, 2);
++		if (!err) err = ta_block(ch, tuning[ch].power[0], true);
++		/* This phone's ASI_SWITCH_TOP/BOTTOM writes in wifi-audio-bootlog. */
++		if (!err) err = ta_update(ch, 0x0a, ch ? 0xf0 : 0x0f, ch ? 0x10 : 0);
++		if (!err) err = ta_block(ch, tuning[ch].power[1], true);
++		printf("PANDORA AMP TAS: ch%u power-up -> %d\n", ch, err);
++	}
++	return err;
++}
++
++static int
++ta_power_down(struct ta_tuning *tuning)
++{
++	int err = 0;
++	/* Always attempt both channels, including rollback after a partial up. */
++	for (unsigned ch = 0; ch < 2; ch++) {
++		int stop = ta_block(ch, tuning[ch].power[2], true);
++		if (!stop) stop = ta_block(ch, tuning[ch].power[3], true);
++		printf("PANDORA AMP TAS: ch%u shutdown -> %d\n", ch, stop);
++		if (!err) err = stop;
++	}
++	return err;
++}
++
++static int
++ta_run_audio(void)
++{
++	uint32_t size = 0;
++	uint8_t *fw = NULL;
++	struct ta_tuning tuning[2] = {0};
++	int err = 0;
++	/* The graph-ready signal also establishes UFS/pack availability.
++	 * All waits are bounded; a failed DSP graph must never power the amps. */
++	unsigned wait;
++	for (wait = 0; wait < 350 && !__atomic_load_n(&ta_tdm_running, __ATOMIC_ACQUIRE); wait++) ta_sleep(100);
++	if (wait == 350) return ETIMEDOUT;
++	fw = pandora_fw_file("tismartpa_driver_tuning.bin", &size);
++	if (!fw) return ENOENT;
++	err = ta_parse_tuning(fw, size, tuning);
++	printf("PANDORA AMP TAS: original phone tuning %u bytes, parse %d\n", size, err);
++	if (err) {
++		kfree_data(fw, size);
++		return err;
++	}
++	for (unsigned ch = 0; ch < 2 && !err; ch++) {
++		err = ta_block(ch, tuning[ch].reset, true);
++		if (!err) err = ta_block(ch, tuning[ch].init, true);
++		if (!err) err = ta_block(ch, tuning[ch].tx, true);
++		if (!err) err = ta_block(ch, tuning[ch].rx, true);
++		printf("PANDORA AMP TAS: ch%u original init/ASI configuration -> %d\n", ch, err);
++	}
++	if (!err && ta_level == 3) {
++		/* Publication is release/acquire: callers cannot observe ready until
++		 * both channels are initialized. Only this thread ever touches SE.
++		 * Requests are serialized by the existing CoreAudio route lock;
++		 * final dominates an overlapping start and forbids future starts. */
++		__atomic_store_n(&ta_ready, 1, __ATOMIC_RELEASE);
++		printf("PANDORA AMP TAS: live speaker worker ready\n");
++		for (;;) {
++			uint32_t event = __atomic_load_n(&ta_event, __ATOMIC_ACQUIRE);
++			uint32_t req = __atomic_load_n(&ta_req, __ATOMIC_ACQUIRE);
++			bool final = __atomic_load_n(&ta_final, __ATOMIC_ACQUIRE) != 0;
++			uint32_t want = final ? 0 : __atomic_load_n(&ta_want, __ATOMIC_ACQUIRE);
++			if (!__atomic_load_n(&ta_tdm_running, __ATOMIC_ACQUIRE)) want = 0;
++			uint32_t mode = __atomic_load_n(&ta_mode, __ATOMIC_ACQUIRE);
++			if (want != mode || req != __atomic_load_n(&ta_done, __ATOMIC_ACQUIRE)) {
++				if (want != mode) err = want ? ta_power_up(tuning) : ta_power_down(tuning);
++				if (err) break;
++				__atomic_store_n(&ta_mode, want, __ATOMIC_RELEASE);
++				__atomic_store_n(&ta_last_error, 0, __ATOMIC_RELEASE);
++				__atomic_store_n(&ta_done, req, __ATOMIC_RELEASE);
++				thread_wakeup((event_t)&ta_done);
++				printf("PANDORA AMP TAS: live route %u -> %u request %u complete\n", mode, want, req);
++			}
++			if (final) break;
++			/* Register the wait before checking the event generation: an
++			 * IO request or graph transition cannot be lost between them. */
++			(void)assert_wait((event_t)&ta_event, THREAD_UNINT);
++			if (__atomic_load_n(&ta_event, __ATOMIC_ACQUIRE) == event) {
++				thread_block(THREAD_CONTINUE_NULL);
++			} else {
++				clear_wait(current_thread(), THREAD_AWAKENED);
++			}
++		}
++	} else if (!err) {
++		err = ta_power_up(tuning);
++	}
++	if (!err && ta_level == 2) {
++		printf("PANDORA AMP TAS: test power active for 10 s; audible result needs user confirmation\n");
++		ta_sleep(10000);
++	}
++	int stop = ta_power_down(tuning);
++	if (!err) err = stop;
++	ta_gpio(54, 0, 0, 16, 0);
++	ta_gpio(56, 0, 0, 16, 0);
++	__atomic_store_n(&ta_mode, 0, __ATOMIC_RELEASE);
++	__atomic_store_n(&ta_last_error, err, __ATOMIC_RELEASE);
++	__atomic_store_n(&ta_done, __atomic_load_n(&ta_req, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&ta_done);
++	if (err) __atomic_store_n(&ta_ready, 0, __ATOMIC_RELEASE);
++	kfree_data(fw, size);
++	return err;
++}
++
++static void
++ta_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	if (!ta_level) {
++		goto out;
++	}
++	/* pandora_amp_tas_delay=<s>: wait before touching anything, to tell a rail
++	 * that settles late (the bus comes alive) from a rail nobody enables in
++	 * iOS (it never does). */
++	unsigned delay_s = 0;
++	(void)PE_parse_boot_argn("pandora_amp_tas_delay", &delay_s, sizeof(delay_s));
++	if (delay_s) {
++		printf("PANDORA AMP TAS: waiting %u s for the rails\n", delay_s);
++		ta_sleep(delay_s * 1000u);
++	}
++	ta_gcc = ml_io_map_unmappable(TA_GCC_PA, 0x1f0000, VM_WIMG_IO);
++	ta_se = ml_io_map_unmappable(TA_SE_PA, 0x1000, VM_WIMG_IO);
++	ta_tlmm = ml_io_map_unmappable(TA_TLMM_PA, 0xb0000, VM_WIMG_IO);
++	if (!ta_gcc || !ta_se || !ta_tlmm) {
++		printf("PANDORA AMP TAS: mapping failed\n");
++		goto out;
++	}
++	printf("PANDORA AMP TAS: pins before: 54=%#x/%u 56=%#x/%u 64=%#x 65=%#x 76=%#x 77=%#x vote3=%#x\n",
++	    ta_rd(ta_tlmm, TA_GPIO(54)), ta_rd(ta_tlmm, TA_GPIO(54) + 4) & 3u,
++	    ta_rd(ta_tlmm, TA_GPIO(56)), ta_rd(ta_tlmm, TA_GPIO(56) + 4) & 3u,
++	    ta_rd(ta_tlmm, TA_GPIO(64)), ta_rd(ta_tlmm, TA_GPIO(65)),
++	    ta_rd(ta_tlmm, TA_GPIO(76)), ta_rd(ta_tlmm, TA_GPIO(77)), ta_rd(ta_gcc, TA_VOTE));
++	unsigned level = 0;
++	if (ta_clocks_w3(&level)) {
++		goto out;
++	}
++	ta_se_cur = ta_se;
++	if (!ta_se_init(ta_se, level)) goto out;
++	ta_gpio(64, 1, 3, 2, -1);
++	ta_gpio(65, 1, 3, 2, -1);
++	for (unsigned t = 0; t < 10000 && !ta_on(0xa8004); t++) {
++		delay(1);
++	}
++	/* Un-shutdown the amps (spkr_02_sd_n = GPIO 76, spkr_13_sd_n = 77: active
++	 * = output high), then the resets exactly as this board's tas25xx_dlkm
++	 * does it: low 20 ms, high, wait 10 ms. */
++	ta_gpio(76, 0, 0, 16, 1);
++	ta_gpio(77, 0, 0, 16, 1);
++	ta_sleep(5);
++	ta_gpio(54, 0, 0, 16, 0);
++	ta_gpio(56, 0, 0, 16, 0);
++	ta_sleep(20);
++	ta_gpio(54, 0, 0, 16, 1);
++	ta_gpio(56, 0, 0, 16, 1);
++	ta_sleep(10);
++	ta_irq_sample();
++	ta_scan(0x08, 0x77);
++	ta_probe_chip(0x4a, "channel 0");
++	ta_probe_chip(0x48, "channel 1");
++	if (ta_level >= 2) {
++		int err = ta_run_audio();
++		printf("PANDORA AMP TAS: audio worker finished, err %d\n", err);
++	}
++
++out:
++	if (ta_tlmm) ml_io_unmap(ta_tlmm, 0xb0000);
++	if (ta_se) ml_io_unmap(ta_se, 0x1000);
++	if (ta_gcc) ml_io_unmap(ta_gcc, 0x1f0000);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pandora_amp_tas_init(void)
++{
++	(void)PE_parse_boot_argn("pandora_amp_tas", &ta_level, sizeof(ta_level));
++	if (!ta_level) return;
++	thread_t thread;
++	if (kernel_thread_start(ta_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PANDORA AMP TAS: worker allocation failed\n");
++	}
++}
++#endif /* PANDORA */

@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1365,6 +1365,10 @@
+         }
+         if (!err) wifi_sleep(NULL, wifi_tx.bound ? 1000 : 5000);
+     }
++    printf("NEZHA WIFI: failure station/RSN/action %u/%u/%u WMI event %#x\n",
++        wifi_station.phase, wifi_rsn.phase, wifi_rsn.tx_action, wifi_wmi.last_event);
++    printf("NEZHA WIFI: failure RX received/discarded %llu/%llu TX submitted/acked/dropped %llu/%llu/%llu\n",
++        wifi_rx.received, wifi_rx.discarded, wifi_tx.submitted, wifi_tx.acked, wifi_tx.dropped);
+     peach_net_stop(err); peach_rsn_clear(&wifi_rsn);
+     wifi_mhi_failure(); wifi_contain();
+     printf("NEZHA WIFI: phase %u stopped in %s: %d; data link down\n",

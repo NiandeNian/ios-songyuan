@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -99,10 +99,14 @@
+     uint32_t metadata = 1u | t->vdev << 2 | t->pdev << 10;
+     uint32_t entry[8] = {
+         (uint32_t)(t->memory.iova + i * PEACH_TX_BUFFER_BYTES), TX_RBM << 8 | cookie << 12,
+-        /* Native dp_tx sends classified EAPOL through FW before keys exist. */
+-        0, metadata << 16, (uint32_t)length | (control ? 1u << 21 : 0),
+-        1u | tid << 4 | t->lmac << 9 | t->vdev << 24,
++        /* Captured native M2/M4: semi-hard notify, voice TID override and
++         * critical-frame classifier; TO_FW is clear for these frames. */
++        control ? 3u << 8 : 0, metadata << 16, (uint32_t)length,
++        1u | (control ? 6u : tid) << 4 | (control ? 6u : 0) |
++            t->lmac << 9 | t->vdev << 24,
+         t->ast | (t->hash & 15) << 20, 0};
++    if (control && t->htt->htc->ops.log)
++        t->htt->htc->ops.log(t->htt->htc->ops.context, "TX EAPOL native notify/classifier", entry[2], entry[5]);
+     t->owned[i] = 1; t->in_flight++; t->submitted_at[i] = now(t);
+     int err = peach_srng_push(t->ring, entry, sizeof(entry));
+     if (err == PeachCeFull) {

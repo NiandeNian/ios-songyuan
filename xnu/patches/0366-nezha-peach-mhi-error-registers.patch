@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -912,6 +912,22 @@
+             wifi_host.state, wifi_host.environment, wifi_host.last_status,
+             wifi_host.last_ring_pointer, wifi_host.last_event_pointer,
+             wifi_host.last_event_data[0], wifi_host.last_event_data[1]);
++        uint32_t debug[6] = {0};
++        for (unsigned i = 0; i < 6; i++)
++            if (wifi_rd(W_BAR, wifi_host.bhi + 0x28 + i * 4, &debug[i])) break;
++        printf("NEZHA WIFI: BHI EE/status/error/debug %#x %#x %#x %#x %#x %#x, TX %u/%u RX %u/%u\n",
++            debug[0], debug[1], debug[2], debug[3], debug[4], debug[5],
++            wifi_host.tx_rp, wifi_host.tx_wp, wifi_host.rx_rp, wifi_host.rx_wp);
++        for (unsigned ch = 20; ch <= 21; ch++) {
++            uint32_t ctx[11], tre[4] = {0};
++            memcpy(ctx, (unsigned char *)wifi_host.memory.bytes + ch * 44, sizeof(ctx));
++            if (ctx[3] >= wifi_host.memory.iova &&
++                ctx[3] - wifi_host.memory.iova <= wifi_host.memory.capacity - sizeof(tre))
++                memcpy(tre, (unsigned char *)wifi_host.memory.bytes + ctx[3] - wifi_host.memory.iova, sizeof(tre));
++            printf("NEZHA WIFI: MHI ch%u cfg/type/er %#x/%#x/%#x base/len/rp/wp %#x/%#x/%#x/%#x first TRE %#x:%#x %#x %#x\n",
++                ch, ctx[0], ctx[1], ctx[2], ctx[3], ctx[5], ctx[7], ctx[9],
++                tre[1], tre[0], tre[2], tre[3]);
++        }
+         return EIO;
+     }
+     wifi_phase = 9;

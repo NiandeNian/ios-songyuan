@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -13,7 +13,7 @@
+ enum { TAG_U32 = 16, TAG_ARRAY = 18, TAG_SERVICE = 32, TAG_MEMORY = 34,
+        TAG_READY = 35, TAG_INIT = 74, TAG_RESOURCES = 75, TAG_CHUNK = 76,
+        TAG_EXT = 428, TAG_AVAILABLE = 559, TAG_EXT2 = 820,
+-       TAG_HW_MODE = 515, TAG_MAC_PHY = 528, TAG_HW_CAP = 529, TAG_SOC_CAP = 530,
++       TAG_MAC_PHY = 528, TAG_HW_CAP = 529, TAG_SOC_CAP = 530,
+        TAG_HAL_REG = 531,
+        TAG_SCAN_EVENT = 36, TAG_MGMT = 44, TAG_SCAN = 77, TAG_CHANNELS = 79, TAG_CHANNEL = 80,
+        TAG_VDEV = 86, TAG_STREAMS = 411, TAG_RULE = 608, TAG_REG = 609,
+@@ -537,10 +537,9 @@
+         tlv(p, TAG_CHUNK, 16); p32(p + 4, m->id); p32(p + 8, (uint32_t)m->dma.iova);
+         p32(p + 12, (uint32_t)m->dma.capacity); p32(p + 16, 0);
+     }
+-    /* Select the actual single-PHY mode from SERVICE_READY_EXT, using the
+-     * vendor copy_hw_mode_in_init_cmd layout. No band-to-MAC overrides. */
+-    tlv(p, TAG_HW_MODE, 12); p32(p + 8, w->radio.mode); p += 16;
+-    tlv(p, TAG_ARRAY, 0); p += 4;
++    /* The selected mode is SINGLE. Vendor init_deinit_send_init_cmd
++     * deliberately omits the optional HW_MODE/band-to-MAC TLVs for SINGLE
++     * because firmware does not support that override in this mode. */
+     return (size_t)(p - w->command);
+ }
+ int peach_wmi_bootstrap(PeachWmi *w)

@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -411,16 +411,21 @@
+     w->phase = 3;
+     WTRY(respond_memory(w));
+     WTRY(wait_flag(w, &w->memory_ready));
++    report(w, "WLFW memory ready", w->memory_count, 0);
+     w->phase = 4;
+     WTRY(request(w, 0x24, 0));
+     size_t len;
+     p = (unsigned char *)field(w, w->response, w->response_bytes, 0x10, &len);
++    report(w, "WLFW capability field/bytes", 0x10, (uint32_t)len);
+     if (!p || len != 8 || w->error) return PeachWlfwProtocol;
+     w->chip_id = u32(p);
+     p = (unsigned char *)field(w, w->response, w->response_bytes, 0x11, &len);
+-    if (!p || len != 4 || w->error) return PeachWlfwProtocol;
+-    w->board_id = u32(p);
++    report(w, "WLFW capability field/bytes", 0x11, (uint32_t)len);
++    if (w->error || (p && len != 4)) return PeachWlfwProtocol;
++    /* CNSS uses 0xff when the optional board_info is absent. */
++    w->board_id = p ? u32(p) : 0xff;
+     p = (unsigned char *)field(w, w->response, w->response_bytes, 0x12, &len);
++    report(w, "WLFW capability field/bytes", 0x12, (uint32_t)len);
+     if (!p || len != 4 || w->error) return PeachWlfwProtocol;
+     w->soc_id = u32(p);
+     report(w, "WLFW chip/board", w->chip_id, w->board_id);

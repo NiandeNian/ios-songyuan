@@ -1,0 +1,219 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -202,10 +202,11 @@
+ int peach_htt_negotiate(PeachHtt *h)
+ {
+     if (!h || !h->htc || !h->htc->started || h->requested) return PeachMhiInvalid;
+-    /* Native Peach dp_htt_h2t_add_tcl_metadata_ver negotiates TCL v1,
+-     * with the scalar TLV's byte length. Do not apply the HL queue-group
+-     * override to this low-latency TCL/WBM datapath. */
+-    const uint32_t request[] = {0, 5u | 4u << 8 | 1u << 16};
++    /* The real phone's htt_soc_attach_target allocates and submits exactly
++     * four payload bytes, all zero (disassembly +0x88..0xac). Its compiled
++     * V1 builder sends no metadata TLV. Per htt.h, absence selects V1;
++     * explicit version TLVs belong to the V2+ negotiation path. */
++    const uint32_t request[] = {0};
+     h->requested = 1;
+     int err = send_message(h, request, sizeof(request));
+     return err ? err : wait_flag(h, &h->confirmed);
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -500,7 +500,8 @@
+         report(w, "WMI SERVICE_READY_EXT", len, 0);
+         break;
+     case 0x4022:
+-        if (tag != TAG_EXT2 || w->ext2_ready) { bad(w); return; }
++        if (tag != TAG_EXT2 || len < 32 || w->ext2_ready) { bad(w); return; }
++        w->peer_metadata_version = u32(p + 32) & 3;
+         w->ext2_ready = 1;
+         report(w, "WMI SERVICE_READY_EXT2", len, 0);
+         break;
+@@ -595,7 +596,13 @@
+      * enabled by NOTIFY_FRAME_CONFIG_ENABLE (flags2 bit14), as in the
+      * captured native INIT (0x013040e0) and wmi_copy_resource_config.
+      * WBM FW completions are handled by PeachTx. */
+-    R(68, 1u << 14 | (w->mgmt_rx_dma.bytes ? 1u << 21 : 0));
++    /* The firmware's RX peer-metadata helpers are also used by its EAPOL
++     * TX path. V0 initializes no ML-bit getter; our RDDM records PC=0 at
++     * the indirect call through 0x015598b4. Native init_cmd_api.c selects
++     * V1A=2 when service365 is advertised; the phone's INIT has bits5:4=2.
++     * This changes the descriptor ABI, not our single-link association. */
++    R(68, w->peer_metadata_version << 4 | 1u << 14 |
++        (w->mgmt_rx_dma.bytes ? 1u << 21 : 0));
+     report(w, "WMI INIT flags1/flags2", u32(p + 44 * 4), u32(p + 68 * 4));
+     if (service(w, 143)) R(57, 0x22); /* allow V2 map/unmap; legacy still legal */
+ #undef R
+@@ -626,6 +633,8 @@
+ {
+     int err = peach_wmi_wait_services(w);
+     if (err) return err;
++    if (service(w, 365)) w->peer_metadata_version = 2;
++    if (!w->peer_metadata_version || w->peer_metadata_version > 2) return PeachMhiInvalid;
+     WTRY(w, allocate_memory(w));
+     w->phase = 1;
+     WTRY(w, send_command(w, 1, build_init(w)));
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -69,7 +69,7 @@
+     PeachHtc *htc;
+     PeachWmiOps ops;
+     unsigned phase, service_ready, ext_ready, ext2_ready, ready;
+-    unsigned mode_required, mode_sent, mode_accepted, unknown_events;
++    unsigned mode_required, mode_sent, mode_accepted, unknown_events, peer_metadata_version;
+     uint32_t firmware_abi[6], services[32], requests, chains, max_fragments;
+     uint32_t last_event, last_tag;
+     unsigned char mac[6];
+diff --git a/bsd/dev/qcom/PeachRx.c b/bsd/dev/qcom/PeachRx.c
+--- a/bsd/dev/qcom/PeachRx.c
++++ b/bsd/dev/qcom/PeachRx.c
+@@ -162,9 +162,10 @@
+     prepare_queues(r); barrier(r);
+     return 0;
+ }
+-int peach_rx_start(PeachRx *r, PeachHtt *h, unsigned pdev)
+-{
+-    if (!r || !r->prepared || r->started || !h) return PeachMhiInvalid;
++int peach_rx_start(PeachRx *r, PeachHtt *h, unsigned pdev, unsigned peer_metadata_version)
++{
++    if (!r || !r->prepared || r->started || !h || !peer_metadata_version ||
++        peer_metadata_version > 2) return PeachMhiInvalid;
+     if (r->error) return r->error;
+     for (unsigned i = 0; i < PeachSrngKinds; i++)
+         if (!r->rings[i].started || r->rings[i].error) return PeachMhiInvalid;
+@@ -174,7 +175,7 @@
+     RTRY(r, peach_htt_config_rx(h, pdev, PEACH_RX_BUFFER_BYTES));
+     r->repost = PEACH_RX_BUFFERS;
+     RTRY(r, replenish(r));
+-    r->started = 1;
++    r->peer_metadata_version = peer_metadata_version; r->started = 1;
+     return 0;
+ }
+ static int buffer_index(PeachRx *r, uint32_t low, unsigned high, unsigned cookie, unsigned *index)
+@@ -267,6 +268,14 @@
+         (u32(m + 0x30) & 0x10000000u) || (u32(m + 0x34) & 0x40000000u);
+     PeachRxInfo info = {0};
+     info.peer = u32(m + 0x28) >> 16;
++    uint32_t peer_meta = u32(m + 0x24);
++    unsigned vdev_shift = r->peer_metadata_version == 2 ? 14 : 16;
++    /* RX_MPDU_START includes both the hardware SW peer and the negotiated
++     * host metadata. Only the local vdev and an ordinary link peer belong
++     * to this STA; ML peers and accelerator/passthrough frames are rejected. */
++    drop |= (peer_meta & 8191) != info.peer || (peer_meta & (1u << 13)) ||
++        ((peer_meta >> vdev_shift) & 255) ||
++        (r->peer_metadata_version == 2 && (peer_meta & 0xe0000000u));
+     info.tid = flags & 128 ? (u32(m + 4) >> 15) & 15 : 16;
+     info.encrypted = !!(flags & 0x40000);
+     info.cipher = (u32(m + 4) >> 2) & 15;
+diff --git a/bsd/dev/qcom/PeachRx.h b/bsd/dev/qcom/PeachRx.h
+--- a/bsd/dev/qcom/PeachRx.h
++++ b/bsd/dev/qcom/PeachRx.h
+@@ -20,7 +20,7 @@
+ typedef struct {
+     PeachSrng *rings;
+     PeachMhiDma memory, links, queues, buffers;
+-    unsigned prepared, started, repost, in_flight;
++    unsigned prepared, started, repost, in_flight, peer_metadata_version;
+     unsigned char owned[PEACH_RX_BUFFERS];
+     uint32_t cookies[PEACH_RX_BUFFERS];
+     uint64_t received, discarded, released;
+@@ -34,7 +34,7 @@
+ int peach_rx_prepare(PeachRx *, PeachSrng rings[PeachSrngKinds], PeachMhiDma);
+ /* Host rings and the idle link pool are started/seeded before WMI INIT.
+  * After HTT setup, this final step publishes packet buffers and filters. */
+-int peach_rx_start(PeachRx *, PeachHtt *, unsigned pdev);
++int peach_rx_start(PeachRx *, PeachHtt *, unsigned pdev, unsigned peer_metadata_version);
+ PeachMhiDma peach_rx_queue(const PeachRx *, unsigned tid);
+ /* After peer retirement only: use fresh retained storage. Old descriptors
+  * may still be cached by REO and must never be cleared or reassigned. */
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -950,7 +950,7 @@
+             err, wifi_htt.setup_pdev, wifi_htt.setup_id, wifi_htt.setup_status, wifi_htt.last_message);
+         return EIO;
+     }
+-    err = peach_rx_start(&wifi_rx, &wifi_htt, wifi_wmi.radio.pdev);
++    err = peach_rx_start(&wifi_rx, &wifi_htt, wifi_wmi.radio.pdev, wifi_wmi.peer_metadata_version);
+     if (err) {
+         printf("NEZHA WIFI: RX start failed %d, retained in-flight %u\n", err, wifi_rx.in_flight);
+         return EIO;
+@@ -1035,6 +1035,9 @@
+ static void wifi_mhi_failure(void)
+ {
+     if (wifi_phase < 6 || wifi_fault) return;
++    printf("NEZHA WIFI: layer errors CE/HTC/WMI/HTT/RX/TX %d/%d/%d/%d/%d/%d, events WMI %#x HTT %#x\n",
++        wifi_ce.error, wifi_htc.error, wifi_wmi.error, wifi_htt.error,
++        wifi_rx.error, wifi_tx.error, wifi_wmi.last_event, wifi_htt.last_message);
+     if (wifi_tx.prepared && wifi_tx.ring->started && wifi_tx.completion->started) {
+         wifi_barrier(NULL);
+         printf("NEZHA WIFI: TX TCL published/consumed DWORDs %u/%u WBM head/tail %u/%u in-flight %u\n",
+@@ -1376,19 +1379,8 @@
+     }
+ }
+ 
+-static int wifi_firmware_recover(int error)
+-{
+-    if (wifi_fault || wifi_recoveries >= WIFI_RECOVERIES ||
+-        !wifi_wlfw.calibration_done || !wifi_wlfw.calibration.bytes || !wifi_wmi.ready)
+-        return error;
+-    PeachMhiDma calibration = wifi_wlfw.calibration;
+-    unsigned char mac[6]; memcpy(mac, wifi_wmi.mac, sizeof(mac));
+-    printf("NEZHA WIFI: firmware recovery %u/%u, error %d station/RSN %u/%u\n",
+-        ++wifi_recoveries, WIFI_RECOVERIES, error, wifi_station.phase, wifi_rsn.phase);
+-    wifi_net_state = PeachNetRecovering;
+-    peach_net_recovering(error); peach_rsn_clear(&wifi_rsn);
+-    wifi_mhi_failure();
+-    if (wifi_fault) return error;
++static int wifi_restart_mission(PeachMhiDma calibration)
++{
+     wifi_step = "firmware recovery reset";
+     WIFI_TRY(wifi_reset_endpoint());
+     /* Quarantine every old context, packet buffer, crash dump and MSI word.
+@@ -1406,12 +1398,38 @@
+     memset(wifi_rxmac, 0, sizeof(wifi_rxmac)); wifi_rxmac_count = 0;
+     memset(&wifi_rx, 0, sizeof(wifi_rx)); memset(&wifi_tx, 0, sizeof(wifi_tx));
+     memset(&wifi_station, 0, sizeof(wifi_station));
+-    WIFI_TRY(wifi_mission_start(calibration));
+-    if (memcmp(mac, wifi_wmi.mac, sizeof(mac))) return EIO;
+-    wifi_net_state = PeachNetReady;
+-    peach_net_status(&wifi_wmi, wifi_net_state, 0);
+-    printf("NEZHA WIFI: firmware recovered; en0 retained, scan ready, manual join required\n");
+-    return 0;
++    return wifi_mission_start(calibration);
++}
++
++static int wifi_firmware_recover(int error)
++{
++    if (wifi_fault || wifi_recoveries >= WIFI_RECOVERIES ||
++        !wifi_wlfw.calibration_done || !wifi_wlfw.calibration.bytes || !wifi_wmi.ready)
++        return error;
++    PeachMhiDma calibration = wifi_wlfw.calibration;
++    unsigned char mac[6]; memcpy(mac, wifi_wmi.mac, sizeof(mac));
++    wifi_net_state = PeachNetRecovering;
++    peach_net_recovering(error); peach_rsn_clear(&wifi_rsn);
++    while (!wifi_fault && wifi_recoveries < WIFI_RECOVERIES) {
++        printf("NEZHA WIFI: firmware recovery %u/%u, error %d station/RSN %u/%u\n",
++            ++wifi_recoveries, WIFI_RECOVERIES, error, wifi_station.phase, wifi_rsn.phase);
++        wifi_mhi_failure();
++        if (wifi_fault) break;
++        int err = wifi_restart_mission(calibration);
++        if (!err && memcmp(mac, wifi_wmi.mac, sizeof(mac))) return EIO;
++        if (!err) {
++            wifi_net_state = PeachNetReady;
++            peach_net_status(&wifi_wmi, wifi_net_state, 0);
++            printf("NEZHA WIFI: firmware recovered; en0 retained, scan ready, manual join required\n");
++            return 0;
++        }
++        /* A failure during restarted bring-up must not bypass the remaining
++         * recovery attempts simply because READY has not been reached yet. */
++        printf("NEZHA WIFI: recovery bring-up failed %d in %s; retained DMA\n", err, wifi_step);
++        error = err;
++        wifi_sleep(NULL, 100000);
++    }
++    return error;
+ }
+ 
+ static void

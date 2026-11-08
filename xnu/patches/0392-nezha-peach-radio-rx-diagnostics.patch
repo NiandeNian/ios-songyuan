@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -103,6 +103,8 @@
+ /* Capabilities must be known before preparing host REO rings for INIT. */
+ int peach_wmi_wait_services(PeachWmi *);
+ int peach_wmi_bootstrap(PeachWmi *);
++/* Optional bring-up diagnostic; the real asynchronous reply is logged. */
++int peach_wmi_request_radio_stats(PeachWmi *);
+ /* One STA vdev, firmware-supplied regulatory rules, passive 2.4/5GHz scan.
+  * Completion requires real scan events; BSS entries come only from received
+  * beacon/probe-response bytes. PeachWmiScanFailed means a real terminal
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -361,6 +361,18 @@
+     unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
+     w->last_event = id; w->last_tag = tag;
+     switch (id) {
++    case 0x1d004: { /* WMI_UPDATE_STATS_EVENTID, legacy PDEV base prefix */
++        if (tag != 70 || len < 32) { bad(w); return; }
++        report(w, "WMI radio stats pdev/count", u32(p + 32), u32(p + 8));
++        size_t off = len + 4;
++        if (!(u32(p + 4) & 4) || !u32(p + 8)) break;
++        if (n - off < 32 || u32(p + off) >> 16 != 17 ||
++            (u32(p + off) & 0xffff) < 28) { bad(w); return; }
++        const unsigned char *base = p + off + 4;
++        report(w, "WMI radio RX frames/cycles", u32(base + 8), u32(base + 16));
++        report(w, "WMI radio noise/PHY errors", u32(base), u32(base + 20));
++        break;
++    }
+     case 0x5003: /* WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID */
+         if (tag != TAG_KEY_DONE || len < 24 || !w->key_pending || w->key_done ||
+             u32(p + 4) || memcmp(p + 8, w->vdev_bssid, 6) ||
+@@ -707,6 +719,18 @@
+     report(w, "WMI passive scan actual BSS/dropped", w->bss_count, w->bss_dropped);
+     return 0;
+ }
++int peach_wmi_request_radio_stats(PeachWmi *w)
++{
++    if (!w || !w->ready || w->scan_active) return PeachMhiInvalid;
++    memset(w->command, 0, 40);
++    tlv(w->command + 4, 143, 20); /* wmi_request_stats_cmd_fixed_param */
++    p32(w->command + 8, 4); /* WMI_REQUEST_PDEV_STAT */
++    p32(w->command + 24, w->radio.pdev);
++    tlv(w->command + 28, TAG_ARRAY, 0);
++    tlv(w->command + 32, TAG_U32, 0);
++    tlv(w->command + 36, 19, 0);
++    return send_command(w, 0x16001, 40);
++}
+ int peach_wmi_peer_create(PeachWmi *w, const unsigned char mac[6], unsigned type)
+ {
+     if (!w || !mac || !w->ready || !w->vdev_sent || w->scan_active || type > 1 ||
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1158,6 +1158,16 @@
+         return EIO;
+     }
+     wifi_phase = 16;
++    int capture = 0;
++    (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
++    if (capture == 1) {
++        wifi_barrier(NULL);
++        printf("NEZHA WIFI: RX refill head/tail %#x/%#x, owned %u received %llu discarded %llu released %llu\n",
++            *(volatile uint32_t *)wifi_srng[PeachSrngRxBuffer].head.bytes,
++            *(volatile uint32_t *)wifi_srng[PeachSrngRxBuffer].tail.bytes,
++            wifi_rx.in_flight, wifi_rx.received, wifi_rx.discarded, wifi_rx.released);
++        WIFI_TRY(peach_wmi_request_radio_stats(&wifi_wmi));
++    }
+     if (err == PeachWmiScanFailed) {
+         printf("NEZHA WIFI: firmware ended initial scan, event %#x reason %u; explicit retry available\n",
+             wifi_wmi.scan_event, wifi_wmi.scan_reason);

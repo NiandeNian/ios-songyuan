@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -663,18 +663,20 @@
+     if (w->vdev_sent) return 0;
+     memset(w->command, 0, sizeof(w->command));
+     unsigned char *p = w->command + 4;
+-    tlv(p, TAG_VDEV, 52); p32(p + 8, 2); /* vdev 0, STA */
++    /* This phone's Android wire capture: 48B payload through cfp_enable,
++     * no newer global_vdev_id. SINGLE uses PDEV 0 for VDEV creation. */
++    tlv(p, TAG_VDEV, 48); p32(p + 8, 2); /* vdev 0, STA */
+     uint32_t lo = 0, hi = 0;
+     for (unsigned i = 0; i < 4; i++) lo |= (uint32_t)w->mac[i] << (i * 8);
+     hi = w->mac[4] | (uint32_t)w->mac[5] << 8;
+-    p32(p + 16, lo); p32(p + 20, hi); p32(p + 24, 2); p32(p + 28, w->radio.pdev);
+-    p += 56; tlv(p, TAG_ARRAY, 32); p += 4;
++    p32(p + 16, lo); p32(p + 20, hi); p32(p + 24, 2);
++    p += 52; tlv(p, TAG_ARRAY, 32); p += 4;
+     for (unsigned band = 1; band <= 2; band++, p += 16) {
+         unsigned streams = !!(w->radio.bands & band);
+         /* Actual vendor builder uses TPC band IDs 0/1 for this field. */
+         tlv(p, TAG_STREAMS, 12); p32(p + 4, band - 1); p32(p + 8, streams); p32(p + 12, streams);
+     }
+-    for (unsigned i = 0; i < 3; i++, p += 4) tlv(p, TAG_ARRAY, 0); /* optional non-MLO fields */
++    tlv(p, TAG_ARRAY, 0); p += 4; /* no MLO MAC; same ABI as native non-MLO vdev */
+     WTRY(w, send_command(w, 0x5001, (size_t)(p - w->command)));
+     w->vdev_sent = 1; /* submission only: this ABI has no VDEV_CREATE ACK */
+     return 0;

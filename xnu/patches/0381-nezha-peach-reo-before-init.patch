@@ -1,0 +1,105 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -542,7 +542,7 @@
+      * because firmware does not support that override in this mode. */
+     return (size_t)(p - w->command);
+ }
+-int peach_wmi_bootstrap(PeachWmi *w)
++int peach_wmi_wait_services(PeachWmi *w)
+ {
+     if (!w || !w->htc || !w->htc->started || w->phase) return PeachMhiInvalid;
+     if (w->error) return w->error;
+@@ -551,6 +551,12 @@
+     if (service(w, 77)) WTRY(w, wait_flag(w, &w->ext_ready));
+     if (service(w, 220)) WTRY(w, wait_flag(w, &w->ext2_ready));
+     if (!w->radio.valid) return bad(w);
++    return 0;
++}
++int peach_wmi_bootstrap(PeachWmi *w)
++{
++    int err = peach_wmi_wait_services(w);
++    if (err) return err;
+     WTRY(w, allocate_memory(w));
+     w->phase = 1;
+     WTRY(w, send_command(w, 1, build_init(w)));
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -100,6 +100,8 @@
+ void peach_wmi_receive(PeachWmi *, const void *, size_t);
+ /* Actual SERVICE_READY -> host memory/INIT -> successful READY. Not scan,
+  * association, data transport or an iOS network-interface implementation. */
++/* Capabilities must be known before preparing host REO rings for INIT. */
++int peach_wmi_wait_services(PeachWmi *);
+ int peach_wmi_bootstrap(PeachWmi *);
+ /* One STA vdev, firmware-supplied regulatory rules, passive 2.4/5GHz scan.
+  * Completion requires real scan events; BSS entries come only from received
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -20,7 +20,10 @@
+         memory.capacity < PEACH_TX_DMA_BYTES || memory.iova >= 0x100000000ull ||
+         PEACH_TX_DMA_BYTES > 0x100000000ull - memory.iova) return PeachMhiInvalid;
+     for (unsigned i = 0; i < PeachSrngKinds; i++) {
+-        if (!rings[i].prepared || rings[i].started || rings[i].error) return PeachMhiInvalid;
++        /* RX rings may already be enabled before WMI INIT. */
++        if (!rings[i].prepared || rings[i].error ||
++            (rings[i].started && (i == PeachSrngTclTx || i == PeachSrngTxCompletion)))
++            return PeachMhiInvalid;
+         PeachMhiDma d = rings[i].memory;
+         if (d.iova < memory.iova + PEACH_TX_DMA_BYTES && memory.iova < d.iova + d.capacity)
+             return PeachMhiInvalid;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -852,7 +852,7 @@
+ static int wifi_srng_health(void *c) { (void)c; return wifi_dma_health(); }
+ static const PeachSrngOps wifi_srng_ops = {NULL, wifi_target_read, wifi_target_write,
+     wifi_srng_health, wifi_barrier};
+-static int wifi_setup_srng(void)
++static int wifi_prepare_srng(void)
+ {
+     /* Retained ring pool plus link/queue/packet memory. Prepare REO before
+      * enabling rings; RX buffers are posted after the HTT layout command. */
+@@ -876,6 +876,15 @@
+             wifi_rx.last_register, wifi_rx.last_value);
+         return EIO;
+     }
++    /* Match ath12k_core_start: host REO destinations precede WMI INIT;
++     * HTT-dependent TX/LMAC setup remains after READY/version negotiation. */
++    WIFI_TRY(peach_srng_start_host(&wifi_srng[PeachSrngReoRx]));
++    WIFI_TRY(peach_srng_start_host(&wifi_srng[PeachSrngReoException]));
++    printf("NEZHA WIFI: host REO rings ready before WMI INIT\n");
++    return 0;
++}
++static int wifi_setup_srng(void)
++{
+     PeachMhiDma tx_memory;
+     WIFI_TRY(wifi_allocate_dma(NULL, PEACH_TX_DMA_BYTES, &tx_memory));
+     int tx_err = peach_tx_prepare(&wifi_tx, wifi_srng, &wifi_htt, tx_memory,
+@@ -884,7 +893,7 @@
+         printf("NEZHA WIFI: TX prepare failed %d\n", tx_err);
+         return EIO;
+     }
+-    for (unsigned i = 0; i < PeachSrngRxBuffer; i++) {
++    for (unsigned i = PeachSrngTclTx; i < PeachSrngRxBuffer; i++) {
+         int err = peach_srng_start_host(&wifi_srng[i]);
+         if (err) {
+             printf("NEZHA WIFI: SRNG %u failed %d at %#x value %#x\n", i, err,
+@@ -1107,6 +1116,15 @@
+         return EIO;
+     }
+     wifi_phase = 12;
++    wifi_step = "WMI services and PHY capabilities";
++    err = peach_wmi_wait_services(&wifi_wmi);
++    if (err) {
++        printf("NEZHA WIFI: WMI capabilities failed: %d event %#x tag %u\n", err,
++            wifi_wmi.last_event, wifi_wmi.last_tag);
++        return EIO;
++    }
++    wifi_step = "host REO setup before WMI INIT";
++    WIFI_TRY(wifi_prepare_srng());
+     wifi_step = "WMI SERVICE_READY/INIT/READY";
+     err = peach_wmi_bootstrap(&wifi_wmi);
+     if (err) {

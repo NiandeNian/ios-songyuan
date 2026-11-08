@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -109,16 +109,18 @@
+         return;
+     }
+     if ((word & 255) == 0x1a) {
+-        unsigned reply_id = h->setup_id;
++        unsigned reply_id = h->setup_id, reply_pdev = h->setup_pdev;
+         /* This phone's HTT 3.143 translates wire HOST1 ring 5 to WAL
+          * ring 3, and RXDMA rings 0/7 to WAL ring 2, before building DONE.
+-         * Match that target ID while retaining the requested wire ID. */
++         * DONE also carries the radio's zero-based pdev. Match these
++         * target IDs while retaining the requested wire IDs. */
+         if (h->minor == 143) {
++            if (reply_pdev) reply_pdev--;
+             if (reply_id == 5) reply_id = 3;
+             else if (reply_id == 0 || reply_id == 7) reply_id = 2;
+         }
+         if (n != 4 || !h->confirmed || !h->setup_pending || !h->setup_sent ||
+-            h->setup_done || ((word >> 8) & 255) != h->setup_pdev ||
++            h->setup_done || ((word >> 8) & 255) != reply_pdev ||
+             ((word >> 16) & 255) != reply_id) {
+             h->error = PeachCeProtocol; return;
+         }

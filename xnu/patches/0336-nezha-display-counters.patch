@@ -1,0 +1,26 @@
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -196,6 +196,23 @@
+ 	int on = 0;
+ 	PE_parse_boot_argn("pandora_dpu_probe", &on, sizeof(on));
+ 	if (!on) {
++		return;
++	}
++	/* Nezha: measure only the active DSI0 interface; avoid probing idle blocks.
++	 * Linux dpu_hw_intf_get_vsync_info() reads these same counters. */
++	if (on == 2) {
++		vm_offset_t intf = dpu_map(DPU_MDSS_PA + DPU_INTF(1), 0x1000);
++		if (!intf) {
++			return;
++		}
++		uint32_t frames = io_rd(intf, 0xac), tear = io_rd(intf, 0x298) >> 16;
++		uint64_t start = mach_absolute_time(), ns = 0;
++		IOSleep(1000);
++		uint32_t end_frames = io_rd(intf, 0xac), end_tear = io_rd(intf, 0x298) >> 16;
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++		printf("NEZHA DPU: DSI0 %llu us: frames %u -> %u, TE frames %u -> %u; "
++		    "count-en %08x tear-en %08x autorefresh %08x\n", ns / 1000,
++		    frames, end_frames, tear, end_tear, io_rd(intf, 0xa8), io_rd(intf, 0x284), io_rd(intf, 0x2b4));
+ 		return;
+ 	}
+ 	dpu_va = dpu_map(DPU_MDSS_PA, DPU_MDSS_LEN);

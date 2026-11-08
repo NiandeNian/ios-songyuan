@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -54,7 +54,7 @@
+ static struct wifi_window wifi_windows[W_NWIN] = {
+     {0x00100000, 0xb0000, 0}, {0x01c00000, 0x3000, 0},
+     {0x01c06000, 0x2000, 0}, {0x01d07000, 0x7000, 0},
+-    {0x01d01000, 0x2000, 0}, {0x01d06000, 0x200, 0},
++    {0x01d01000, 0x2000, 0}, {NEZHA_PCIE_CRM_COMMON_PA, NEZHA_PCIE_CRM_COMMON_BYTES, 0},
+     {0x01d03800, 0x2000, 0}, {0x400000000, 0x10000, 0},
+     {0x410000000, 0x1000, 0}, {0x400100000, 0x4000, 0},
+     {0x40400000, 0x200000, 0}, {0x15000000, 0x100000, 0},
+@@ -236,6 +236,7 @@
+     wifi_step = "CESTA v3";
+     WIFI_TRY(wifi_rd(W_COMMON, 0x0c, &enabled));
+     WIFI_TRY(wifi_rd(W_COMMON, 4, &cfg));
++    printf("NEZHA WIFI: CESTA enabled %#x config %#x\n", enabled, cfg);
+     unsigned resources = (cfg >> 6) & 15, nodes = (cfg >> 26) & 31;
+     unsigned states = cfg & 15, channels = (cfg >> 4) & 3;
+     if (!enabled || enabled == 0xffffffffu || channels != 2 || states != 2 ||
+diff --git a/bsd/dev/qcom/NezhaPcieData.h b/bsd/dev/qcom/NezhaPcieData.h
+--- a/bsd/dev/qcom/NezhaPcieData.h
++++ b/bsd/dev/qcom/NezhaPcieData.h
+@@ -1,6 +1,8 @@
+ /* Generated from the captured Nezha live.dtb; do not edit tables. */
+ #ifndef NEZHA_PCIE_DATA_H
+ #define NEZHA_PCIE_DATA_H
++#define NEZHA_PCIE_CRM_COMMON_PA 0x1d05e00ull
++#define NEZHA_PCIE_CRM_COMMON_BYTES 0x200u
+ static const uint32_t wifi_phy_seq[][3] = {
+     {0x1440, 0x3, 0},
+     {0x30, 0x1b, 0},

@@ -1,0 +1,53 @@
+diff --git a/iokit/Kernel/arm/PeachWLAN.cpp b/iokit/Kernel/arm/PeachWLAN.cpp
+--- a/iokit/Kernel/arm/PeachWLAN.cpp
++++ b/iokit/Kernel/arm/PeachWLAN.cpp
+@@ -10,7 +10,9 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <kern/thread.h>
+ #include <libkern/c++/OSData.h>
++#include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+ 
+ /* The existing Nezha identity service defines this base in
+@@ -43,6 +45,27 @@
+ };
+ OSDefineMetaClassAndStructors(IONetworkStack, IOService);
+ OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++/* One delayed snapshot with the existing Wi-Fi diagnostic flag: identify the
++ * service blocking InterfaceNamer without changing its busy accounting. */
++static void network_quiet_diagnostic(void *, wait_result_t)
++{
++    IOSleep(30000);
++    IOService *root = IOService::getServiceRoot();
++    IOLog("NEZHA WIFI: registry busy after network discovery %u\n", root->getBusyState());
++    IORegistryIterator *iter = IORegistryIterator::iterateOver(root,
++        gIOServicePlane, kIORegistryIterateRecursively);
++    if (iter) {
++        IOService *service;
++        while ((service = OSDynamicCast(IOService, iter->getNextObject()))) {
++            if (service->getBusyState())
++                IOLog("NEZHA WIFI: busy service %s (%s) count %u\n",
++                    service->getName(), service->getMetaClass()->getClassName(),
++                    service->getBusyState());
++        }
++        iter->release();
++    }
++    thread_terminate(current_thread());
++}
+ bool IONetworkStackUserClient::start(IOService *provider)
+ {
+     if (!IOUserClient::start(provider)) return false;
+@@ -50,6 +73,11 @@
+     proc_selfname(name, sizeof(name));
+     IOLog("NEZHA WIFI: network stack opened by %s, registry busy %u\n",
+         name, (unsigned)IOService::getServiceRoot()->getBusyState());
++    int capture = 0;
++    (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
++    thread_t thread;
++    if (capture == 1 && kernel_thread_start(network_quiet_diagnostic, NULL, &thread) == KERN_SUCCESS)
++        thread_deallocate(thread);
+     return true;
+ }
+ IOReturn IONetworkStackUserClient::clientClose(void)

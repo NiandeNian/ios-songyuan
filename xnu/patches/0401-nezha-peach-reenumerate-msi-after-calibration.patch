@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -355,6 +355,9 @@
+     uint32_t value, next;
+     WIFI_TRY(wifi_rd(W_CFG, 4, &value));
+     WIFI_TRY(wifi_wr(W_CFG, 4, (value & 0xfffbu) | 0x400));
++    /* A checked endpoint reset invalidates the previous enumeration. Keep
++     * duplicate MSI detection local to this walk, including calibration restart. */
++    wifi_msi_cap = 0;
+     if (value & 0x100000) {
+         WIFI_TRY(wifi_rd(W_CFG, 0x34, &next));
+         next &= 255;

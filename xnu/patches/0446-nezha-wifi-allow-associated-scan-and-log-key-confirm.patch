@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -411,6 +411,7 @@
+             u32(p + 4) || memcmp(p + 8, w->vdev_bssid, 6) ||
+             u32(p + 16) != w->key_index || (u32(p + 20) & 1) != w->key_group ||
+             (u32(p + 20) & ~0x31u) || u32(p + 24)) { bad(w); return; }
++        report(w, "WMI key confirm index/flags", u32(p + 16), u32(p + 20));
+         w->key_done = 1;
+         break;
+     case 0x6006: { /* WMI_PEER_ASSOC_CONF_EVENTID */
+@@ -848,7 +849,7 @@
+ int peach_wmi_passive_scan(PeachWmi *w)
+ {
+     if (!w || w->phase != 2 || !w->ready || !w->radio.valid || w->radio.phy >= 3 ||
+-        w->scan_active || w->vdev_start_sent)
++        w->scan_active || w->vdev_stop_sent || (w->vdev_start_sent && !w->vdev_up_sent))
+         return PeachMhiInvalid;
+     if (w->error) return w->error;
+     PeachWmiRegDomain *r = &w->regulatory[w->radio.phy];

@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -46,6 +46,8 @@
+ extern void pandora_apps_smmu_lock(void);
+ extern void pandora_apps_smmu_unlock(void);
+ extern int pandora_firmware_pread(const char *, uint64_t, void *, size_t, uint64_t *);
++extern uint8_t *pandora_fbdump_begin(uint32_t *);
++extern void pandora_fbdump_commit(uint32_t);
+ void pandora_wifi_init(void);
+ 
+ enum { W_GCC, W_PARF, W_PHY, W_SM, W_CRM, W_COMMON, W_CRMC, W_DBI,
+@@ -922,6 +924,20 @@
+     wifi_barrier(NULL);
+     wifi_check_at = 0;
+     WIFI_TRY(wifi_dma_health());
++    int capture = 0;
++    (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
++    if (capture == 1) {
++        /* Reuse the pinned diagnostic slot; no new disk mapping or writer.
++         * Disable frame captures for this diagnostic boot to retain it. */
++        uint32_t capacity = 0;
++        uint8_t *saved = pandora_fbdump_begin(&capacity);
++        if (saved) {
++            uint32_t length = capacity < bytes ? capacity : (uint32_t)bytes;
++            memcpy(saved, wifi_rddm.bytes, length);
++            pandora_fbdump_commit(length);
++            printf("NEZHA WIFI: RDDM diagnostic prefix queued, %#x of %#lx bytes\n", length, bytes);
++        }
++    }
+     /* cnss2 rddm_header: two u32s followed by at most twelve 64-byte entries.
+      * File contents follow the header in table order, not at target PAs. */
+     uint32_t header[2];
+@@ -934,11 +950,11 @@
+         uint64_t size;
+         memcpy(&size, entry + 16, sizeof(size));
+         if (size > bytes - offset) return EINVAL;
+-        printf("NEZHA WIFI: RDDM file %.20s size %#llx\n", entry + 44, size);
++        printf("NEZHA WIFI: RDDM file %.20s size %#llx offset %#lx (%.20s)\n",
++            entry + 44, size, offset, entry + 24);
+         if (!memcmp(entry + 44, "Q6-SFR.bin", 11)) {
+             unsigned length = size > 1024 ? 1024 : (unsigned)size;
+             printf("NEZHA WIFI: firmware reason %.*s\n", length, (char *)wifi_rddm.bytes + offset);
+-            return 0;
+         }
+         offset += (size_t)size;
+     }

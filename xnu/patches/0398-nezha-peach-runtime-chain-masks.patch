@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -580,6 +580,18 @@
+     w->phase = 1;
+     WTRY(w, send_command(w, 1, build_init(w)));
+     WTRY(w, wait_flag(w, &w->ready));
++    /* ath12k_mac_start applies the advertised antenna masks after READY.
++     * INIT's resource limits alone are not the runtime PDEV configuration.
++     * This command has no ACK; only subsequent received frames prove RX. */
++    for (unsigned parameter = 1; parameter <= 2; parameter++) {
++        memset(w->command, 0, 20);
++        tlv(w->command + 4, 82, 12); /* wmi_pdev_set_param_cmd_fixed_param */
++        p32(w->command + 8, w->radio.pdev);
++        p32(w->command + 12, parameter); /* TX_CHAIN_MASK / RX_CHAIN_MASK */
++        p32(w->command + 16, parameter == 1 ? w->radio.tx_chains : w->radio.rx_chains);
++        WTRY(w, send_command(w, 0x4003, 20));
++    }
++    report(w, "WMI TX/RX antenna masks submitted", w->radio.tx_chains, w->radio.rx_chains);
+     w->phase = 2;
+     return 0;
+ }

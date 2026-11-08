@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -819,29 +819,31 @@
+ static int wifi_service_receive(void *c, unsigned service, const void *p, size_t n)
+ {
+     (void)c;
++    int err;
++    uint32_t message;
+     if (service == 0x100) {
+         peach_wmi_receive(&wifi_wmi, p, n);
+-        int capture = 0;
+-        (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
+-        if (wifi_wmi.error && capture == 1) {
+-            uint32_t capacity = 0, bytes = (uint32_t)n;
+-            uint8_t *saved = pandora_fbdump_begin(&capacity);
+-            if (saved && capacity >= 16 && n <= capacity - 16) {
+-                memcpy(saved, "NEZWMI01", 8);
+-                memcpy(saved + 8, &bytes, 4);
+-                memcpy(saved + 12, &wifi_wmi.last_event, 4);
+-                memcpy(saved + 16, p, n);
+-                pandora_fbdump_commit(bytes + 16);
+-                printf("NEZHA WIFI: failed WMI packet queued, %#x bytes\n", bytes);
+-            }
++        err = wifi_wmi.error; message = wifi_wmi.last_event;
++    } else if (service == 0x300) {
++        peach_htt_receive(&wifi_htt, p, n);
++        err = wifi_htt.error; message = wifi_htt.last_message;
++    } else return PeachCeProtocol;
++    int capture = 0;
++    (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
++    if (err && capture == 1) {
++        uint32_t capacity = 0, bytes = (uint32_t)n;
++        uint8_t *saved = pandora_fbdump_begin(&capacity);
++        if (saved && capacity >= 16 && n <= capacity - 16) {
++            memcpy(saved, service == 0x100 ? "NEZWMI01" : "NEZHTT01", 8);
++            memcpy(saved + 8, &bytes, 4);
++            memcpy(saved + 12, &message, 4);
++            memcpy(saved + 16, p, n);
++            pandora_fbdump_commit(bytes + 16);
++            printf("NEZHA WIFI: failed %s packet queued, %#x bytes message %#x\n",
++                service == 0x100 ? "WMI" : "HTT", bytes, message);
+         }
+-        return wifi_wmi.error;
+-    }
+-    if (service == 0x300) {
+-        peach_htt_receive(&wifi_htt, p, n);
+-        return wifi_htt.error;
+-    }
+-    return PeachCeProtocol;
++    }
++    return err;
+ }
+ static const PeachCeOps wifi_ce_ops = {NULL, wifi_target_read, wifi_target_write,
+     wifi_barrier, peach_htc_receive, &wifi_htc};

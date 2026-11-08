@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -182,14 +182,16 @@
+             if (d[2] & 0x80000000u) return invalid(t);
+             continue;
+         }
+-        if ((source != 0 && source != 3) || ((d[2] >> 6) & 7) != 0 ||
+-            ((d[2] >> 9) & 15) != TX_RBM || (d[2] & 0xc0000000u)) return invalid(t);
+         unsigned cookie = (d[2] >> 18) & 4095 | ((d[7] >> 20) & 255) << 12;
+         unsigned peer = (source == 3 ? d[5] : d[7]) & 65535;
+         if (t->acked + t->dropped < 3 && t->htt->htc->ops.log) {
+             t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion source/status", source, status);
+             t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion cookie/peer", cookie, peer);
+         }
++        /* Peach bit30 reports cookie conversion, not an internal error.
++         * Keep using our cookie table; never dereference the returned VA. */
++        if ((source != 0 && source != 3) || ((d[2] >> 6) & 7) != 0 ||
++            ((d[2] >> 9) & 15) != TX_RBM || (d[2] & 0x80000000u)) return invalid(t);
+         /* FW reinject/inspect return ownership too (dp_tx_*_handler),
+          * but are dropped by this STA path and never counted as ACKs.
+          * Their overlay is not the OK/DROP/TTL peer-status layout. */
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1081,6 +1081,18 @@
+             *(volatile uint32_t *)wifi_tx.completion->head.bytes,
+             wifi_tx.completion->rp * wifi_tx.completion->dwords, wifi_tx.in_flight);
+     }
++    if (wifi_tx.error) {
++        const uint32_t *d = wifi_tx.last_descriptor;
++        printf("NEZHA WIFI: TX last completion DWORDs2..7 %#x %#x %#x %#x %#x %#x\n",
++            d[2], d[3], d[4], d[5], d[6], d[7]);
++    }
++    if (wifi_rx.error) {
++        const uint32_t *d = wifi_rx.last_descriptor;
++        printf("NEZHA WIFI: RX last register/value %#x %#x descriptor0..3 %#x %#x %#x %#x\n",
++            wifi_rx.last_register, wifi_rx.last_value, d[0], d[1], d[2], d[3]);
++        printf("NEZHA WIFI: RX last descriptor4..7 %#x %#x %#x %#x\n",
++            d[4], d[5], d[6], d[7]);
++    }
+     printf("NEZHA WIFI: last MSI data %#x\n",
+         *(volatile uint32_t *)(wifi_arena + WIFI_MSI_OFFSET));
+     uint32_t status = 0, debug[6] = {0};

@@ -1,0 +1,22 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1208,7 +1208,7 @@
+ static int sweet_crash_limit = -1;
+ static const char *const sweet_crash_keep[] = {"launchd", "SpringBoard", "backboardd", "runningboardd", "logd",
+     "notifyd", "configd", "securityd", "keybagd", "ReportCrash", "mediaserverd", "audiomxd", "lsd", "installd",
+-    "UserEventAgent", "cfprefsd", "containermanager"};
++    "UserEventAgent", "cfprefsd", "containermanager", "Preferences", "Music", "PosterBoard"};
+ 
+ static int
+ sweet_crash_limit_get(void)
+@@ -1292,6 +1292,10 @@
+ 		sweet_sink_mode = mode;
+ 	}
+ 	if (sweet_sink_mode <= 0 || path == NULL) {
++		return NULL;
++	}
++	/* Apps and extensions need their own launch/check-in protocol, not a daemon sink. */
++	if (strnstr(path, ".app/", MAXPATHLEN) || strnstr(path, ".appex/", MAXPATHLEN) || strnstr(path, ".xpc/", MAXPATHLEN)) {
+ 		return NULL;
+ 	}
+ 	const char *slash = strrchr(path, '/');

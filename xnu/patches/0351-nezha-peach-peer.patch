@@ -1,0 +1,342 @@
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -7,6 +7,47 @@
+ #include <string.h>
+ #endif
+ static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++const PeachHttPeer *peach_htt_peer(const PeachHtt *h, unsigned vdev, const unsigned char mac[6])
++{
++    if (!h || !mac) return NULL;
++    for (unsigned i = 0; i < PEACH_HTT_PEERS; i++)
++        if (h->peers[i].mapped && h->peers[i].vdev == vdev && !memcmp(h->peers[i].mac, mac, 6))
++            return &h->peers[i];
++    return NULL;
++}
++static int peer_message(PeachHtt *h, const unsigned char *p, size_t n)
++{
++    unsigned type = p[0], map = type == 3 || type == 0x1e, v2 = type >= 0x1e;
++    if (!h->confirmed || n != (map ? (v2 ? 32u : 12u) : (v2 ? 28u : 4u)))
++        return h->error = PeachCeProtocol;
++    unsigned id = u32(p) >> 16, vdev = p[1];
++    if (vdev || id == 65535) return h->error = PeachCeProtocol;
++    PeachHttPeer *slot = NULL;
++    for (unsigned i = 0; i < PEACH_HTT_PEERS; i++) {
++        PeachHttPeer *s = &h->peers[i];
++        if (s->mapped && s->peer == id) { slot = s; break; }
++    }
++    if (!map) {
++        if (!slot || slot->vdev != vdev || (v2 &&
++            (memcmp(slot->mac, p + 4, 6) || (u32(p + 8) & (1u << 16)) ||
++             (u32(p + 16) & 65535)))) return h->error = PeachCeProtocol;
++        slot->mapped = 0;
++        return 0;
++    }
++    if (slot || (p[4] & 1) || !memcmp(p + 4, "\0\0\0\0\0\0", 6) ||
++        peach_htt_peer(h, vdev, p + 4) || (v2 && (u32(p + 12) & (1u << 16))))
++        return h->error = PeachCeProtocol; /* no WDS/duplicate peer ownership */
++    for (unsigned i = 0; i < PEACH_HTT_PEERS; i++)
++        if (!h->peers[i].mapped) { slot = &h->peers[i]; break; }
++    if (!slot || h->peer_generation == 0xffffffffu) return h->error = PeachCeProtocol;
++    memset(slot, 0, sizeof(*slot));
++    slot->vdev = vdev; slot->peer = id; slot->ast = u32(p + 8) >> 16;
++    slot->ast_valid = slot->ast != 65535;
++    slot->hash_valid = v2; slot->hash = v2 ? u32(p + 12) & 65535 : 0;
++    slot->generation = ++h->peer_generation;
++    memcpy(slot->mac, p + 4, 6); slot->mapped = 1;
++    return 0;
++}
+ int peach_htt_init(PeachHtt *h, PeachHtc *htc)
+ {
+     if (!h || !htc) return PeachMhiInvalid;
+@@ -21,6 +62,11 @@
+     if (!p || n < 4 || (n & 3)) { h->error = PeachCeProtocol; return; }
+     uint32_t word = u32(p);
+     h->last_message = word;
++    if ((word & 255) == 3 || (word & 255) == 4 ||
++        (word & 255) == 0x1e || (word & 255) == 0x1f) {
++        (void)peer_message(h, p, n);
++        return;
++    }
+     if ((word & 255) == 0x1a) {
+         if (n != 4 || !h->confirmed || !h->setup_pending || !h->setup_sent ||
+             h->setup_done || ((word >> 8) & 255) != h->setup_pdev ||
+--- a/bsd/dev/qcom/PeachHtt.h
++++ b/bsd/dev/qcom/PeachHtt.h
+@@ -3,6 +3,13 @@
+ #define PEACH_HTT_H
+ #include "PeachHtc.h"
+ enum { PeachHttHwToSw, PeachHttSwToHw, PeachHttSwToSw };
++#define PEACH_HTT_PEERS 8u
++
++typedef struct {
++    unsigned mapped, vdev, peer, ast, hash, ast_valid, hash_valid;
++    uint32_t generation;
++    unsigned char mac[6];
++} PeachHttPeer;
+ typedef struct {
+     /* All addresses are coherent, retained DMA, including BOTH remote
+      * pointers. No CPU virtual address or windowed BAR address is accepted. */
+@@ -15,11 +22,16 @@
+     unsigned setup_pending, setup_sent, setup_done, setup_pdev, setup_id, setup_status;
+     uint32_t configured[4];
+     unsigned rx_config_sent, rx_pdev;
++    uint32_t peer_generation;
++    PeachHttPeer peers[PEACH_HTT_PEERS];
+     uint32_t last_message;
+     int error;
+ } PeachHtt;
+ int peach_htt_init(PeachHtt *, PeachHtc *);
+ void peach_htt_receive(PeachHtt *, const void *, size_t);
++/* Single worker, fixed table. Pointer is borrowed and invalidated by the
++ * next receive. Legacy maps have no AST hash; never invent that value. */
++const PeachHttPeer *peach_htt_peer(const PeachHtt *, unsigned vdev, const unsigned char mac[6]);
+ /* Real VERSION_REQ/CONF, retaining implicit V1 TCL metadata. A completed
+  * negotiation is not a configured DP path or evidence of packet exchange. */
+ int peach_htt_negotiate(PeachHtt *);
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -17,6 +17,8 @@
+        TAG_SCAN_EVENT = 36, TAG_MGMT = 44, TAG_SCAN = 77, TAG_CHANNELS = 79, TAG_CHANNEL = 80,
+        TAG_VDEV = 86, TAG_STREAMS = 411, TAG_RULE = 608, TAG_REG = 609,
+        TAG_RULE_EXT = 937, TAG_REG_EXT = 938,
++       TAG_PEER_CREATE = 97, TAG_PEER_DELETE = 98, TAG_PEER_QUEUE = 549,
++       TAG_PEER_CONFIRM = 868, TAG_PEER_DELETED = 451,
+        TAG_FW_READY = 1321, TAG_MODE = 1322, TAG_MODE_RESPONSE = 1323,
+        RESOURCE_WORDS = 88, VDEVS = 1, PEERS = 8 };
+ static const uint32_t host_abi[6] = {0x01000000, 1822, 0x5f414351, 0x4c4d, 0, 0};
+@@ -26,6 +28,18 @@
+ static void p32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+ static void tlv(unsigned char *p, unsigned tag, unsigned bytes) { p32(p, tag << 16 | bytes); }
+ static int bad(PeachWmi *w) { return w->error = PeachCeProtocol; }
++static PeachWmiPeer *peer_find(PeachWmi *w, const unsigned char mac[6])
++{
++    for (unsigned i = 0; i < PEACH_WMI_PEERS; i++)
++        if (w->peers[i].used && !memcmp(w->peers[i].mac, mac, 6)) return &w->peers[i];
++    return NULL;
++}
++static void peer_mac(unsigned char *p, const unsigned char mac[6])
++{
++    p32(p, (uint32_t)mac[0] | (uint32_t)mac[1] << 8 |
++        (uint32_t)mac[2] << 16 | (uint32_t)mac[3] << 24);
++    p32(p + 4, (uint32_t)mac[4] | (uint32_t)mac[5] << 8);
++}
+ static void report(PeachWmi *w, const char *s, uint32_t a, uint32_t b)
+ { if (w->ops.log) w->ops.log(w->ops.context, s, a, b); }
+ static unsigned service(PeachWmi *w, unsigned id)
+@@ -278,6 +292,21 @@
+     unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
+     w->last_event = id; w->last_tag = tag;
+     switch (id) {
++    case 0x601a: /* WMI_PEER_CREATE_CONF_EVENTID */
++    case 0x6007: { /* WMI_PEER_DELETE_RESP_EVENTID */
++        if (tag != (id == 0x601a ? TAG_PEER_CONFIRM : TAG_PEER_DELETED) ||
++            len < 16 || u32(p + 4)) { bad(w); return; }
++        PeachWmiPeer *s = peer_find(w, p + 8);
++        if (!s || !s->create_sent || u32(p + 16)) { bad(w); return; }
++        if (id == 0x601a) {
++            if (s->create_confirmed) { bad(w); return; }
++            s->create_confirmed = 1;
++        } else {
++            if (!s->delete_sent || s->delete_response) { bad(w); return; }
++            s->delete_response = 1;
++        }
++        break;
++    }
+     case 0x3a001: (void)regulatory_event(w, p, n, 0); break;
+     case 0x3a003: (void)regulatory_event(w, p, n, 1); break;
+     case 0x3001: (void)scan_event(w, p); break;
+@@ -402,6 +431,7 @@
+     R(29, 256); R(30, w->max_fragments > 10 ? 10 : w->max_fragments);
+     R(44, 1u << 30); /* explicitly disable IPA */
+     R(54, 1); R(63, 1); R(81, 1); /* pdev IDs, single STA/active vdev */
++    if (service(w, 143)) R(57, 0x22); /* allow V2 map/unmap; legacy still legal */
+ #undef R
+     p += RESOURCE_WORDS * 4;
+     tlv(p, TAG_ARRAY, w->requests * 20); p += 4;
+@@ -549,3 +579,63 @@
+     report(w, "WMI passive scan actual BSS/dropped", w->bss_count, w->bss_dropped);
+     return 0;
+ }
++int peach_wmi_peer_create(PeachWmi *w, const unsigned char mac[6], unsigned type)
++{
++    if (!w || !mac || !w->ready || !w->vdev_sent || w->scan_active || type > 1 ||
++        (mac[0] & 1) || !memcmp(mac, "\0\0\0\0\0\0", 6) || peer_find(w, mac) ||
++        (!type && memcmp(mac, w->mac, 6)) || (type && !memcmp(mac, w->mac, 6)))
++        return PeachMhiInvalid;
++    if (w->error) return w->error;
++    PeachWmiPeer *s = NULL;
++    for (unsigned i = 0; i < PEACH_WMI_PEERS; i++)
++        if (!w->peers[i].used) { s = &w->peers[i]; break; }
++    if (!s) return PeachCeFull;
++    /* Current fixed struct is 32B, followed by empty non-MLO array. */
++    memset(w->command, 0, 40); tlv(w->command + 4, TAG_PEER_CREATE, 28);
++    peer_mac(w->command + 12, mac); p32(w->command + 20, type);
++    tlv(w->command + 36, TAG_ARRAY, 0);
++    memset(s, 0, sizeof(*s)); s->used = 1; s->type = type; memcpy(s->mac, mac, 6);
++    WTRY(w, send_command(w, 0x6001, 40)); s->create_sent = 1;
++    if (service(w, 234)) WTRY(w, wait_flag(w, &s->create_confirmed));
++    return 0;
++}
++int peach_wmi_peer_delete(PeachWmi *w, const unsigned char mac[6])
++{
++    if (!w || !mac) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    PeachWmiPeer *s = peer_find(w, mac);
++    if (!s || !s->create_sent || s->delete_sent) return PeachMhiInvalid;
++    /* Stop/flush TX and detach queues separately; this command does not
++     * release any retained DMA allocation or permit queue reuse. */
++    memset(w->command, 0, 24); tlv(w->command + 4, TAG_PEER_DELETE, 12);
++    peer_mac(w->command + 12, mac); tlv(w->command + 20, TAG_ARRAY, 0);
++    WTRY(w, send_command(w, 0x6002, 24)); s->delete_sent = 1;
++    if (service(w, 92)) WTRY(w, wait_flag(w, &s->delete_response));
++    return 0;
++}
++int peach_wmi_peer_queue(PeachWmi *w, const PeachHtt *h, const unsigned char mac[6],
++                         unsigned tid, PeachMhiDma queue)
++{
++    if (!w || !h || !mac || tid > 16 || !queue.bytes || !queue.iova ||
++        (queue.iova & 127) || ((uintptr_t)queue.bytes & 127) ||
++        queue.iova >= 0x100000000ull || queue.capacity < (tid == 16 ? 128u : 512u) ||
++        (tid == 16 ? 128u : 512u) > 0x100000000ull - queue.iova) return PeachMhiInvalid;
++    if (w->error || h->error) return w->error = w->error ? w->error : h->error;
++    PeachWmiPeer *s = peer_find(w, mac);
++    const PeachHttPeer *mapped = peach_htt_peer(h, 0, mac);
++    if (!s || !s->type || !s->create_sent || s->delete_sent ||
++        (service(w, 234) && !s->create_confirmed) ||
++        !mapped || (s->queues_sent & (1u << tid))) return PeachMhiInvalid;
++    uint32_t generation = mapped->generation;
++    memset(w->command, 0, 44); tlv(w->command + 4, TAG_PEER_QUEUE, 36);
++    peer_mac(w->command + 12, mac); p32(w->command + 20, tid);
++    p32(w->command + 24, (uint32_t)queue.iova);
++    p32(w->command + 28, (uint32_t)(queue.iova >> 32));
++    p32(w->command + 32, tid); p32(w->command + 36, 1); p32(w->command + 40, 1);
++    w->ops.barrier(w->ops.context);
++    WTRY(w, send_command(w, 0x6013, 44));
++    s->queues_sent |= 1u << tid; /* submitted, not acknowledged */
++    mapped = peach_htt_peer(h, 0, mac);
++    if (!mapped || mapped->generation != generation) return bad(w);
++    return 0;
++}
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -2,10 +2,12 @@
+ #ifndef PEACH_WMI_H
+ #define PEACH_WMI_H
+ #include "PeachHtc.h"
++#include "PeachHtt.h"
+ #define PEACH_WMI_MEMORY_REQUESTS 16u
+ #define PEACH_WMI_REG_RULES 64u
+ #define PEACH_WMI_SCAN_CHANNELS 64u
+ #define PEACH_WMI_BSS_ENTRIES 32u
++#define PEACH_WMI_PEERS 8u
+ typedef struct {
+     void *context;
+     int (*allocate)(void *, size_t, PeachMhiDma *);
+@@ -34,6 +36,12 @@
+     unsigned char bssid[6], ssid[32], ies[512];
+     uint16_t capability, beacon_interval;
+ } PeachWmiBss;
++
++typedef struct {
++    unsigned used, type, create_sent, create_confirmed, delete_sent, delete_response;
++    uint32_t queues_sent;
++    unsigned char mac[6];
++} PeachWmiPeer;
+ typedef struct {
+     PeachHtc *htc;
+     PeachWmiOps ops;
+@@ -50,6 +58,7 @@
+     unsigned scan_reg_generation;
+     PeachWmiScanChannel channels[PEACH_WMI_SCAN_CHANNELS];
+     PeachWmiBss bss[PEACH_WMI_BSS_ENTRIES];
++    PeachWmiPeer peers[PEACH_WMI_PEERS];
+     int error;
+     PeachWmiMemory memory[PEACH_WMI_MEMORY_REQUESTS];
+     unsigned char command[2048];
+@@ -64,4 +73,13 @@
+  * Completion requires real scan events; BSS entries come only from received
+  * beacon/probe-response bytes. No association, keys, NIC or DHCP is implied. */
+ int peach_wmi_passive_scan(PeachWmi *);
++/* vdev0 only; type 0=self, 1=BSS. Optional firmware confirmation is waited
++ * for only when advertised. The caller must ALSO wait for a real HTT map.
++ * Delete retains the peer slot/queue memory; no drain or cache flush implied. */
++int peach_wmi_peer_create(PeachWmi *, const unsigned char mac[6], unsigned type);
++int peach_wmi_peer_delete(PeachWmi *, const unsigned char mac[6]);
++/* Initial non-BA queues only, after a live HTT map. Success means command
++ * submission: this ABI has no queue-setup ACK. Protected RX needs PN setup. */
++int peach_wmi_peer_queue(PeachWmi *, const PeachHtt *, const unsigned char mac[6],
++                         unsigned tid, PeachMhiDma);
+ #endif
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -42,17 +42,29 @@
+     t->prepared = 1;
+     return 0;
+ }
+-int peach_tx_bind(PeachTx *t, unsigned vdev, unsigned peer, unsigned ast, unsigned hash)
++static int mapping_live(PeachTx *t)
+ {
+-    if (!t || !t->prepared || t->authorized || t->in_flight || vdev > 255 ||
+-        peer >= 65535 || ast >= 65535 || hash > 65535) return PeachMhiInvalid;
++    const PeachHttPeer *p = peach_htt_peer(t->htt, t->vdev, t->peer_mac);
++    return !t->htt->error && p && p->generation == t->peer_generation &&
++        p->peer == t->peer && p->ast_valid && p->hash_valid &&
++        p->ast == t->ast && p->hash == t->hash;
++}
++int peach_tx_bind(PeachTx *t, unsigned vdev, const unsigned char mac[6])
++{
++    if (!t || !t->prepared || t->authorized || t->in_flight || vdev || !mac)
++        return PeachMhiInvalid;
+     if (t->error) return t->error;
+-    t->vdev = vdev; t->peer = peer; t->ast = ast; t->hash = hash; t->bound = 1;
++    if (t->htt->error) return t->error = t->htt->error;
++    const PeachHttPeer *p = peach_htt_peer(t->htt, vdev, mac);
++    if (!p || !p->ast_valid || !p->hash_valid) return PeachMhiInvalid;
++    t->vdev = vdev; t->peer = p->peer; t->ast = p->ast; t->hash = p->hash;
++    t->peer_generation = p->generation; memcpy(t->peer_mac, mac, 6); t->bound = 1;
+     return 0;
+ }
+ int peach_tx_authorize(PeachTx *t, unsigned enabled)
+ {
+-    if (!t || !t->prepared || enabled > 1 || (enabled && !t->bound)) return PeachMhiInvalid;
++    if (!t || !t->prepared || enabled > 1 || (enabled && (!t->bound || !mapping_live(t))))
++        return PeachMhiInvalid;
+     if (t->error) return t->error;
+     t->authorized = enabled;
+     return 0;
+@@ -63,6 +75,7 @@
+         bytes < 14 || bytes > 1518 || tid > 15 ||
+         !t->ring->started || !t->completion->started) return PeachMhiInvalid;
+     if (t->error) return t->error;
++    if (!mapping_live(t)) { t->authorized = 0; return PeachMhiInvalid; }
+     if (t->ring->error || t->completion->error)
+         return t->error = t->ring->error ? t->ring->error : t->completion->error;
+     unsigned i = t->next;
+@@ -99,6 +112,7 @@
+ {
+     if (!t || !t->prepared || !t->completion->started) return 0;
+     if (t->error) return t->error;
++    if (t->bound && !mapping_live(t)) t->authorized = 0;
+     for (unsigned budget = 0; budget < 64; budget++) {
+         uint32_t d[8];
+         int err = peach_srng_pop(t->completion, d, sizeof(d));
+--- a/bsd/dev/qcom/PeachTx.h
++++ b/bsd/dev/qcom/PeachTx.h
+@@ -11,6 +11,8 @@
+     PeachHtt *htt;
+     PeachMhiDma memory;
+     unsigned prepared, bound, authorized, lmac, pdev, vdev, peer, ast, hash;
++    uint32_t peer_generation;
++    unsigned char peer_mac[6];
+     unsigned in_flight, next;
+     unsigned char owned[PEACH_TX_BUFFERS];
+     uint32_t cookies[PEACH_TX_BUFFERS];
+@@ -24,7 +26,7 @@
+ /* Binding must use a real HTT peer map after successful association. The
+  * caller may authorize only after the required security/key setup succeeds.
+  * Unbind needs all outstanding completions; no timeout-based DMA freeing. */
+-int peach_tx_bind(PeachTx *, unsigned vdev, unsigned peer, unsigned ast, unsigned hash);
++int peach_tx_bind(PeachTx *, unsigned vdev, const unsigned char mac[6]);
+ int peach_tx_authorize(PeachTx *, unsigned enabled);
+ int peach_tx_send(PeachTx *, const void *, size_t, unsigned tid);
+ int peach_tx_poll(PeachTx *);

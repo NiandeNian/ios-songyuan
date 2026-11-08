@@ -1,0 +1,62 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -84,6 +84,8 @@
+ static PeachHtt wifi_htt;
+ static PeachWmi wifi_wmi;
+ static PeachSrng wifi_srng[PeachSrngKinds];
++static PeachHttRing wifi_rxmac[2];
++static unsigned wifi_rxmac_count;
+ static PeachRx wifi_rx;
+ static PeachTx wifi_tx;
+ static PeachStation wifi_station;
+@@ -889,6 +891,30 @@
+     printf("NEZHA WIFI: host REO rings ready before WMI INIT\n");
+     return 0;
+ }
++/* Android's actual HTT stream configures HOST1/SW-to-SW and, separately,
++ * RXDMA_HOST_BUF/SW-to-HW for both advertised PHYs. The firmware moves
++ * buffers between them. These intermediate rings remain firmware-owned;
++ * the host neither seeds them nor consumes their entries. */
++static int wifi_setup_rxmac(void)
++{
++    enum { entries = 4096, bytes = entries * 8 + 128 };
++    wifi_rxmac_count = wifi_wmi.regulatory[1].valid ? 2 : 1;
++    PeachMhiDma memory;
++    WIFI_TRY(wifi_allocate_dma(NULL, bytes * wifi_rxmac_count, &memory));
++    memset(memory.bytes, 0, bytes * wifi_rxmac_count);
++    for (unsigned i = 0; i < wifi_rxmac_count; i++) {
++        unsigned char *p = (unsigned char *)memory.bytes + i * bytes;
++        uint64_t base = memory.iova + i * bytes;
++        wifi_rxmac[i] = (PeachHttRing){
++            {p, base, entries * 8}, {p + entries * 8, base + entries * 8, 4},
++            {p + entries * 8 + 64, base + entries * 8 + 64, 4},
++            i + 1, 0, PeachHttSwToHw, entries, 2
++        };
++        WIFI_TRY(peach_htt_setup_ring(&wifi_htt, &wifi_rxmac[i]));
++    }
++    printf("NEZHA WIFI: %u firmware-owned RXMAC rings configured\n", wifi_rxmac_count);
++    return 0;
++}
+ static int wifi_setup_srng(void)
+ {
+     PeachMhiDma tx_memory;
+@@ -912,6 +938,7 @@
+      * in the single host-MAC slot 0. RXDMA destination uses target PDEV. */
+     int err = peach_srng_start_lmac(&wifi_srng[PeachSrngRxBuffer], &wifi_htt,
+         0, 5, PeachHttSwToSw);
++    if (!err) err = wifi_setup_rxmac();
+     if (!err) err = peach_srng_start_lmac(&wifi_srng[PeachSrngRxException], &wifi_htt,
+         wifi_wmi.radio.pdev, 7, PeachHttHwToSw);
+     if (err) {
+@@ -1210,6 +1237,10 @@
+             *(volatile uint32_t *)wifi_srng[PeachSrngRxBuffer].head.bytes,
+             *(volatile uint32_t *)wifi_srng[PeachSrngRxBuffer].tail.bytes,
+             wifi_rx.in_flight, wifi_rx.received, wifi_rx.discarded, wifi_rx.released);
++        for (unsigned i = 0; i < wifi_rxmac_count; i++)
++            printf("NEZHA WIFI: RXMAC pdev %u head/tail %#x/%#x\n", i + 1,
++                *(volatile uint32_t *)wifi_rxmac[i].head.bytes,
++                *(volatile uint32_t *)wifi_rxmac[i].tail.bytes);
+         printf("NEZHA WIFI: management RX received %llu discarded %llu tail %#x\n",
+             wifi_wmi.mgmt_rx_received, wifi_wmi.mgmt_rx_discarded,
+             wifi_wmi.mgmt_rx_dma.bytes ? *(volatile uint32_t *)

@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/qcom/PeachSrng.c b/bsd/dev/qcom/PeachSrng.c
+--- a/bsd/dev/qcom/PeachSrng.c
++++ b/bsd/dev/qcom/PeachSrng.c
+@@ -14,12 +14,12 @@
+     {0x00a38500, 0x00a3b048, 1,   8, 0, 0}, /* REO2SW1 */
+     {0x00a388c0, 0x00a3b088, 0,   8, 0, 0}, /* REO2SW0 exception */
+     {0x00a44918, 0x00a46000, 24,  8, 1, 0}, /* SW2TCL1 */
+-    {0x00a34e08, 0x00a370c8, 128, 8, 0, 0}, /* WBM2SW0 */
++    {0x00a34f70, 0x00a370e0, 131, 8, 0, 0}, /* WBM2SW3 RX release */
+     {0, 0, 0, 2, 1, 1},                    /* FW-controlled RX refill */
+     {0, 0, 0, 8, 0, 1},                    /* FW-controlled RXDMA2SW */
+     {0x00a34d3c, 0x00a370b8, 120, 2, 1, 0}, /* WBM idle link */
+     {0x00a3437c, 0x00a37010, 121, 8, 1, 0}, /* SW2WBM release */
+-    {0x00a34e80, 0x00a370d0, 129, 8, 0, 0}, /* WBM2SW1 TX completion */
++    {0x00a34e08, 0x00a370c8, 128, 8, 0, 0}, /* WBM2SW0 TX; SW1 belongs to FW */
+ };
+ #define STRY(r, expr) do { int err_ = (expr); if (err_) { (r)->error = err_; return err_; } } while (0)
+ static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -7,7 +7,7 @@
+ #else
+ #include <string.h>
+ #endif
+-#define TX_RBM 6u /* HAL_BE_WBM_SW0_BM_ID + WBM2SW1 */
++#define TX_RBM 5u /* Peach TCL0 -> WBM2SW0; WBM2SW1 is firmware-owned. */
+ #define TTRY(t, expr) do { int err_ = (expr); if (err_) { (t)->error = err_; return err_; } } while (0)
+ static int invalid(PeachTx *t) { return t->error = PeachCeProtocol; }
+ static uint64_t now(PeachTx *t) { return t->htt->htc->ops.now_us(t->htt->htc->ops.context); }
+diff --git a/bsd/dev/qcom/PeachRx.c b/bsd/dev/qcom/PeachRx.c
+--- a/bsd/dev/qcom/PeachRx.c
++++ b/bsd/dev/qcom/PeachRx.c
+@@ -26,7 +26,7 @@
+ #define RTRY(r, expr) do { int err_ = (expr); if (err_) { (r)->error = err_; return err_; } } while (0)
+ #define REO_BASE 0x00a38000u
+ #define WBM_BASE 0x00a34000u
+-#define RX_RBM 5u /* HAL_BE_WBM_SW0_BM_ID -> WBM2SW0 */
++#define RX_RBM 8u /* Peach single-PDEV RX release -> WBM2SW3. */
+ static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+ static PeachSrngOps *ops(PeachRx *r) { return &r->rings[PeachSrngReoRx].ops; }
+ static void barrier(PeachRx *r) { ops(r)->barrier(ops(r)->context); }

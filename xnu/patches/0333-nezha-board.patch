@@ -1,0 +1,245 @@
+diff --git a/bsd/dev/pandora_touch.c b/bsd/dev/pandora_touch.c
+--- a/bsd/dev/pandora_touch.c
++++ b/bsd/dev/pandora_touch.c
+@@ -1,9 +1,9 @@
+ /*
+- * PANDORA (Xiaomi 17 Pro, SM8850) main screen touch: Synaptics S3910P speaking
++ * NEZHA (Xiaomi 17 Ultra, SM8850; PANDORA kernel configuration) main screen touch: Synaptics TCM (IC identity unconfirmed) speaking
+  * TouchComm (v1 or v2, detected) over SPI on QUPv3 wrapper 4 SE0 (0x01a80000),
+  * polled through GPI DMA. Hardware from the live DT (device/DT_FINDINGS.md):
+  *   IRQ    TLMM GPIO 158, active low        reset  GPIO 66, active low
+- *   avdd   fixed regulator, GPIO 117 high   iovdd  RPMh LDO "L4I_E0" 1.8 V (pmh0110_i_l4)
++ *   avdd   fixed regulator, GPIO 215 high   iovdd  RPMh LDO "L4I_E0" 1.8 V (pmh0110_i_l4)
+  *   SPI    GPIO 48 MISO, 49 MOSI, 50 CLK, 51 CS, function 1 (qup4_se0), 6 mA, pull-down
+  * TLMM pins are 0x1000 apart from 0x0f100000: the downstream pinctrl-canoe.ko adds
+  * 0x100000 to the DT base 0x0f000000 (its pin table holds 0x100000 + 0x1000 * n), and
+@@ -11,16 +11,16 @@
+  * bits 22-26, SE0 RCG 0xa9014); GENI and SPI registers as Linux qcom-geni-se.c and
+  * spi-geni-qcom.c; TouchComm as Synaptics' syna_c10 driver (tcm/*.c).
+  *
+- * Boot-arg pandora_touch (bit mask, default 0xf; 0 = off):
++ * Boot-arg pandora_touch (bit mask, default 0; explicitly enable after board bring-up):
+  *   bit 0  probe: print GCC, SE and pin state (votes the wrapper 4 clocks on)
+  *   bit 1  vote L4I_E0 on (1.8 V, high power mode) through RPMh, apps RSC DRV 2
+  *   bit 2  run: SPI set-up, avdd, reset, TouchComm identify, application info, touch
+  *          report config, then report touches to SweetHIDTouch
+  *   bit 3  also keep the firmware's THP frames (report 0xc0: 64-byte header, then the
+- *          16 x 35 signed 16-bit capacitance deltas) and find fingers in them here, for
++ *          18 x 39 signed 16-bit capacitance deltas) and find fingers in them here, for
+  *          a firmware that leaves touch positions to the host. Its own touch reports
+  *          (0x11) win when they come. pandora_thp_thr (default 200) is the finger
+- *          threshold, pandora_thp_swap=1 reads the deltas as 35 rows of 16,
++ *          threshold, pandora_thp_swap=1 reads the deltas as 39 rows of 18,
+  *          pandora_thp_flip bit 0 / bit 1 mirror x / y.
+  * pandora_steps=MS: before the first access to each new register region print its
+  * name and wait MS (default 0), so a bus hang leaves the name in the log file.
+@@ -56,7 +56,7 @@
+ #define PT_GPIO(n)    ((uint32_t)(n) * 0x1000u)
+ #define PT_IRQ        158u
+ #define PT_RESET      66u
+-#define PT_AVDD       117u
++#define PT_AVDD       215u
+ #define PT_MAX        10u
+ #define PT_PRIORITY   92               /* BASEPRI_PREEMPT, as fuxi_touch */
+ 
+@@ -145,7 +145,7 @@
+ 	unsigned max_x, max_y, max_objects;
+ 	bool fill;
+ 	bool thp;                              /* bit 3: fingers from THP frames too */
+-	unsigned rows, cols;                   /* THP image: 16 x 35 */
++	unsigned rows, cols;                   /* THP image: 18 x 39 */
+ 	unsigned thp_thr, thp_swap, thp_flip, thp_logs;
+ 	uint64_t last_ic_touch;                /* last 0x11 report with a finger */
+ 	uint8_t msg[PT_MSG_MAX];
+@@ -1232,8 +1232,8 @@
+ 	printf("PANDORA TOUCH: app info: version %u status %u max %u x %u objects %u image %u x %u\n",
+ 	    le16(pt.msg), le16(pt.msg + 2), pt.max_x, pt.max_y, pt.max_objects,
+ 	    pt.msg_len >= 44 ? le16(pt.msg + 40) : 0, pt.msg_len >= 44 ? le16(pt.msg + 42) : 0);
+-	pt.rows = pt.msg_len >= 44 ? le16(pt.msg + 40) : 16;
+-	pt.cols = pt.msg_len >= 44 ? le16(pt.msg + 42) : 35;
++	pt.rows = pt.msg_len >= 44 ? le16(pt.msg + 40) : 18;
++	pt.cols = pt.msg_len >= 44 ? le16(pt.msg + 42) : 39;
+ 	if (pt.max_objects == 0 || pt.max_objects > PT_MAX) {
+ 		pt.max_objects = PT_MAX;
+ 	}
+@@ -1283,7 +1283,7 @@
+ 	return out;
+ }
+ 
+-/* Fingers in panel pixels (1220 x 2656) -> SweetHIDTouch, which on PANDORA takes the
++/* Fingers in panel pixels (1200 x 2608) -> SweetHIDTouch, which on PANDORA takes the
+  * presented 1125 x 2436 display's pixels (stretched with sweetfb_fill=1, else centred). */
+ static void
+ pt_deliver(uint32_t mask, const int *px, const int *py)
+@@ -1297,11 +1297,11 @@
+ 		}
+ 		int x, y;
+ 		if (pt.fill) {
+-			x = px[id] * 1125 / 1220;
+-			y = py[id] * 2436 / 2656;
++			x = px[id] * 1125 / 1200;
++			y = py[id] * 2436 / 2608;
+ 		} else {
+-			x = px[id] - (1220 - 1125) / 2;
+-			y = py[id] - (2656 - 2436) / 2;
++			x = px[id] - (1200 - 1125) / 2;
++			y = py[id] - (2608 - 2436) / 2;
+ 		}
+ 		pt.px[id] = px[id];
+ 		pt.py[id] = py[id];
+@@ -1405,9 +1405,9 @@
+ 			continue;
+ 		}
+ 		mask |= 1u << id;
+-		/* IC units (0..max) -> panel pixels, 1220 x 2656 */
+-		px[id] = (int)((uint64_t)xs[id] * 1220 / (pt.max_x + 1));
+-		py[id] = (int)((uint64_t)ys[id] * 2656 / (pt.max_y + 1));
++		/* IC units (0..max) -> panel pixels, 1200 x 2608 */
++		px[id] = (int)((uint64_t)xs[id] * 1200 / (pt.max_x + 1));
++		py[id] = (int)((uint64_t)ys[id] * 2608 / (pt.max_y + 1));
+ 	}
+ 	if (mask) {
+ 		pt.last_ic_touch = mach_absolute_time();
+@@ -1474,8 +1474,8 @@
+ 			if (pt.thp_flip & 2u) {
+ 				yc = (long)yn * 16 - yc;
+ 			}
+-			fx[found] = (int)(xc * 1220 / ((long)xn * 16));
+-			fy[found] = (int)(yc * 2656 / ((long)yn * 16));
++			fx[found] = (int)(xc * 1200 / ((long)xn * 16));
++			fy[found] = (int)(yc * 2608 / ((long)yn * 16));
+ 			fv[found] = v;
+ 			if (pt.thp_logs < 40) {
+ 				printf("PANDORA TOUCH: THP peak cell %u,%u value %d -> panel %d,%d\n", r, c, v,
+@@ -1555,7 +1555,7 @@
+ static void
+ pt_thread(void *arg, wait_result_t result)
+ {
+-	unsigned mask = 0xf, delay_s = 5;
++	unsigned mask = 0, delay_s = 5;
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("pandora_touch", &mask, sizeof(mask));
+@@ -1579,7 +1579,7 @@
+ 	}
+ 	pt_step("GCC wrapper 4 clocks", PT_GCC_PA + GCC_VOTE);
+ 	pt_clock_dump("before");
+-	pt_step("TLMM GPIO 117 (not shared)", PT_TLMM_PA + PT_GPIO(PT_AVDD));
++	pt_step("TLMM GPIO 215 (not shared)", PT_TLMM_PA + PT_GPIO(PT_AVDD));
+ 	(void)pt_rd(pt.tlmm, PT_GPIO(PT_AVDD));
+ 	pt_step("TLMM GPIO 48 (trusted-touch VM list)", PT_TLMM_PA + PT_GPIO(48));
+ 	pt_pins_dump("before");
+@@ -1674,7 +1674,7 @@
+ pandora_touch_init(void)
+ {
+ 	thread_t thread;
+-	unsigned mask = 0xf;
++	unsigned mask = 0;
+ 	if (pt.started) {
+ 		return;
+ 	}
+diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -193,7 +193,7 @@
+ void
+ pandora_dpu_probe(uint64_t fb)
+ {
+-	int on = 1;
++	int on = 0;
+ 	PE_parse_boot_argn("pandora_dpu_probe", &on, sizeof(on));
+ 	if (!on) {
+ 		return;
+@@ -320,9 +320,9 @@
+ #define SC_SLOTS          16u
+ #define SC_PIPES          2u                 /* VIG0, VIG1 */
+ #define SC_FLUSH          ((1u << 0) | (1u << 1) | (1u << 17))
+-#define SC_PANEL_W        1220u
+-#define SC_HALF_W         610u
+-#define SC_PANEL_H        2656u
++#define SC_PANEL_W        1200u
++#define SC_HALF_W         600u
++#define SC_PANEL_H        2608u
+ /* REC block registers (dpu_hw_sspp_v13.c) */
+ #define SC_OP_MODE        0x08u
+ #define SC_SRC_SIZE       0x14u
+@@ -471,7 +471,7 @@
+ int
+ pandora_scanout_init(void)
+ {
+-	int on = 1;
++	int on = 0;
+ 	PE_parse_boot_argn("pandora_scanout", &on, sizeof(on));
+ 	if (!on) {
+ 		printf("PANDORA SCANOUT: off (pandora_scanout=0): CPU copy\n");
+@@ -776,7 +776,7 @@
+ 		{ "intf1 tear", DPU_TEARI(1) + 0x0, DPU_TEARI(1) + 0x4, DPU_TEARI(1) + 0x8 },
+ 	};
+ 	enum { NREG = sizeof(regs) / sizeof(regs[0]) };
+-	int on = 1;
++	int on = 0;
+ 	PE_parse_boot_argn("pandora_dpu_irqprobe", &on, sizeof(on));
+ 	if (!on) {
+ 		return;
+@@ -869,7 +869,7 @@
+ static void
+ sc_irq_start(void)
+ {
+-	int on = 1;
++	int on = 0;
+ 	PE_parse_boot_argn("pandora_scanout_irq", &on, sizeof(on));
+ 	if (!on || !sc_irq_enable) {
+ 		printf("PANDORA SCANOUT: frame start by polling (%s)\n", on ? "no event source" : "pandora_scanout_irq=0");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -550,9 +550,9 @@
+ }
+ 
+ /*
+- * Panel brightness over DSI (0139). The main panel (DT "xiaomi q200 42 02 0a cmd mode dsc
++ * Panel brightness over DSI (0139). The main panel (DT "p1_42_0d_0b_p21 DSC command-mode
+  * dsi panel") is on DSI0 (0x09ac0000) and takes DCS 0x51 with two bytes, high byte first
+- * (qcom,mdss-dsi-bl-inverted-dbv), 7..0x3fff, 0x1554 = top of the normal range (above it
++ * (qcom,mdss-dsi-bl-inverted-dbv), 7..0x3fff, 8191 = top of the Nezha normal range (above it
+  * is Xiaomi's high-brightness mode), HS mode. The command goes through the test-pattern
+  * FIFO, as dsi_ctrl_hw_cmn_kickoff_fifo_command / reset_cmd_fifo in the SM8850 msm_drm:
+  * TPG_CTRL 0x15c = 0x30006, words to 0x17c, COMMAND_MODE_DMA_CTRL 0x3c |= embedded mode,
+@@ -562,7 +562,7 @@
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SWEET_DSI0_PA           0x09ac0000u
+ #define SWEET_PANEL_BL_MIN      7u
+-#define SWEET_PANEL_BL_MAX      0x1554u
++#define SWEET_PANEL_BL_MAX      8191u
+ static vm_offset_t sweet_dsi;
+ static int sweet_dsi_bl = -1;           /* -1 unknown, 0 off/failed, 1 working */
+ static unsigned sweet_dsi_logs;
+@@ -667,7 +667,7 @@
+ sweet_dsi_ready(void)
+ {
+ 	if (sweet_dsi_bl < 0) {
+-		int on = 1;
++		int on = 0;
+ 		PE_parse_boot_argn("pandora_dsi_bl", &on, sizeof(on));
+ 		sweet_dsi_bl = on ? 1 : 0;
+ 		if (on) {
+diff --git a/bsd/dev/pandora_cpu.c b/bsd/dev/pandora_cpu.c
+--- a/bsd/dev/pandora_cpu.c
++++ b/bsd/dev/pandora_cpu.c
+@@ -1,6 +1,6 @@
+ /*
+  * PANDORA CPU performance: what the cores run at and what the firmware offers (patch 0200), boot-arg
+- * pandora_cpu (default 1; 0 = off). Read only: nothing is changed.
++ * pandora_cpu (Nezha default 0; opt in after bring-up). Read only: nothing is changed.
+  *
+  * On this SoC the CPU frequencies are set by the CPUCP firmware. Android asks it through SCMI (Arm's System
+  * Control and Management Interface, performance protocol 0x13) over the "pdp" channel (scmi-cpufreq, governor
+@@ -853,7 +853,7 @@
+ pandora_cpu_init(void)
+ {
+ 	thread_t thread;
+-	int on = 1;
++	int on = 0;
+ 	(void)PE_parse_boot_argn("pandora_cpu", &on, sizeof(on));
+ 	if (on <= 0) {
+ 		return;

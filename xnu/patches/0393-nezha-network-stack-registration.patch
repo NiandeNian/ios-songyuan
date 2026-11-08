@@ -1,0 +1,77 @@
+diff --git a/iokit/Kernel/arm/PeachWLAN.cpp b/iokit/Kernel/arm/PeachWLAN.cpp
+--- a/iokit/Kernel/arm/PeachWLAN.cpp
++++ b/iokit/Kernel/arm/PeachWLAN.cpp
+@@ -6,9 +6,12 @@
+ #include <sys/errno.h>
+ #if defined(PANDORA)
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
+ #include <libkern/c++/OSData.h>
++#include <sys/proc.h>
+ 
+ /* The existing Nezha identity service defines this base in
+  * SweetPlatformExpert.cpp. Keep one metaclass definition in the kernel. */
+@@ -24,9 +27,60 @@
+ OSDefineMetaClassAndStructors(IO80211Controller, IONetworkController);
+ OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
+ 
++/* InterfaceNamer must open this service before it publishes registry quiet.
++ * Without it SCNetworkInterfaceCopyAll blocks wifid and then SpringBoard.
++ * BSD already assigned en0, so there is no interface naming operation here.
++ * See HackiOS MiniIONetworkStack.cpp. */
++class IONetworkStack : public IOService {
++    OSDeclareDefaultStructors(IONetworkStack);
++};
++class IONetworkStackUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(IONetworkStackUserClient);
++public:
++    virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++bool IONetworkStackUserClient::start(IOService *provider)
++{
++    if (!IOUserClient::start(provider)) return false;
++    char name[32];
++    proc_selfname(name, sizeof(name));
++    IOLog("NEZHA WIFI: network stack opened by %s, registry busy %u\n",
++        name, (unsigned)IOService::getServiceRoot()->getBusyState());
++    return true;
++}
++IOReturn IONetworkStackUserClient::clientClose(void)
++{
++    if (!isInactive()) terminate();
++    return kIOReturnSuccess;
++}
++IOReturn IONetworkStackUserClient::setProperties(OSObject *)
++{ return kIOReturnUnsupported; }
++static int network_stack_publish(void)
++{
++    IOService *resources = IOService::getResourceService();
++    IONetworkStack *stack = new IONetworkStack;
++    if (!resources || !stack || !stack->init()) {
++        OSSafeReleaseNULL(stack); return ENOMEM;
++    }
++    stack->setName("IONetworkStack");
++    stack->setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++    int error = EIO;
++    if (stack->attach(resources)) {
++        if (stack->start(resources)) {
++            stack->registerService(); error = 0;
++        } else stack->detach(resources);
++    }
++    stack->release(); return error;
++}
+ extern "C" int peach_wlan_publish(const char *, const unsigned char *);
+ extern "C" int peach_wlan_publish(const char *name, const unsigned char *mac)
+ {
++    int stack_error = network_stack_publish();
++    if (stack_error) return stack_error;
+     IOService *provider = IOService::getPlatform();
+     IO80211Controller *controller = new IO80211Controller;
+     IONetworkInterface *interface = new IONetworkInterface;

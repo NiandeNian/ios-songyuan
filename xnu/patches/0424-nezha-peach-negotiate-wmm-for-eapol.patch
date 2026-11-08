@@ -1,0 +1,127 @@
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -55,7 +55,7 @@
+ } PeachWmiMgmt;
+ 
+ typedef struct {
+-    unsigned aid, capabilities, protected_network, rate_count;
++    unsigned aid, capabilities, protected_network, rate_count, qos;
+     unsigned char rates[12]; /* 500kbps, including the basic-rate bit */
+ } PeachWmiAssociation;
+ 
+diff --git a/bsd/dev/qcom/PeachTx.h b/bsd/dev/qcom/PeachTx.h
+--- a/bsd/dev/qcom/PeachTx.h
++++ b/bsd/dev/qcom/PeachTx.h
+@@ -10,7 +10,7 @@
+     PeachSrng *ring, *completion;
+     PeachHtt *htt;
+     PeachMhiDma memory;
+-    unsigned prepared, bound, authorized, lmac, pdev, vdev, peer, ast, hash;
++    unsigned prepared, bound, authorized, lmac, pdev, vdev, peer, ast, hash, qos;
+     uint32_t peer_generation;
+     unsigned char peer_mac[6];
+     unsigned in_flight, next;
+diff --git a/bsd/dev/qcom/PeachStation.c b/bsd/dev/qcom/PeachStation.c
+--- a/bsd/dev/qcom/PeachStation.c
++++ b/bsd/dev/qcom/PeachStation.c
+@@ -185,6 +185,15 @@
+     }
+     return PeachMhiTimeout;
+ }
++static unsigned wmm_parameters(const unsigned char *p, size_t bytes)
++{
++    while (bytes >= 2 && p[1] <= bytes - 2) {
++        if (p[0] == 221 && p[1] == 24 &&
++            !memcmp(p + 2, "\x00\x50\xf2\x02\x01\x01", 6)) return 1;
++        size_t n = p[1] + 2u; p += n; bytes -= n;
++    }
++    return 0;
++}
+ static int associate(PeachStation *s, const PeachWmiBss *b)
+ {
+     header(s, 0); p16(s->frame + 24, s->requested_caps); p16(s->frame + 26, 10);
+@@ -199,6 +208,11 @@
+         memcpy(s->frame + off, s->rates + first, s->rate_count - first); off += s->rate_count - first;
+     }
+     memcpy(s->frame + off, s->rsn, s->rsn_bytes); off += s->rsn_bytes;
++    unsigned qos = wmm_parameters(b->ies, b->ie_bytes);
++    if (qos) {
++        static const unsigned char info[] = {221,7,0,0x50,0xf2,2,0,1,0};
++        memcpy(s->frame + off, info, sizeof(info)); off += sizeof(info);
++    }
+     int err = peach_wmi_mgmt_tx(s->wmi, s->frame, off);
+     if (err && err != PeachMhiDeviceError) return err;
+     err = response(s, 0x10, 30);
+@@ -209,6 +223,7 @@
+     PeachWmiAssociation *a = &s->association;
+     a->aid = u16(p + 28) & 0x3fff; a->capabilities = u16(p + 24);
+     a->protected_network = s->security == PeachStationWpa2Psk;
++    a->qos = qos && wmm_parameters(p + 30, s->received.bytes - 30);
+     if (!a->aid || a->aid > 2007 || (a->capabilities & 3) != 1 ||
+         !!(a->capabilities & 16) != a->protected_network) return PeachCeProtocol;
+     err = rates_from_ies(p + 30, s->received.bytes - 30, b->frequency, a->rates, &a->rate_count);
+@@ -246,9 +261,12 @@
+     STRY(s, peach_wmi_peer_queue(s->wmi, s->htt, s->bssid, 16, peach_rx_queue(s->rx, 16)));
+     s->phase = PeachStationAuth; STRY(s, authenticate(s));
+     s->phase = PeachStationAssoc; STRY(s, associate(s, b));
++    if (s->association.qos)
++        STRY(s, peach_wmi_peer_queue(s->wmi, s->htt, s->bssid, 6, peach_rx_queue(s->rx, 6)));
+     STRY(s, peach_wmi_peer_assoc(s->wmi, s->htt, &s->association));
+     STRY(s, peach_wmi_vdev_up(s->wmi));
+     STRY(s, peach_tx_bind(s->tx, 0, s->bssid));
++    s->tx->qos = s->association.qos;
+     s->phase = security ? PeachStationAwaitKeys : PeachStationOpenAssociated;
+     return 0; /* caller still has no authorized TX/NIC */
+ }
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -1033,7 +1033,7 @@
+ int peach_wmi_peer_assoc(PeachWmi *w, const PeachHtt *h, const PeachWmiAssociation *a)
+ {
+     if (!w || !h || !a || !w->vdev_started || w->vdev_stop_sent || w->vdev_up_sent ||
+-        a->aid < 1 || a->aid > 2007 || a->capabilities > 65535 || a->protected_network > 1 ||
++        a->aid < 1 || a->aid > 2007 || a->capabilities > 65535 || a->protected_network > 1 || a->qos > 1 ||
+         !a->rate_count || a->rate_count > sizeof(a->rates) ||
+         !!(a->capabilities & 16) != a->protected_network) return PeachMhiInvalid;
+     if (w->error || h->error) return w->error = w->error ? w->error : h->error;
+@@ -1050,8 +1050,7 @@
+         for (unsigned j = 0; j < i; j++) if (rate == (a->rates[j] & 127)) return PeachMhiInvalid;
+         if (!found) return PeachMhiInvalid;
+     }
+-    /* Current wmi_peer_assoc_complete has 96 words, including zero HE,
+-     * EHT/UHR arrays and the single-word flags union. No PHY feature flags. */
++    /* Legacy PHY, with WMM only if accepted by the AP; no aggregation. */
+     memset(w->command, 0, sizeof(w->command));
+     unsigned char *p = w->command + 4;
+     /* Native Peach module send_peer_assoc_cmd_tlv: 280-byte fixed struct,
+@@ -1060,7 +1059,7 @@
+     p32(p + 16, 1); p32(p + 20, a->aid);
+     /* Native protected association requests PTK/GTK handshakes. PRIV
+      * would enable encryption before a pairwise key exists for M2. */
+-    p32(p + 24, a->protected_network ? 0x14 : 1);
++    p32(p + 24, (a->protected_network ? 0x14 : 1) | (a->qos ? 2u : 0));
+     p32(p + 28, a->capabilities); p32(p + 32, 10); p32(p + 52, 1);
+     unsigned mode = w->vdev_frequency < 2500 ? 1 : 0;
+     for (unsigned i = 0; i < w->channel_count; i++)
+@@ -1073,6 +1072,7 @@
+     tlv(p, 17, 0); p += 4; tlv(p, TAG_VHT_RATES, 20); p += 24;
+     for (unsigned i = 0; i < 5; i++, p += 4) tlv(p, TAG_ARRAY, 0);
+     report(w, "WMI native peer assoc bytes/rates", (uint32_t)(p - w->command), a->rate_count);
++    report(w, "WMI peer negotiated QoS/flags", a->qos, u32(w->command + 28));
+     WTRY(w, send_command(w, 0x6005, (size_t)(p - w->command))); s->assoc_sent = 1;
+     s->assoc_id = a->aid; s->protected_network = a->protected_network;
+     if (service(w, 79)) WTRY(w, wait_flag(w, &s->assoc_confirmed));
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -107,7 +107,7 @@
+         /* Captured native M2/M4: semi-hard notify, voice TID override and
+          * critical-frame classifier; TO_FW is clear for these frames. */
+         control ? 3u << 8 : 0, metadata << 16, (uint32_t)length,
+-        1u | (control ? 6u : tid) << 4 | (control ? 6u : 0) |
++        1u | (control && t->qos ? 6u : tid) << 4 | (control ? 6u : 0) |
+             t->lmac << 9 | t->vdev << 24,
+         t->ast | (t->hash & 15) << 20, 0};
+     if (control && t->htt->htc->ops.log) {

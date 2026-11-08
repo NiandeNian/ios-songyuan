@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -361,6 +361,7 @@
+ 	bool          fDirty;
+ 	bool          fCopying;     /* the vsync timer is copying the frame it took from fPending */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fRefreshHz;     /* notification cadence and CoreAnimation agree */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	uint64_t      fTickAbs;       /* vsync period, absolute time units */
+@@ -981,7 +982,7 @@
+ 	fLogicalH = fHeight;
+ #if defined(PANDORA)
+ 	/*
+-	 * The 17 Pro panel (1220x2656) is larger than the iPhone X one. Presented at its
++	 * The Nezha panel (1200x2608) is larger than the iPhone X one. Presented at its
+ 	 * own size, backboardd/UIKit have no layout for it and backboardd loops looking
+ 	 * for AppleM2ScalerCSCDriver. Present 1125x2436 and center it (47 px left/right,
+ 	 * 110 px top/bottom black border); the offsets below are then negative.
+@@ -998,8 +999,7 @@
+ #if defined(PANDORA)
+ 	/*
+ 	 * sweetfb_fill=1: instead of the centered 1125x2436 area with a black border,
+-	 * scale the presented display to the whole 1220x2656 panel (nearest neighbour,
+-	 * x 1.084 / y 1.090; the aspect ratios differ by 0.5 %).
++	 * scale the presented display to the whole 1200x2608 panel.
+ 	 */
+ 	int fill = 0;
+ 	PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
+@@ -1031,19 +1031,27 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-#if defined(FUXI)
++	fRefreshHz = 60;
++#if defined(PANDORA)
++	fRefreshHz = 120;
++	PE_parse_boot_argn("sweetfb_refresh", &fRefreshHz, sizeof(fRefreshHz));
++	if (fRefreshHz != 60 && fRefreshHz != 120) {
++		fRefreshHz = 120;
++	}
++	uint32_t hz = fRefreshHz;
++#elif defined(FUXI)
+ 	uint32_t hz = 60;
+ #else
+ 	uint32_t hz = 10;
+ #endif
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-#if defined(FUXI)
+-	nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &fTickAbs);
++	fFlushTicks = (hz == 0 || hz >= fRefreshHz) ? 1 : (fRefreshHz + hz - 1) / hz;
++#if defined(FUXI) || defined(PANDORA)
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / fRefreshHz, &fTickAbs);
+ 	fNextTick = mach_absolute_time() + fTickAbs;
+ 	fStatStart = mach_absolute_time();
+ 	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
+-	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", 60 / fFlushTicks, fFlushTicks);
++	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", fRefreshHz / fFlushTicks, fFlushTicks);
+ #else
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ #endif
+@@ -1082,11 +1090,10 @@
+ 	 * fixed point, displayRefreshStepMachTime: the variable-refresh step}. AppleDisplay reads it from this service and
+ 	 * AppleCLCDDisplay::heartbeat_rate makes the shortest interval CoreAnimation's frame period when there is no step.
+ 	 * Step 0: a fixed rate, and no APT claim (APT would put animations without a range at 60-80 Hz). Boot-arg
+-	 * sweetfb_refresh (Hz, default 120; 0 publishes nothing: 60 Hz, as the iPhone X).
++	 * sweetfb_refresh selects 60 or 120 Hz; notifications use the same period.
+ 	 */
+ 	{
+-		uint32_t refresh = 120;
+-		PE_parse_boot_argn("sweetfb_refresh", &refresh, sizeof(refresh));
++		const uint32_t refresh = fRefreshHz;
+ 		OSDictionary *d = refresh ? OSDictionary::withCapacity(2) : NULL;
+ 		OSNumber *interval = d ? OSNumber::withNumber((1ULL << 32) / refresh, 32) : NULL;
+ 		OSNumber *step = d ? OSNumber::withNumber(0ULL, 32) : NULL;
+@@ -1131,7 +1138,7 @@
+ static void
+ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
+ {
+-#if defined(FUXI)
++#if defined(FUXI) || defined(PANDORA)
+ 	/* Absolute deadlines: the period does not grow by the copy time. */
+ 	uint64_t now = mach_absolute_time();
+ 	fb->fNextTick += fb->fTickAbs;
+@@ -1556,8 +1563,8 @@
+ 		IOLog("SWEET FB: present thread: no memory\n");
+ 		return;
+ 	}
+-	if (fFlushTicks > 1) {      /* sweetfb_hz under 60: at most that many frames a second */
+-		nanoseconds_to_absolutetime((uint64_t)fFlushTicks * SWEET_FB_VSYNC_US * NSEC_PER_USEC, &gap);
++	if (fFlushTicks > 1) {
++		gap = (uint64_t)fFlushTicks * fTickAbs;
+ 	}
+ 	IOLockLock(fLock);
+ 	for (;;) {

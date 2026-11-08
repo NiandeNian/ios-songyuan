@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -675,6 +675,7 @@
+ 	if (off + len < off || off + len > f->size) {
+ 		return EINVAL;
+ 	}
++	if (!len) return 0;
+ 	if (f->in_fat) {
+ 		lck_mtx_lock(&ad_fat_lock);
+ 		int err = fat_read(&ad_fat, &f->fat, off, dst, (size_t)len) ? EIO : 0;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -858,6 +858,7 @@
+         wifi_firmware.amss[i] = wifi_dma_part((i + 1) * PEACH_MHI_SEGMENT_BYTES, PEACH_MHI_SEGMENT_BYTES);
+     wifi_firmware.vectors = wifi_dma_part(0x800000, 0x1000);
+     int err = peach_mhi_firmware_stage(&wifi_firmware, wifi_firmware_read, NULL, bytes);
++    printf("NEZHA WIFI: firmware stage %d, %llu bytes\n", err, bytes);
+     if (err) return EINVAL;
+     wifi_phase = 5;
+     return 0;

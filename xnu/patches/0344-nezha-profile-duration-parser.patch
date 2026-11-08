@@ -1,0 +1,12 @@
+--- a/osfmk/arm/pandora_prof.c
++++ b/osfmk/arm/pandora_prof.c
+@@ -660,7 +660,8 @@
+ 		uint32_t *values[] = { &pprof_at, &pprof_duration };
+ 		for (unsigned i = 0; i < 2; i++) {
+ 			while (*suffix >= '0' && *suffix <= '9') {
+-				*values[i] = MIN(3600u, *values[i] * 10u + (uint32_t)(*suffix++ - '0'));
++				const uint32_t digit = (uint32_t)(*suffix++ - '0');
++				*values[i] = MIN(3600u, *values[i] * 10u + digit);
+ 			}
+ 			if (*suffix != ':') break;
+ 			suffix++;

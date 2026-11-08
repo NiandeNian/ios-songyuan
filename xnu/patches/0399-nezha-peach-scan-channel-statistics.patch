@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -361,6 +361,14 @@
+     unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
+     w->last_event = id; w->last_tag = tag;
+     switch (id) {
++    case 0x4002: /* WMI_CHAN_INFO_EVENTID: initial scan RF evidence */
++        if (tag != 38 || len < 56) { bad(w); return; }
++        if (w->scan_id == 0xa001) {
++            report(w, "WMI channel MHz/error", u32(p + 8), u32(p + 4));
++            report(w, "WMI channel RX frames/clear", u32(p + 36), u32(p + 20));
++            report(w, "WMI channel cycles/noise", u32(p + 24), u32(p + 16));
++        }
++        break;
+     case 0x1d004: { /* WMI_UPDATE_STATS_EVENTID, legacy PDEV base prefix */
+         if (tag != 70 || len < 32) { bad(w); return; }
+         report(w, "WMI radio stats pdev/count", u32(p + 32), u32(p + 8));
+@@ -700,7 +708,8 @@
+     p32(p + 16, 1); p32(p + 20, 0x7b); /* low priority, channel/start/completion/failures */
+     p32(p + 24, 120); p32(p + 28, 120); /* passive dwell in ms */
+     p32(p + 48, 25); p32(p + 52, 15000);
+-    p32(p + 60, 0x21); /* PASSIVE + FILTER_PROBE_REQ; no probes or active DFS */
++    p32(p + 60, 0x21 | (w->scan_id == 0xa001 ? 0x10 : 0));
++    /* PASSIVE + FILTER_PROBE_REQ; request channel counters on the first scan. */
+     p32(p + 68, w->channel_count);
+     p32(p + 72, 1); /* broadcast BSSID, as in ath12k_wmi_start_scan_init */
+     p += 172; tlv(p, TAG_U32, w->channel_count * 4); p += 4;

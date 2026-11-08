@@ -1,0 +1,107 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -62,7 +62,7 @@
+     {0x0f166000, 0x3000, 0}, {0x0f1cc000, 0x2000, 0},
+ };
+ static int wifi_fault, wifi_wait;
+-static unsigned wifi_phase, wifi_bank, wifi_slot;
++static unsigned wifi_phase, wifi_bank, wifi_slot, wifi_msi_cap;
+ static const char *wifi_step = "init";
+ static uint64_t wifi_arena_pa, wifi_tables_pa;
+ static vm_offset_t wifi_arena, wifi_tables;
+@@ -98,6 +98,7 @@
+ #define WIFI_DMA_BYTES 0x920000u
+ #define WIFI_DMA_LIMIT 0x28000000ull
+ #define WIFI_TABLE_BYTES 0x50000u
++#define WIFI_MSI_OFFSET 0x808000u
+ #define WIFI_TRY(expr) do { int err_ = (expr); if (err_) return err_; } while (0)
+ static int wifi_dma_health(void);
+ 
+@@ -358,7 +359,11 @@
+             visited |= 1ull << (next / 4);
+             WIFI_TRY(wifi_rd(W_CFG, next, &value));
+             uint32_t masked = value;
+-            if ((value & 255) == 5) masked &= ~(1u << 16);
++            if ((value & 255) == 5) {
++                if (wifi_msi_cap) return EINVAL;
++                wifi_msi_cap = next;
++                masked &= ~(1u << 16);
++            }
+             if ((value & 255) == 0x11) masked = (masked & ~(1u << 31)) | 1u << 30;
+             if (masked != value) {
+                 WIFI_TRY(wifi_wr(W_CFG, next, masked));
+@@ -697,6 +702,42 @@
+     wifi_now, wifi_sleep, 0x200000};
+ static void wifi_barrier(void *c)
+ { (void)c; __asm__ volatile("dsb sy" ::: "memory"); }
++
++/* MHI firmware still sends MSI when the host consumes rings by polling.
++ * Keep INTx/MSI-X disabled; route MSI writes into an owned normal-NC word,
++ * as an IOMMU-mapped MSI message, without targeting an unregistered GIC IRQ. */
++static int wifi_enable_poll_msi(void)
++{
++    uint32_t cap, data, check;
++    if (!wifi_msi_cap || !wifi_arena) return ENOTSUP;
++    WIFI_TRY(wifi_rd(W_CFG, wifi_msi_cap, &cap));
++    if ((cap & 255) != 5 || (cap & 1u << 16) || ((cap >> 17) & 7) != 5) return ENOTSUP;
++    unsigned wide = !!(cap & 1u << 23), mask = !!(cap & 1u << 24);
++    unsigned data_off = wifi_msi_cap + (wide ? 12 : 8);
++    unsigned mask_off = wifi_msi_cap + (wide ? 16 : 12);
++    uint32_t address = (uint32_t)(WIFI_IOVA + WIFI_MSI_OFFSET);
++    *(volatile uint32_t *)(wifi_arena + WIFI_MSI_OFFSET) = 0;
++    wifi_barrier(NULL);
++    if (mask) WIFI_TRY(wifi_wr(W_CFG, mask_off, 0xffffffffu));
++    WIFI_TRY(wifi_wr(W_CFG, wifi_msi_cap + 4, address));
++    if (wide) WIFI_TRY(wifi_wr(W_CFG, wifi_msi_cap + 8, 0));
++    WIFI_TRY(wifi_rd(W_CFG, data_off, &data));
++    WIFI_TRY(wifi_wr(W_CFG, data_off, data & 0xffff0000u));
++    cap = (cap & ~(7u << 20 | 1u << 26)) | 5u << 20 | 1u << 16;
++    WIFI_TRY(wifi_wr(W_CFG, wifi_msi_cap, cap));
++    WIFI_TRY(wifi_rd(W_CFG, wifi_msi_cap, &check));
++    if (check != cap) return EIO;
++    WIFI_TRY(wifi_rd(W_CFG, wifi_msi_cap + 4, &check));
++    if (check != address) return EIO;
++    if (mask) {
++        WIFI_TRY(wifi_wr(W_CFG, mask_off, 0));
++        WIFI_TRY(wifi_rd(W_CFG, mask_off, &check));
++        if (check) return EIO;
++    }
++    printf("NEZHA WIFI: MSI 32 vectors -> owned IOVA %#x (polled)\n", address);
++    return 0;
++}
++
+ static int wifi_wlfw_file(void *c, const char *name, uint64_t o, void *p, size_t n, uint64_t *size)
+ { (void)c; return pandora_firmware_pread(name, o, p, n, size); }
+ static void wifi_wlfw_log(void *c, const char *s, uint32_t a, uint32_t b)
+@@ -907,6 +948,8 @@
+ static void wifi_mhi_failure(void)
+ {
+     if (wifi_phase < 6 || wifi_fault) return;
++    printf("NEZHA WIFI: last MSI data %#x\n",
++        *(volatile uint32_t *)(wifi_arena + WIFI_MSI_OFFSET));
+     uint32_t status = 0, debug[6] = {0};
+     (void)wifi_rd(W_BAR, 0x48, &status);
+     printf("NEZHA WIFI: MHI state %u EE %u status %#x ring %#llx event %#llx %#x %#x\n",
+@@ -940,6 +983,8 @@
+     WIFI_TRY(wifi_pcie_link());
+     WIFI_TRY(wifi_dma());
+     WIFI_TRY(wifi_stage_firmware());
++    wifi_step = "configure polled MSI delivery";
++    WIFI_TRY(wifi_enable_poll_msi());
+     wifi_step = "BHI SBL download";
+     uint32_t command, session;
+     read_random(&session, sizeof(session));
+diff --git a/bsd/dev/qcom/PeachMhiHost.h b/bsd/dev/qcom/PeachMhiHost.h
+--- a/bsd/dev/qcom/PeachMhiHost.h
++++ b/bsd/dev/qcom/PeachMhiHost.h
+@@ -8,7 +8,8 @@
+ 
+ /* One worker owns host state, rings and receive callbacks. memory must be
+  * coherent little-endian DMA belonging to SID 0x1401's isolated domain.
+- * The caller masks PCI MSI/INTx while polling, holds endpoint power, and
++ * The caller masks INTx and routes PCI MSI into owned DMA while polling,
++ * holds endpoint power, and
+  * retains all storage until real endpoint containment, including on errors. */
+ typedef struct {
+     PeachMhiDma memory;

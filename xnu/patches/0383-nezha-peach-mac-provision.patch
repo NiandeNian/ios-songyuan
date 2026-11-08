@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -445,14 +445,21 @@
+     return 0;
+ }
+ 
+-int peach_wlfw_wlan_enable(PeachWlfw *w)
++int peach_wlfw_wlan_enable(PeachWlfw *w, const unsigned char mac[6])
+ {
+     if (!w || w->phase != 6 || !w->firmware_ready) return PeachMhiInvalid;
+     if (w->error) return w->error;
++    if (!mac || (mac[0] & 1) || !memcmp(mac, "\0\0\0\0\0\0", 6)) return PeachMhiInvalid;
++    /* CNSS provisions the collected host address before WLAN_CFG/MISSION;
++     * otherwise this firmware reports an all-zero MAC in WMI READY. */
++    unsigned char *p = w->packet + 39;
++    p[0] = 0x10; p16(p + 1, 6); memcpy(p + 3, mac, 6);
++    WTRY(request(w, 0x33, 9));
++    report(w, "WLFW MAC provisioned", 0, 0);
+     /* cnss2/qmi.c WLAN_CFG schema: variable arrays carry an 8-bit count,
+      * all pipe fields are 32-bit. Use the vendor's Peach-selected table,
+      * including its terminator. No shadow/MSI capabilities are asserted. */
+-    unsigned char *p = w->packet + 39;
++    p = w->packet + 39;
+     static const char version[] = "UniXNU-Nezha";
+     p[0] = 0x10; p16(p + 1, sizeof(version) - 1);
+     memcpy(p + 3, version, sizeof(version) - 1);
+diff --git a/bsd/dev/qcom/PeachWlfw.h b/bsd/dev/qcom/PeachWlfw.h
+--- a/bsd/dev/qcom/PeachWlfw.h
++++ b/bsd/dev/qcom/PeachWlfw.h
+@@ -51,5 +51,5 @@
+ int peach_wlfw_bootstrap(PeachWlfw *);
+ /* Call with CE DMA prepared, before enabling the host-owned CE rings. Does
+  * not advertise MSI, shadow-register acceleration, MLO or a working NIC. */
+-int peach_wlfw_wlan_enable(PeachWlfw *);
++int peach_wlfw_wlan_enable(PeachWlfw *, const unsigned char mac[6]);
+ #endif
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1098,7 +1098,13 @@
+         peach_htt_init(&wifi_htt, &wifi_htc) ||
+         peach_wmi_init(&wifi_wmi, &wifi_htc, &wifi_wmi_ops)) return EIO;
+     wifi_step = "WLFW WLAN_CFG/MISSION";
+-    if (peach_wlfw_wlan_enable(&wifi_wlfw)) return EIO;
++    DTEntry chosen;
++    const void *mac = NULL;
++    unsigned mac_bytes = 0;
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++        SecureDTGetProperty(chosen, "nezha-wifi-mac", &mac, &mac_bytes) != kSuccess ||
++        mac_bytes != 6) return EINVAL;
++    if (peach_wlfw_wlan_enable(&wifi_wlfw, mac)) return EIO;
+     wifi_phase = 10;
+     wifi_step = "Peach CE rings";
+     err = peach_ce_start(&wifi_ce);

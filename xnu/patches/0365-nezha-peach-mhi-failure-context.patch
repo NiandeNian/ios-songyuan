@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -908,6 +908,10 @@
+     err = peach_wlfw_bootstrap(&wifi_wlfw);
+     if (err) {
+         printf("NEZHA WIFI: WLFW phase %u failed: %d\n", wifi_wlfw.phase, err);
++        printf("NEZHA WIFI: MHI state %u EE %u status %#x ring %#llx event %#llx %#x %#x\n",
++            wifi_host.state, wifi_host.environment, wifi_host.last_status,
++            wifi_host.last_ring_pointer, wifi_host.last_event_pointer,
++            wifi_host.last_event_data[0], wifi_host.last_event_data[1]);
+         return EIO;
+     }
+     wifi_phase = 9;
+diff --git a/bsd/dev/qcom/PeachMhiHost.c b/bsd/dev/qcom/PeachMhiHost.c
+--- a/bsd/dev/qcom/PeachMhiHost.c
++++ b/bsd/dev/qcom/PeachMhiHost.c
+@@ -138,6 +138,8 @@
+ {
+     uint64_t pointer = get64(h, off);
+     uint32_t d0 = get32(h, off + 8), d1 = get32(h, off + 12);
++    h->last_event_pointer = pointer;
++    h->last_event_data[0] = d0; h->last_event_data[1] = d1;
+     unsigned type = (d1 >> 16) & 255, ch = d1 >> 24, code = d0 >> 24;
+     if (type == 0x20) {
+         h->state = d0 >> 24;
+@@ -191,12 +193,14 @@
+     if (!h || !h->io || h->poisoned || !budget || budget > 512) return PeachMhiInvalid;
+     uint32_t status;
+     HOST_TRY(rd(h, 0x48, &status));
++    h->last_status = status;
+     if (status == 0xffffffffu || (status & 4)) { h->poisoned = 1; return PeachMhiDeviceError; }
+     for (unsigned e = 0; e < 2 && budget; e++) {
+         unsigned base = e ? DATA_RING : CTRL_RING, n = e ? 256 : 32;
+         unsigned ctx = EVCTX + e * CTX_BYTES, device_index, consumed = 0;
+         h->barrier(h->io->context);
+-        HOST_TRY(index_of(h, get64(h, ctx + 28), base, n, &device_index));
++        h->last_ring_pointer = get64(h, ctx + 28);
++        HOST_TRY(index_of(h, h->last_ring_pointer, base, n, &device_index));
+         while (h->event_rp[e] != device_index && budget) {
+             h->barrier(h->io->context);
+             HOST_TRY(process_event(h, base + h->event_rp[e] * 16));
+diff --git a/bsd/dev/qcom/PeachMhiHost.h b/bsd/dev/qcom/PeachMhiHost.h
+--- a/bsd/dev/qcom/PeachMhiHost.h
++++ b/bsd/dev/qcom/PeachMhiHost.h
+@@ -21,6 +21,8 @@
+     unsigned tx_rp, tx_wp, rx_rp, rx_wp, cmd_wp;
+     uint64_t pending_cmd;
+     unsigned pending_channel, command_done, environment, state, ipcr_up, poisoned;
++    uint64_t last_event_pointer, last_ring_pointer;
++    uint32_t last_event_data[2], last_status;
+ } PeachMhiHost;
+ 
+ /* After BHI SBL transfer: wait RESET clear/READY, publish actual contexts and

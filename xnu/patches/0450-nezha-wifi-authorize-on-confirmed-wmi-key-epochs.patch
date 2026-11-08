@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/qcom/PeachRsn.c b/bsd/dev/qcom/PeachRsn.c
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -299,11 +299,12 @@
+         return PeachMhiInvalid;
+     for (unsigned i = 0; i < 2; i++) {
+         unsigned changed = i ? r->pair_changed : group_changed;
+-        if (changed && p->security_generation[i] == 0xffffffffu) return PeachCeProtocol;
+-        r->expected_security[i] = p->security_generation[i] + changed;
++        uint32_t generation = i ? t->generation : g->generation;
++        if (changed && generation == 0xffffffffu) return PeachCeProtocol;
++        r->expected_keys[i] = generation + changed;
+     }
+     if (s->wmi->htc->ops.log) s->wmi->htc->ops.log(s->wmi->htc->ops.context,
+-        "RSN expected group/pair security generations", r->expected_security[0], r->expected_security[1]);
++        "RSN expected WMI group/pair key generations", r->expected_keys[0], r->expected_keys[1]);
+     if (pair) RTRY(r, peach_wmi_install_ccmp(s->wmi, s->htt, 0, 0, r->ptk + 32, 0));
+     RTRY(r, peach_wmi_install_ccmp(s->wmi, s->htt, 1, r->group_index, r->gtk, r->group_rsc));
+     erase(r->gtk, sizeof(r->gtk));
+@@ -341,13 +342,19 @@
+     if (r->phase == PeachRsnKeys) {
+         const PeachHttPeer *p = peach_htt_peer(s->htt, 0, s->bssid);
+         if (!p || p->generation != s->peer_generation) return fail(r, PeachMhiDeviceError);
+-        if (p->security_valid[0] && p->security_valid[1] && p->security[0] == 6 && p->security[1] == 6 &&
+-            p->security_generation[0] >= r->expected_security[0] &&
+-            p->security_generation[1] >= r->expected_security[1]) {
+-            RTRY(r, peach_wmi_authorize(s->wmi, s->htt));
+-            RTRY(r, peach_tx_authorize(s->tx, 1)); r->phase = PeachRsnConnected;
+-        } else if (now(r) >= r->deadline) return fail(r, PeachMhiTimeout);
+-        else return 0;
++        const PeachWmiKey *t = &s->wmi->keys[0], *g = &s->wmi->keys[r->group_index + 1];
++        /* Native ath12k/mac and dp_set_key_sec_type use the matching WMI
++         * install completion, then commit host key state. HTT SEC_IND is
++         * an independent indication; this STA firmware need not send it.
++         * install_ccmp advances each epoch only after its validated ACK. */
++        if (s->wmi->key_pending || !t->installed || !g->installed ||
++            t->generation != r->expected_keys[1] || g->generation != r->expected_keys[0] ||
++            !equal(t->bytes, r->ptk + 32, 16)) return fail(r, PeachCeProtocol);
++        if (s->wmi->htc->ops.log) s->wmi->htc->ops.log(s->wmi->htc->ops.context,
++            "RSN WMI group/pair confirmations validated", g->generation, t->generation);
++        RTRY(r, peach_wmi_authorize(s->wmi, s->htt));
++        if (s->error) return fail(r, s->error);
++        RTRY(r, peach_tx_authorize(s->tx, 1)); r->phase = PeachRsnConnected;
+     }
+     if (r->phase != PeachRsnConnected && now(r) >= r->deadline) return fail(r, PeachMhiTimeout);
+     if (r->count) {
+diff --git a/bsd/dev/qcom/PeachRsn.h b/bsd/dev/qcom/PeachRsn.h
+--- a/bsd/dev/qcom/PeachRsn.h
++++ b/bsd/dev/qcom/PeachRsn.h
+@@ -13,7 +13,7 @@
+     unsigned phase, head, count, tx_action, tx_sent, tx_tries;
+     unsigned group_index, pair_changed, have_replay, have_response, response_group;
+     uint64_t deadline, tx_deadline, replay, m1_replay, response_replay, group_rsc;
+-    uint32_t expected_security[2], pn_generation[5];
++    uint32_t expected_keys[2], pn_generation[5]; /* confirmed WMI GTK/PTK epochs */
+     uint64_t pn[5][17]; /* separate key generations and QoS/non-QoS replay spaces */
+     unsigned char pmk[32], ptk[48], snonce[32], anonce[32], gtk[16];
+     unsigned char ap_bssid[6], ap_rsn[257], response_digest[20];
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -1231,9 +1231,11 @@
+     PeachWmiPeer *s = peer_find(w, w->vdev_bssid);
+     const PeachHttPeer *p = peach_htt_peer(h, 0, w->vdev_bssid);
+     if (!s || !p || !s->assoc_sent || s->delete_sent) return PeachMhiInvalid;
+-    if (s->protected_network && (!w->keys[0].installed ||
+-        !p->security_valid[0] || !p->security_valid[1] ||
+-        p->security[0] != 6 || p->security[1] != 6)) return PeachMhiInvalid;
++    unsigned group_installed = 0;
++    for (unsigned i = 1; i < 5; i++)
++        group_installed |= w->keys[i].installed && w->keys[i].generation;
++    if (s->protected_network && (!w->keys[0].installed || !w->keys[0].generation ||
++        !group_installed)) return PeachMhiInvalid;
+     /* wmi_peer_set_param_cmd_fixed_param: vdev, MAC, param, value. There is
+      * no completion for this command; success means queued, not data proof. */
+     memset(w->command, 0, 28); tlv(w->command + 4, 100, 20);
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1440,6 +1440,7 @@
+             }
+         } else if (!err) {
+             err = peach_wmi_authorize(&wifi_wmi, &wifi_htt);
++            if (!err) err = wifi_station.error;
+             if (!err) err = peach_tx_authorize(&wifi_tx, 1);
+         }
+     }

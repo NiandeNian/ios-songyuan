@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -99,7 +99,8 @@
+     uint32_t metadata = 1u | t->vdev << 2 | t->pdev << 10;
+     uint32_t entry[8] = {
+         (uint32_t)(t->memory.iova + i * PEACH_TX_BUFFER_BYTES), TX_RBM << 8 | cookie << 12,
+-        0, metadata << 16, (uint32_t)length,
++        /* Native dp_tx sends classified EAPOL through FW before keys exist. */
++        0, metadata << 16, (uint32_t)length | (control ? 1u << 21 : 0),
+         1u | tid << 4 | t->lmac << 9 | t->vdev << 24,
+         t->ast | (t->hash & 15) << 20, 0};
+     t->owned[i] = 1; t->in_flight++; t->submitted_at[i] = now(t);
+@@ -139,18 +140,27 @@
+         if (err) return t->error = err;
+         memcpy(t->last_descriptor, d, sizeof(d));
+         t->last_status = d[2];
+-        /* No virtual-address conversion. TQM and FW completions have
+-         * different formats: do not reinterpret FW exception metadata. */
+-        if ((d[2] & 7) != 0 || ((d[2] >> 6) & 7) != 0 ||
++        /* FW overlays HTT v3 transmit status on DWORDs 2..6. WBM still
++         * owns the cookie fields; the peer moves from DWORD7 to DWORD5. */
++        unsigned source = d[2] & 7, status = (d[2] >> 13) & 15;
++        if ((source != 0 && source != 3) || ((d[2] >> 6) & 7) != 0 ||
+             ((d[2] >> 9) & 15) != TX_RBM || (d[2] & 0xc0000000u)) return invalid(t);
+         unsigned cookie = (d[2] >> 18) & 4095 | ((d[7] >> 20) & 255) << 12;
++        unsigned peer = (source == 3 ? d[5] : d[7]) & 65535;
++        if (t->acked + t->dropped < 3 && t->htt->htc->ops.log) {
++            t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion source/status", source, status);
++            t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion cookie/peer", cookie, peer);
++        }
++        /* Only FW OK/DROP/TTL release a packet here. Reinjection, inspect
++         * and MEC notifications are not transmission acknowledgements. */
++        if (source == 3 && (status > 2 || (!status && !(d[5] & (1u << 21))))) return invalid(t);
+         unsigned i = cookie & (PEACH_TX_BUFFERS - 1);
+         if (!t->bound || !t->owned[i] || cookie != t->cookies[i] ||
+-            (d[7] & 65535) != t->peer) return invalid(t);
++            ((source == 0 || (d[5] & (1u << 21))) && peer != t->peer)) return invalid(t);
+         /* A source TP advance did not release this buffer. Only this
+-         * validated TQM completion permits reuse, including failed TX. */
++         * validated completion permits reuse, including failed TX. */
+         t->owned[i] = 0; t->in_flight--;
+-        unsigned acked = ((d[2] >> 13) & 15) == 0;
++        unsigned acked = status == 0;
+         if (t->control_pending && cookie == t->control_cookie) {
+             t->control_pending = 0; t->control_done = 1; t->control_acked = acked;
+         }
+diff --git a/bsd/dev/qcom/PeachTx.h b/bsd/dev/qcom/PeachTx.h
+--- a/bsd/dev/qcom/PeachTx.h
++++ b/bsd/dev/qcom/PeachTx.h
+@@ -33,7 +33,7 @@
+ int peach_tx_send(PeachTx *, const void *, size_t, unsigned tid);
+ /* One retained EAPOL packet, also allowed before ordinary data authorization.
+  * Destination/source must match the selected BSS and local station. Completion
+- * is a real TQM result; a successful enqueue is not a transmitted handshake. */
++ * is a real TQM/FW result; a successful enqueue is not a transmitted handshake. */
+ int peach_tx_eapol(PeachTx *, const unsigned char local[6], const void *, size_t);
+ int peach_tx_poll(PeachTx *);
+ #endif

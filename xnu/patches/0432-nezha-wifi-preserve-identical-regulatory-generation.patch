@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -222,13 +222,18 @@
+     unsigned phy = u32(p + 8);
+     if (phy >= 3) { report(w, "WMI regulatory untracked PHY", phy, u32(p + 4)); return 0; }
+     PeachWmiRegDomain *r = &w->regulatory[phy];
+-    /* Revoke previous scan eligibility before accepting an updated domain. */
+-    r->valid = 0; r->status = u32(p + 4); r->generation++;
+-    if (r->status) return 0;
++    PeachWmiRegDomain next = {0};
++    next.status = u32(p + 4);
++    if (next.status) {
++        r->valid = 0; r->status = next.status;
++        if (r->generation == UINT32_MAX) return bad(w);
++        r->generation++;
++        return 0;
++    }
+     unsigned n2 = u32(p + 52), n5 = u32(p + 56);
+     if (n2 > PEACH_WMI_REG_RULES || n5 > PEACH_WMI_REG_RULES - n2) return bad(w);
+-    r->alpha2 = u32(p + 12); r->country = u32(p + 20);
+-    r->domain = u32(p + 24); r->dfs = u32(p + 28);
++    next.alpha2 = u32(p + 12); next.country = u32(p + 20);
++    next.domain = u32(p + 24); next.dfs = u32(p + 28);
+     size_t off = len + 4;
+     if (n - off < 4 || u32(p + off) >> 16 != TAG_ARRAY) return bad(w);
+     unsigned array_bytes = u32(p + off) & 0xffff;
+@@ -240,7 +245,7 @@
+         if (u32(v) >> 16 != (extended ? TAG_RULE_EXT : TAG_RULE) ||
+             bytes < (extended ? 16u : 12u)) return bad(w);
+         if (count < n2 + n5) {
+-            PeachWmiRegRule *rule = &r->rules[count];
++            PeachWmiRegRule *rule = &next.rules[count];
+             rule->frequencies = u32(v + 4); rule->bandwidth_power = u32(v + 8);
+             rule->flags = u32(v + 12);
+             unsigned low = rule->frequencies & 0xffff, high = rule->frequencies >> 16;
+@@ -249,7 +254,15 @@
+         count++; v += bytes + 4; left -= bytes + 4;
+     }
+     if (count < n2 + n5 || (!extended && count != n2 + n5)) return bad(w);
+-    r->count_2g = n2; r->count_5g = n5; r->valid = 1;
++    /* Repeated identical domain notifications do not revoke an active
++     * scan/association. Only a real rule change advances its generation. */
++    if (r->valid && r->alpha2 == next.alpha2 && r->country == next.country &&
++        r->domain == next.domain && r->dfs == next.dfs &&
++        r->count_2g == n2 && r->count_5g == n5 &&
++        !memcmp(r->rules, next.rules, (n2 + n5) * sizeof(next.rules[0]))) return 0;
++    if (r->generation == UINT32_MAX) return bad(w);
++    next.count_2g = n2; next.count_5g = n5; next.valid = 1;
++    next.generation = r->generation + 1; *r = next;
+     report(w, "WMI real regulatory PHY/country", phy, r->alpha2 & 0xffff);
+     return 0;
+ }

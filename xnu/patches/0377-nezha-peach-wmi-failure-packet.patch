@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -821,6 +821,20 @@
+     (void)c;
+     if (service == 0x100) {
+         peach_wmi_receive(&wifi_wmi, p, n);
++        int capture = 0;
++        (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
++        if (wifi_wmi.error && capture == 1) {
++            uint32_t capacity = 0, bytes = (uint32_t)n;
++            uint8_t *saved = pandora_fbdump_begin(&capacity);
++            if (saved && capacity >= 16 && n <= capacity - 16) {
++                memcpy(saved, "NEZWMI01", 8);
++                memcpy(saved + 8, &bytes, 4);
++                memcpy(saved + 12, &wifi_wmi.last_event, 4);
++                memcpy(saved + 16, p, n);
++                pandora_fbdump_commit(bytes + 16);
++                printf("NEZHA WIFI: failed WMI packet queued, %#x bytes\n", bytes);
++            }
++        }
+         return wifi_wmi.error;
+     }
+     if (service == 0x300) {

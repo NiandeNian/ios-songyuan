@@ -1,0 +1,774 @@
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+-/* Real BSD Ethernet data interface over the Peach worker. Native Apple80211
+- * UI integration is separate; no IO80211 service/capabilities are fabricated. */
++/* BSD Ethernet and control snapshots over the single Peach protocol worker. */
+ #include "PeachNet.h"
++#include "PeachApple80211.h"
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+@@ -26,6 +26,10 @@
+ static kern_ctl_ref net_control;
+ static ifnet_t net_interface;
+ static PeachControlStatusData net_snapshot;
++static PeachNetInfo net_info_data;
++static PeachWmiBss net_bss[PEACH_WMI_BSS_ENTRIES];
++static PeachWmiScanChannel net_channels[PEACH_WMI_SCAN_CHANNELS];
++static unsigned net_channel_count, net_join_pending;
+ static PeachNetRequest net_request;
+ static mbuf_t net_queue[TX_QUEUE], net_pending;
+ static unsigned net_head, net_count, net_online;
+@@ -34,27 +38,44 @@
+ { (void)c; (void)s; *p = NULL; return 0; }
+ static errno_t control_disconnect(kern_ctl_ref c, u_int32_t u, void *p)
+ { (void)c; (void)u; (void)p; return 0; }
+-static errno_t control_set(kern_ctl_ref c, u_int32_t u, void *p, int opt, void *data, size_t len)
+-{
+-    (void)c; (void)u; (void)p;
++int peach_net_request(const PeachNetRequest *request)
++{
++    if (!request) return EINVAL;
++    unsigned opt = request->action;
+     if (opt != PeachControlJoin && opt != PeachControlScan) return ENOPROTOOPT;
+-    if (opt == PeachControlScan && len) return EINVAL;
+     if (opt == PeachControlJoin) {
+-        if (!data || len != sizeof(PeachControlJoinData)) return EINVAL;
+-        const PeachControlJoinData *j = data;
++        const PeachControlJoinData *j = &request->join;
+         if (j->version != PEACH_CONTROL_VERSION || j->security > PeachStationWpa2Psk ||
+             !j->ssid_bytes || j->ssid_bytes > 32 || j->bssid_valid > 1 ||
+-            j->reserved[0] || j->reserved[1] || (j->bssid_valid && (j->bssid[0] & 1))) return EINVAL;
++            j->reserved[0] || j->reserved[1] || (j->bssid_valid && ((j->bssid[0] & 1) ||
++            !memcmp(j->bssid, "\0\0\0\0\0\0", 6))) ||
++            (request->passphrase_bytes && (j->security != PeachStationWpa2Psk ||
++             request->passphrase_bytes < 8 || request->passphrase_bytes > 63))) return EINVAL;
++        for (unsigned i = 0; i < request->passphrase_bytes; i++)
++            if (request->passphrase[i] < 32 || request->passphrase[i] > 126) return EINVAL;
+     }
+     lck_mtx_lock(&net_lock);
+     int err = net_snapshot.state == PeachNetFailed ? ENXIO :
+         net_snapshot.state != PeachNetReady || net_request.action ? EBUSY : 0;
+     if (!err) {
+-        net_request.action = opt;
+-        if (opt == PeachControlJoin) memcpy(&net_request.join, data, len);
++        net_request = *request;
++        if (opt == PeachControlJoin) { net_join_pending = 1; net_info_data.result = 0; }
+         net_snapshot.state = opt == PeachControlJoin ? PeachNetAssociating : PeachNetScanning;
+-    }
+-    lck_mtx_unlock(&net_lock);
++        net_snapshot.error = 0;
++    }
++    lck_mtx_unlock(&net_lock);
++    return err;
++}
++static errno_t control_set(kern_ctl_ref c, u_int32_t u, void *p, int opt, void *data, size_t len)
++{
++    (void)c; (void)u; (void)p;
++    if ((opt == PeachControlScan && len) ||
++        (opt == PeachControlJoin && (!data || len != sizeof(PeachControlJoinData)))) return EINVAL;
++    PeachNetRequest request = {0}; request.action = opt;
++    if (opt == PeachControlJoin) memcpy(&request.join, data, len);
++    int err = peach_net_request(&request);
++    volatile unsigned char *secret = (void *)&request;
++    for (size_t i = 0; i < sizeof(request); i++) secret[i] = 0;
+     return err;
+ }
+ static errno_t control_get(kern_ctl_ref c, u_int32_t u, void *p, int opt, void *data, size_t *len)
+@@ -91,17 +112,62 @@
+ void peach_net_status(const PeachWmi *w, unsigned state, int error)
+ {
+     lck_mtx_lock(&net_lock);
++    unsigned scan_done = net_snapshot.state == PeachNetScanning &&
++        (state == PeachNetReady || state == PeachNetFailed);
++    unsigned join_done = net_join_pending &&
++        (state == PeachNetOnline || state == PeachNetReady || state == PeachNetFailed);
+     net_snapshot.state = state; net_snapshot.error = error;
++    if (join_done) {
++        net_info_data.result = state == PeachNetOnline ? 1 : error == PeachMhiTimeout ? 9 : 2;
++        net_join_pending = 0;
++    }
++    if (w) {
++        net_info_data.powered = w->ready != 0;
++        net_channel_count = w->channel_count;
++        memcpy(net_channels, w->channels, net_channel_count * sizeof(net_channels[0]));
++        net_info_data.country = w->regulatory[w->radio.phy].alpha2;
++    }
+     if (w && w->scan_finished && !w->scan_active) {
+         net_snapshot.count = w->scan_done ? w->bss_count : 0;
+         for (unsigned i = 0; i < net_snapshot.count; i++) {
+             PeachControlBss *d = &net_snapshot.bss[i]; const PeachWmiBss *b = &w->bss[i];
++            net_bss[i] = *b;
+             memset(d, 0, sizeof(*d)); d->frequency = b->frequency; d->rssi = b->rssi;
+             d->privacy = !!(b->capability & 16); d->ssid_bytes = b->ssid_bytes;
+             memcpy(d->bssid, b->bssid, 6); memcpy(d->ssid, b->ssid, b->ssid_bytes);
+         }
+     }
+     lck_mtx_unlock(&net_lock);
++    if (state == PeachNetOnline) peach_net_link(1);
++    else if (state == PeachNetHandshake || state == PeachNetFailed) peach_net_link(0);
++    if (scan_done) peach_apple80211_event(PeachAppleScanDone);
++    if (join_done) peach_apple80211_event(PeachAppleJoinDone);
++}
++void peach_net_selection(const PeachWmiBss *b, unsigned security)
++{
++    lck_mtx_lock(&net_lock); net_info_data.current = *b; net_info_data.security = security;
++    lck_mtx_unlock(&net_lock);
++}
++void peach_net_info(PeachNetInfo *out)
++{
++    lck_mtx_lock(&net_lock); *out = net_info_data;
++    out->state = net_snapshot.state; out->error = net_snapshot.error;
++    lck_mtx_unlock(&net_lock);
++}
++int peach_net_bss(unsigned index, PeachWmiBss *out)
++{
++    lck_mtx_lock(&net_lock);
++    int err = net_snapshot.state == PeachNetScanning ? EBUSY :
++        index >= net_snapshot.count ? EIO : 0;
++    if (!err) *out = net_bss[index];
++    lck_mtx_unlock(&net_lock); return err;
++}
++unsigned peach_net_channels(PeachWmiScanChannel *out, unsigned capacity)
++{
++    lck_mtx_lock(&net_lock);
++    unsigned count = net_channel_count < capacity ? net_channel_count : capacity;
++    memcpy(out, net_channels, count * sizeof(*out));
++    lck_mtx_unlock(&net_lock); return count;
+ }
+ static errno_t output(ifnet_t interface, mbuf_t m)
+ {
+@@ -118,6 +184,7 @@
+ }
+ static errno_t interface_ioctl(ifnet_t p, u_long cmd, void *data)
+ {
++    if (cmd == 0x802869c8u || cmd == 0xc02869c9u) return peach_apple80211_ioctl(cmd, data);
+     struct ifreq *r = data;
+     switch (cmd) {
+     case SIOCSIFADDR: return ifnet_set_flags(p, IFF_UP, IFF_UP);
+@@ -185,11 +252,22 @@
+      * register an Ethernet BPF endpoint or tap its received packets.
+      * See HackiOS redwood_net.c's BSD interface integration. */
+     bpfattach(p, DLT_EN10MB, 14);
+-    ifnet_set_flags(p, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-    lck_mtx_lock(&net_lock); net_online = 1;
++    ifnet_set_flags(p, IFF_UP, IFF_UP | IFF_RUNNING);
++    lck_mtx_lock(&net_lock);
+     snprintf(net_snapshot.interface_name, sizeof(net_snapshot.interface_name), "%s%u", ifnet_name(p), ifnet_unit(p));
+     lck_mtx_unlock(&net_lock);
+-    link_event(1); return 0;
++    extern int peach_wlan_publish(const char *, const unsigned char *);
++    return peach_wlan_publish(net_snapshot.interface_name, mac);
++}
++void peach_net_link(unsigned up)
++{
++    lck_mtx_lock(&net_lock);
++    unsigned changed = net_online != !!up; net_online = !!up;
++    int rssi = net_info_data.current.rssi;
++    lck_mtx_unlock(&net_lock);
++    if (!net_interface || !changed) return;
++    ifnet_set_flags(net_interface, up ? IFF_RUNNING : 0, IFF_RUNNING);
++    link_event(up); peach_apple80211_link(up, rssi);
+ }
+ int peach_net_transmit(PeachTx *tx)
+ {
+@@ -230,11 +308,11 @@
+ }
+ void peach_net_stop(int error)
+ {
+-    lck_mtx_lock(&net_lock); net_online = 0;
++    peach_net_status(NULL, PeachNetFailed, error);
++    lck_mtx_lock(&net_lock);
+     volatile unsigned char *secret = (void *)&net_request;
+     for (size_t i = 0; i < sizeof(net_request); i++) secret[i] = 0;
+     lck_mtx_unlock(&net_lock);
+-    if (net_interface) { ifnet_set_flags(net_interface, 0, IFF_RUNNING); link_event(0); }
+     if (net_pending) { mbuf_freem(net_pending); net_pending = NULL; }
+     for (;;) {
+         mbuf_t m = NULL;
+@@ -247,5 +325,4 @@
+         if (!m) break;
+         mbuf_freem(m);
+     }
+-    peach_net_status(NULL, PeachNetFailed, error);
+-}
++}
+--- a/bsd/dev/qcom/PeachNet.h
++++ b/bsd/dev/qcom/PeachNet.h
+@@ -3,11 +3,28 @@
+ #define PEACH_NET_H
+ #include "PeachControl.h"
+ #include "PeachStation.h"
+-typedef struct { unsigned action; PeachControlJoinData join; } PeachNetRequest;
++typedef struct {
++    unsigned action;
++    PeachControlJoinData join;
++    unsigned passphrase_bytes;
++    unsigned char passphrase[63];
++} PeachNetRequest;
++typedef struct {
++    unsigned state, result, security, powered;
++    int error;
++    uint32_t country;
++    PeachWmiBss current;
++} PeachNetInfo;
+ int peach_net_init(void);
++int peach_net_request(const PeachNetRequest *);
+ int peach_net_take_request(PeachNetRequest *);
+ void peach_net_status(const PeachWmi *, unsigned state, int error);
++void peach_net_selection(const PeachWmiBss *, unsigned security);
++void peach_net_info(PeachNetInfo *);
++int peach_net_bss(unsigned index, PeachWmiBss *);
++unsigned peach_net_channels(PeachWmiScanChannel *, unsigned capacity);
+ int peach_net_attach(const unsigned char mac[6]);
++void peach_net_link(unsigned up);
+ int peach_net_transmit(PeachTx *);
+ void peach_net_receive(const void *, size_t);
+ void peach_net_stop(int error);
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -45,6 +45,27 @@
+     SHA1Init(&c); SHA1Update(&c, pad, sizeof(pad)); SHA1Update(&c, inner, sizeof(inner)); SHA1Final(out, &c);
+     erase(&c, sizeof(c)); erase(pad, sizeof(pad)); erase(inner, sizeof(inner));
+ }
++int peach_rsn_pmk(const void *passphrase, size_t bytes, const void *ssid,
++                  size_t ssid_bytes, unsigned char pmk[32])
++{
++    if (!passphrase || bytes < 8 || bytes > 63 || !ssid || !ssid_bytes || ssid_bytes > 32 || !pmk)
++        return PeachMhiInvalid;
++    const unsigned char *p = passphrase;
++    for (size_t i = 0; i < bytes; i++) if (p[i] < 32 || p[i] > 126) return PeachMhiInvalid;
++    unsigned char salt[36], u[20], block[20];
++    memcpy(salt, ssid, ssid_bytes); memset(salt + ssid_bytes, 0, 4);
++    for (unsigned n = 1; n <= 2; n++) {
++        salt[ssid_bytes + 3] = n;
++        hmac(p, bytes, salt, ssid_bytes + 4, u); memcpy(block, u, sizeof(block));
++        for (unsigned round = 1; round < 4096; round++) {
++            hmac(p, bytes, u, sizeof(u), u);
++            for (unsigned j = 0; j < sizeof(block); j++) block[j] ^= u[j];
++        }
++        memcpy(pmk + (n - 1) * 20, block, n == 1 ? 20 : 12);
++    }
++    erase(salt, sizeof(salt)); erase(u, sizeof(u)); erase(block, sizeof(block));
++    return 0;
++}
+ static void derive_ptk(PeachRsn *r)
+ {
+     static const unsigned char label[] = "Pairwise key expansion";
+--- a/bsd/dev/qcom/PeachRsn.h
++++ b/bsd/dev/qcom/PeachRsn.h
+@@ -37,4 +37,7 @@
+ int peach_rsn_receive(PeachRsn *, const void *, size_t, const PeachRxInfo *);
+ int peach_rsn_poll(PeachRsn *);
+ void peach_rsn_clear(PeachRsn *);
++/* IEEE 802.11 PSK derivation on the connection worker, outside ioctl/locks. */
++int peach_rsn_pmk(const void *passphrase, size_t bytes, const void *ssid,
++                  size_t ssid_bytes, unsigned char pmk[32]);
+ #endif
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -308,6 +308,7 @@
+         w->bss_count++;
+     }
+     PeachWmiBss *b = &w->bss[i];
++    b->seen_us = w->htc->ops.now_us(w->htc->ops.context);
+     b->frequency = frequency; b->rssi = (int32_t)u32(p + 48);
+     if (b->rssi < -127 || b->rssi > 0) b->rssi = -128; /* unknown, never estimate */
+     memcpy(b->bssid, frame + 16, 6);
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -35,6 +35,7 @@
+ typedef struct { unsigned frequency, flags, power, antenna; } PeachWmiScanChannel;
+ typedef struct {
+     unsigned frequency, ssid_bytes, ie_bytes, ies_truncated, dtim_period;
++    uint64_t seen_us;
+     int rssi;
+     unsigned char bssid[6], ssid[32], ies[512];
+     uint16_t capability, beacon_interval;
+--- /dev/null
++++ b/bsd/dev/qcom/PeachApple80211.c
+@@ -0,0 +1,322 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* iOS 16 Apple80211 ioctl/event ABI, as recorded in HackiOS redwood's
++ * redwood_apple80211.c. Only implemented Peach operations/capabilities are
++ * exposed. All mutable protocol state stays on pandora_wifi's worker. */
++#include "PeachApple80211.h"
++#include "PeachNet.h"
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <sys/errno.h>
++#include <sys/kern_event.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
++
++#define APPLE_SET 0x802869c8u
++#define APPLE_GET 0xc02869c9u
++typedef struct {
++    char interface[16];
++    int32_t type, value;
++    uint32_t length;
++    user_addr_t data __attribute__((aligned(8)));
++} AppleRequest;
++typedef struct { uint32_t version, channel, flags; } AppleChannel;
++typedef struct {
++    uint32_t version, count;
++    AppleChannel channels[401];
++    uint32_t unused;
++} AppleChannels;
++typedef struct {
++    uint8_t unknown0[12];
++    uint16_t count;
++    uint8_t unknown1[800];
++    uint8_t number[400], indoor[400], dfs[400], passive[400], wide40[400], wide80[400];
++    uint8_t unknown2[1602];
++    uint32_t flags[400];
++    uint8_t unknown3[3600];
++} __attribute__((packed)) AppleChannelsInfo;
++typedef struct {
++    uint32_t version;
++    AppleChannel channel;
++    uint16_t noise_known;
++    int16_t noise, snr, rssi;
++    uint16_t beacon_interval, capability;
++    uint8_t bssid[6], rate_count, unused0;
++    uint32_t rates[15];
++    uint8_t ssid_bytes, ssid[32], unused1[3];
++    uint32_t age_ms;
++    uint8_t flags, unused2;
++    uint16_t ie_bytes;
++    uint8_t ies[1024];
++} AppleScanResult;
++typedef struct {
++    uint32_t version, bss_type;
++    uint8_t bssid[6], unused0[2];
++    uint32_t ssid_bytes;
++    uint8_t ssid[32];
++    uint32_t scan_type, phy_mode;
++    uint16_t dwell_ms, unused1;
++    uint32_t rest_ms, channel_count;
++    AppleChannel channels[400];
++    uint64_t flags;
++    uint32_t unused2, name_count;
++    uint8_t names[10][56];
++    uint32_t short_ssid, unused3;
++} AppleScanRequest;
++typedef struct {
++    uint32_t version;
++    uint16_t mode, auth_lower, auth_upper, unused0;
++    uint32_t ssid_bytes;
++    uint8_t ssid[32], bssid[6], unused1[2];
++    uint32_t key_version, key_bytes, key_cipher;
++    uint16_t key_flags, key_index;
++    uint8_t key[64];
++} AppleJoin;
++typedef struct {
++    uint8_t down, unused0[3];
++    int32_t rssi;
++    uint16_t snr, noise;
++    uint8_t unused1[4], involuntary, unused2[3];
++    uint32_t reason, subreason;
++    uint8_t unused3[4];
++} AppleLink;
++_Static_assert(sizeof(AppleRequest) == 40 && offsetof(AppleRequest, data) == 32,
++               "Apple80211 ioctl envelope");
++_Static_assert(sizeof(AppleChannels) == 4824 && sizeof(AppleChannelsInfo) == 10016 &&
++               offsetof(AppleChannelsInfo, flags) == 0x12d0, "Apple80211 channels");
++_Static_assert(sizeof(AppleScanRequest) == 5456 && sizeof(AppleScanResult) == 1164 &&
++               offsetof(AppleScanResult, ies) == 0x8c, "Apple80211 scan ABI");
++_Static_assert(sizeof(AppleJoin) == 0x88 && offsetof(AppleJoin, key) == 0x48 &&
++               sizeof(AppleLink) == 32, "Apple80211 join/link ABI");
++static LCK_GRP_DECLARE(apple_group, "nezha-apple80211");
++static LCK_MTX_DECLARE(apple_lock, &apple_group);
++static unsigned result_next;
++static void erase(void *p, size_t n)
++{ volatile unsigned char *v = p; while (n--) *v++ = 0; }
++static int give(AppleRequest *r, const void *data, size_t bytes)
++{
++    if (r->length < bytes) { r->length = (uint32_t)bytes; return EMSGSIZE; }
++    if (!r->data && bytes) return EFAULT;
++    return copyout(data, r->data, bytes);
++}
++static AppleChannel channel(unsigned frequency, unsigned flags)
++{
++    AppleChannel c = {1, frequency == 2484 ? 14 : frequency < 2500 ?
++        (frequency - 2407) / 5 : (frequency - 5000) / 5,
++        2u | (frequency < 2500 ? 8u : 16u) | (!(flags & 1) ? 0x80u : 0) |
++        ((flags & 2) ? 0x100u : 0)};
++    return c;
++}
++static AppleChannel bss_channel(unsigned frequency)
++{
++    PeachWmiScanChannel channels[PEACH_WMI_SCAN_CHANNELS];
++    unsigned n = peach_net_channels(channels, PEACH_WMI_SCAN_CHANNELS);
++    for (unsigned i = 0; i < n; i++)
++        if (channels[i].frequency == frequency) return channel(frequency, channels[i].flags);
++    return channel(frequency, 1); /* no active-channel claim without a rule */
++}
++static int network(AppleRequest *r, const PeachWmiBss *b)
++{
++    AppleScanResult *out = kalloc_data(sizeof(*out), Z_WAITOK | Z_ZERO);
++    if (!out) return ENOMEM;
++    unsigned room = sizeof(out->ies);
++    int err = r->length < offsetof(AppleScanResult, ies) ? EINVAL :
++        copyin(r->data, out, offsetof(AppleScanResult, ies));
++    if (err) { kfree_data(out, sizeof(*out)); return err; }
++    if (out->ie_bytes < room) room = out->ie_bytes;
++    memset(out, 0, sizeof(*out));
++    out->version = 1; out->channel = bss_channel(b->frequency);
++    out->rssi = b->rssi; out->beacon_interval = b->beacon_interval; out->capability = b->capability;
++    memcpy(out->bssid, b->bssid, 6); out->ssid_bytes = b->ssid_bytes;
++    memcpy(out->ssid, b->ssid, b->ssid_bytes);
++    out->ie_bytes = b->ie_bytes <= room ? b->ie_bytes : 0;
++    memcpy(out->ies, b->ies, out->ie_bytes);
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++    uint64_t age = ns / 1000 > b->seen_us ? (ns / 1000 - b->seen_us) / 1000 : 0;
++    out->age_ms = age > UINT32_MAX ? UINT32_MAX : (uint32_t)age;
++    for (unsigned off = 0; off + 2 <= b->ie_bytes && b->ies[off + 1] <= b->ie_bytes - off - 2;) {
++        unsigned n = b->ies[off + 1];
++        if (b->ies[off] == 1 || b->ies[off] == 50)
++            for (unsigned i = 0; i < n && out->rate_count < 15; i++) {
++                unsigned rate = (b->ies[off + 2 + i] & 127) / 2;
++                if (rate && rate <= 54) out->rates[out->rate_count++] = rate;
++            }
++        off += n + 2;
++    }
++    err = give(r, out, sizeof(*out)); kfree_data(out, sizeof(*out)); return err;
++}
++static int get(AppleRequest *r)
++{
++    PeachNetInfo info; peach_net_info(&info);
++    switch (r->type) {
++    case 43: case 44: {
++        static const char name[256] = "UniXNU Nezha WCN7860 Peach v2";
++        return give(r, name, sizeof(name));
++    }
++    case 12: {
++        /* AES, AES-CCM, short preamble/slot, WPA2. No WME, HT, power-save
++         * or PMF capability until their actual protocol paths exist. */
++        const uint8_t capabilities[13] = {0x0c, 0x46};
++        return give(r, capabilities, sizeof(capabilities));
++    }
++    case 15: r->value = 1; return 0; /* station */
++    case 19: {
++        if (info.state == PeachNetFailed) return ENXIO;
++        uint32_t power[6] = {1, 1, info.powered, 0, 0, 0};
++        return give(r, power, sizeof(power));
++    }
++    case 13:
++        r->value = info.state == PeachNetOnline ? 4 : info.state == PeachNetAssociating ? 2 :
++            info.state == PeachNetHandshake ? 3 : info.state == PeachNetScanning ? 1 : 0;
++        return 0;
++    case 21: r->value = info.result; return 0;
++    case 27: case 254: case 207: {
++        PeachWmiScanChannel channels[PEACH_WMI_SCAN_CHANNELS];
++        unsigned count = peach_net_channels(channels, PEACH_WMI_SCAN_CHANNELS);
++        if (!count) return ENXIO;
++        size_t bytes = r->type == 207 ? sizeof(AppleChannelsInfo) : sizeof(AppleChannels);
++        void *out = kalloc_data(bytes, Z_WAITOK | Z_ZERO);
++        if (!out) return ENOMEM;
++        if (r->type == 207) {
++            AppleChannelsInfo *a = out; a->count = count;
++            for (unsigned i = 0; i < count; i++) {
++                AppleChannel c = channel(channels[i].frequency, channels[i].flags);
++                a->number[i] = c.channel; a->flags[i] = c.flags;
++                a->dfs[i] = !!(channels[i].flags & 2);
++                a->passive[i] = !!(channels[i].flags & 3);
++                a->indoor[i] = !!(channels[i].flags & 8);
++            }
++        } else {
++            AppleChannels *a = out; a->version = 1; a->count = count;
++            for (unsigned i = 0; i < count; i++) a->channels[i] = channel(channels[i].frequency, channels[i].flags);
++        }
++        int err = give(r, out, bytes); kfree_data(out, bytes); return err;
++    }
++    case 11: {
++        PeachWmiBss b;
++        lck_mtx_lock(&apple_lock);
++        int err = peach_net_bss(result_next, &b);
++        if (!err) result_next++;
++        lck_mtx_unlock(&apple_lock);
++        return err ? err : network(r, &b);
++    }
++    default: break;
++    }
++    if (info.state != PeachNetOnline) return ENXIO;
++    switch (r->type) {
++    case 1: {
++        int err = give(r, info.current.ssid, info.current.ssid_bytes);
++        if (!err) r->length = info.current.ssid_bytes;
++        return err;
++    }
++    case 9: return give(r, info.current.bssid, 6);
++    case 4: {
++        struct { uint32_t version; AppleChannel channel; } a = {1, bss_channel(info.current.frequency)};
++        return give(r, &a, sizeof(a));
++    }
++    case 16: {
++        struct { uint32_t version, radios, unit; int32_t each[4], all, each_ext[4], all_ext; }
++            a = { .version = 1, .radios = 1, .each = {info.current.rssi}, .all = info.current.rssi,
++                  .each_ext = {info.current.rssi}, .all_ext = info.current.rssi };
++        return give(r, &a, sizeof(a));
++    }
++    case 2: {
++        uint32_t auth[4] = {1, 1, info.security == PeachStationWpa2Psk ? 8u : 0, 0};
++        return give(r, auth, sizeof(auth));
++    }
++    case 103: return network(r, &info.current);
++    default: return EOPNOTSUPP;
++    }
++}
++static int join(const AppleRequest *r)
++{
++    if (r->length < sizeof(AppleJoin)) return EINVAL;
++    AppleJoin a; PeachNetRequest request = {0};
++    int err = copyin(r->data, &a, sizeof(a));
++    if (err) { erase(&a, sizeof(a)); return err; }
++    if (a.version != 1 || (a.auth_lower & ~1u) || (a.auth_upper & ~8u) ||
++        !a.ssid_bytes || a.ssid_bytes > 32) { err = EOPNOTSUPP; goto done; }
++    request.action = PeachControlJoin; request.join.version = PEACH_CONTROL_VERSION;
++    request.join.ssid_bytes = a.ssid_bytes; memcpy(request.join.ssid, a.ssid, a.ssid_bytes);
++    if (memcmp(a.bssid, "\0\0\0\0\0\0", 6)) {
++        request.join.bssid_valid = 1; memcpy(request.join.bssid, a.bssid, 6);
++    }
++    if (!a.auth_upper && !a.key_bytes) request.join.security = PeachStationOpen;
++    else if (a.auth_upper == 8 && a.key_cipher == 6 && a.key_bytes == 32) {
++        request.join.security = PeachStationWpa2Psk; memcpy(request.join.pmk, a.key, 32);
++    } else if (a.auth_upper == 8 && a.key_cipher == 10 && a.key_bytes >= 8 && a.key_bytes <= 63) {
++        request.join.security = PeachStationWpa2Psk; request.passphrase_bytes = a.key_bytes;
++        memcpy(request.passphrase, a.key, a.key_bytes);
++    } else { err = EOPNOTSUPP; goto done; }
++    err = peach_net_request(&request);
++done:
++    erase(&a, sizeof(a)); erase(&request, sizeof(request)); return err;
++}
++static int set(const AppleRequest *r)
++{
++    if (r->type == 20) return join(r);
++    if (r->type == 22) {
++        PeachNetInfo info; peach_net_info(&info);
++        /* wifid can leave an already idle station before its first join.
++         * A live association still needs the separate teardown path. */
++        return info.state == PeachNetReady || info.state == PeachNetScanning ? 0 : EOPNOTSUPP;
++    }
++    if (r->type == 10) {
++        if (r->length != sizeof(AppleScanRequest)) return EINVAL;
++        AppleScanRequest *a = kalloc_data(sizeof(*a), Z_WAITOK);
++        if (!a) return ENOMEM;
++        int err = copyin(r->data, a, sizeof(*a));
++        if (!err && (a->version != 1 || a->ssid_bytes > 32 || a->channel_count > 400 ||
++            a->name_count > 10 || (a->scan_type != 1 && a->scan_type != 2))) err = EINVAL;
++        /* Backend performs a full passive scan. It never transmits probes
++         * or overrides the firmware's board-specific regulatory rules. */
++        if (!err) { PeachNetRequest request = { .action = PeachControlScan }; err = peach_net_request(&request); }
++        kfree_data(a, sizeof(*a)); return err;
++    }
++    if (r->type == 19) {
++        uint32_t power[6];
++        if (r->length < sizeof(power)) return EINVAL;
++        int err = copyin(r->data, power, sizeof(power));
++        if (err) return err;
++        PeachNetInfo info; peach_net_info(&info);
++        /* Idempotent power-on only. Do not acknowledge power-off or
++         * restart before hardware teardown/drain has been implemented. */
++        return power[0] == 1 && power[1] == 1 && power[2] == 1 && info.powered &&
++            info.state != PeachNetFailed ? 0 : EOPNOTSUPP;
++    }
++    return EOPNOTSUPP;
++}
++int peach_apple80211_ioctl(u_long command, void *data)
++{
++    if (command != APPLE_SET && command != APPLE_GET) return EOPNOTSUPP;
++    AppleRequest *r = data;
++    if (!r || strncmp(r->interface, "en0", sizeof(r->interface))) return ENXIO;
++    if (command == APPLE_SET) {
++        int err = proc_suser(current_proc());
++        return err ? err : set(r);
++    }
++    return get(r);
++}
++static void post(unsigned code, const void *data, unsigned bytes)
++{
++    char name[16] = "en0";
++    struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS,
++        .kev_subclass = 1, .event_code = code };
++    message.dv[0].data_ptr = name; message.dv[0].data_length = sizeof(name);
++    message.dv[1].data_ptr = (void *)data; message.dv[1].data_length = bytes;
++    (void)kev_post_msg(&message);
++}
++void peach_apple80211_event(unsigned code)
++{
++    if (code == PeachAppleScanDone) {
++        lck_mtx_lock(&apple_lock); result_next = 0; lck_mtx_unlock(&apple_lock);
++    }
++    post(code, NULL, 0);
++}
++void peach_apple80211_link(unsigned up, int rssi)
++{
++    AppleLink link = { .down = !up, .rssi = up ? rssi : 0, .involuntary = !up, .reason = up ? 0 : 4 };
++    post(2, NULL, 0); post(3, NULL, 0); post(4, &link, sizeof(link));
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachApple80211.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_APPLE80211_H
++#define PEACH_APPLE80211_H
++#include <sys/types.h>
++enum { PeachAppleScanDone = 10, PeachAppleJoinDone = 9 };
++int peach_apple80211_ioctl(u_long, void *);
++void peach_apple80211_event(unsigned);
++void peach_apple80211_link(unsigned up, int rssi);
++#endif
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -2,8 +2,8 @@
+ /* Nezha/SM8850 Peach: board power, CESTA v3, PCIe0 and isolated firmware DMA.
+  * Register sequences follow Qualcomm's pci-msm.c, crm-v2.c, clk-rpmh.c and
+  * rpmh-regulator.c, plus this phone's captured DT. No Linux module ABI.
+- * Opt-in nezha_wifi=1; a BSD data interface is published only after a real
+- * AP association and the selected security exchange. No Apple80211 UI shim.
++ * Opt-in nezha_wifi=1; en0 is discovered after firmware initialization.
++ * Its data link stays down until actual association/security completion.
+  * All buffers and mappings live until reboot, including on failure. */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -997,8 +997,15 @@
+     int err = 0;
+     if (selected == PEACH_WMI_BSS_ENTRIES) peach_net_status(&wifi_wmi, PeachNetReady, ENOENT);
+     else {
++        peach_net_selection(&wifi_wmi.bss[selected], j->security);
++        if (wifi_request.passphrase_bytes)
++            err = peach_rsn_pmk(wifi_request.passphrase, wifi_request.passphrase_bytes,
++                j->ssid, j->ssid_bytes, j->pmk);
++        volatile unsigned char *passphrase = wifi_request.passphrase;
++        for (size_t i = 0; i < sizeof(wifi_request.passphrase); i++) passphrase[i] = 0;
++        wifi_request.passphrase_bytes = 0;
+         if (j->security == PeachStationWpa2Psk)
+-            err = peach_rsn_prepare(&wifi_rsn, &wifi_station, selected, j->pmk);
++            if (!err) err = peach_rsn_prepare(&wifi_rsn, &wifi_station, selected, j->pmk);
+         wifi_step = "802.11 authentication/association";
+         if (!err) err = peach_station_associate(&wifi_station, selected, j->security);
+         if (!err && j->security == PeachStationWpa2Psk) {
+@@ -1049,21 +1056,19 @@
+     if (!err) {
+         wifi_net_state = PeachNetReady;
+         peach_net_status(&wifi_wmi, wifi_net_state, wifi_wmi.scan_done ? 0 : EAGAIN);
++        wifi_step = "BSD/Apple80211 interface discovery";
++        err = peach_net_attach(wifi_wmi.mac);
++        if (!err) wifi_net_attached = 1;
+     }
+     while (!err) {
+         err = peach_htc_poll(&wifi_htc);
+         if (!err) err = peach_rsn_poll(&wifi_rsn);
+         if (!err) err = wifi_connection_request();
+         if (!err && wifi_tx.authorized) {
+-            if (!wifi_net_attached) {
+-                wifi_step = "BSD interface attach";
+-                err = peach_net_attach(wifi_wmi.mac);
+-                if (!err) wifi_net_attached = 1;
+-            }
+             if (!err && wifi_net_state != PeachNetOnline) {
+                 wifi_net_state = PeachNetOnline;
+                 peach_net_status(&wifi_wmi, wifi_net_state, 0);
+-                printf("NEZHA WIFI: association/security complete; BSD data interface attached, IP configuration pending\n");
++                printf("NEZHA WIFI: association/security complete; en0 link up, IP configuration pending\n");
+             }
+             if (!err) err = peach_net_transmit(&wifi_tx);
+         } else if (!err && wifi_net_attached && wifi_net_state == PeachNetOnline) {
+--- /dev/null
++++ b/iokit/Kernel/arm/PeachWLAN.cpp
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* IO80211.framework's ioctl fallback and SystemConfiguration discovery,
++ * following HackiOS RedwoodWLAN's registry contract. The data interface
++ * and Apple80211 operations are owned by PeachNet, not this registry node. */
++#include <pexpert/arm64/board_config.h>
++#include <sys/errno.h>
++#if defined(PANDORA)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSData.h>
++
++/* The existing Nezha identity service defines this base in
++ * SweetPlatformExpert.cpp. Keep one metaclass definition in the kernel. */
++class IONetworkController : public IOService {
++    OSDeclareDefaultStructors(IONetworkController);
++};
++class IO80211Controller : public IONetworkController {
++    OSDeclareDefaultStructors(IO80211Controller);
++};
++class IONetworkInterface : public IOService {
++    OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IO80211Controller, IONetworkController);
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++extern "C" int peach_wlan_publish(const char *, const unsigned char *);
++extern "C" int peach_wlan_publish(const char *name, const unsigned char *mac)
++{
++    IOService *provider = IOService::getPlatform();
++    IO80211Controller *controller = new IO80211Controller;
++    IONetworkInterface *interface = new IONetworkInterface;
++    OSData *address = OSData::withBytes(mac, 6);
++    if (!provider || !controller || !interface || !address || !controller->init() || !interface->init()) {
++        OSSafeReleaseNULL(controller); OSSafeReleaseNULL(interface); OSSafeReleaseNULL(address);
++        return ENOMEM;
++    }
++    controller->setName("NezhaPeachWLAN");
++    controller->setProperty("IOMACAddress", address);
++    controller->setProperty("IOBuiltin", true);
++    address->release();
++    interface->setName("NezhaPeachInterface");
++    interface->setProperty("IOInterfaceName", name);
++    interface->setProperty("BSD Name", name);
++    interface->setProperty("IOInterfaceNamePrefix", "en");
++    interface->setProperty("IOInterfaceType", 6ULL, 32);
++    interface->setProperty("IOInterfaceUnit", 0ULL, 32);
++    interface->setProperty("IOBuiltin", true);
++    interface->setProperty("IOPrimaryInterface", true);
++    interface->setProperty("IO80211InterfaceRole", "Infrastructure");
++    int error = EIO;
++    if (controller->attach(provider)) {
++        if (controller->start(provider)) {
++            if (interface->attach(controller)) {
++                if (interface->start(controller)) {
++                    controller->registerService(); interface->registerService();
++                    IOLog("NEZHA WIFI: Apple80211 ioctl interface %s published (link separate)\n", name);
++                    error = 0;
++                } else interface->detach(controller);
++            }
++            if (error) controller->stop(provider);
++        }
++        if (error) controller->detach(provider);
++    }
++    interface->release(); controller->release(); return error;
++}
++#else
++extern "C" int peach_wlan_publish(const char *, const unsigned char *) { return EOPNOTSUPP; }
++#endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -142,6 +142,7 @@
+ bsd/dev/qcom/PeachStation.c			standard
+ bsd/dev/qcom/PeachRsn.c			standard
+ bsd/dev/qcom/PeachNet.c			standard
++bsd/dev/qcom/PeachApple80211.c		standard
+ bsd/dev/pandora_wifi.c			standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -8,6 +8,7 @@
+ 
+ # SWEET device-tree platform (empty translation unit on other boards)
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
++iokit/Kernel/arm/PeachWLAN.cpp                                   optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp

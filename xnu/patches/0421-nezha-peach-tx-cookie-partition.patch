@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -589,7 +589,7 @@
+     R(10, 100); R(11, 100); R(12, 100); R(13, 40);
+     R(14, 2); R(15, 1); R(16, 1); /* Ethernet decap, one scan, beacon miss */
+     R(29, 256); R(30, w->max_fragments > 10 ? 10 : w->max_fragments);
+-    R(44, 1u << 30); /* explicitly disable IPA */
++    R(44, 1u << 30 | 1u << 10); /* IPA disabled; native 20-bit TX MSDU IDs */
+     R(54, 1); R(63, 1); R(81, 1); /* pdev IDs, single STA/active vdev */
+     if (w->mgmt_rx_dma.bytes) R(68, 1u << 21); /* real MGMT_SRNG, native flags2 */
+     if (service(w, 143)) R(57, 0x22); /* allow V2 map/unmap; legacy still legal */
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -107,8 +107,12 @@
+         1u | (control ? 6u : tid) << 4 | (control ? 6u : 0) |
+             t->lmac << 9 | t->vdev << 24,
+         t->ast | (t->hash & 15) << 20, 0};
+-    if (control && t->htt->htc->ops.log)
++    if (control && t->htt->htc->ops.log) {
+         t->htt->htc->ops.log(t->htt->htc->ops.context, "TX EAPOL native notify/classifier", entry[2], entry[5]);
++        t->htt->htc->ops.log(t->htt->htc->ops.context, "TX EAPOL DMA/cookie", entry[0], entry[1]);
++        t->htt->htc->ops.log(t->htt->htc->ops.context, "TX EAPOL metadata/length", entry[3], entry[4]);
++        t->htt->htc->ops.log(t->htt->htc->ops.context, "TX EAPOL search/hash", entry[6], 0);
++    }
+     t->owned[i] = 1; t->in_flight++; t->submitted_at[i] = now(t);
+     int err = peach_srng_push(t->ring, entry, sizeof(entry));
+     if (err == PeachCeFull) {

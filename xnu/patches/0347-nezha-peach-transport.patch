@@ -1,0 +1,1144 @@
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -22,6 +22,10 @@
+ #include "qcom/PeachMhiFirmware.h"
+ #include "qcom/PeachMhiHost.h"
+ #include "qcom/PeachWlfw.h"
++#include "qcom/PeachCe.h"
++#include "qcom/PeachHtc.h"
++#include "qcom/PeachHtt.h"
++#include "qcom/PeachWmi.h"
+ #include "qcom/NezhaPcieData.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+@@ -64,15 +68,22 @@
+ static PeachMhiFirmware wifi_firmware;
+ static PeachMhiHost wifi_host;
+ static PeachWlfw wifi_wlfw;
++static PeachCe wifi_ce;
++static PeachHtc wifi_htc;
++static PeachHtt wifi_htt;
++static PeachWmi wifi_wmi;
++static uint32_t wifi_target_window = 0xffffffffu;
+ static uint64_t wifi_context_offset, wifi_dma_next, wifi_check_at;
+ static uint32_t wifi_context_control;
+ static unsigned wifi_table_next, wifi_allocations;
+-static vm_offset_t wifi_owned_dma[PEACH_WLFW_SEGMENTS + 2];
++#define WIFI_DMA_ALLOCATIONS (PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 3)
++static vm_offset_t wifi_owned_dma[WIFI_DMA_ALLOCATIONS];
+ #define WIFI_IOVA 0x20000000ull
+ #define WIFI_DMA_BYTES 0x920000u
+ #define WIFI_DMA_LIMIT 0x28000000ull
+ #define WIFI_TABLE_BYTES 0x50000u
+ #define WIFI_TRY(expr) do { int err_ = (expr); if (err_) return err_; } while (0)
++static int wifi_dma_health(void);
+ 
+ static void
+ wifi_sleep(void *unused, unsigned us)
+@@ -153,6 +164,7 @@
+     uint64_t end = wifi_now(NULL) + ms * 1000ull;
+     do {
+         uint32_t value;
++        if (w == W_BAR) WIFI_TRY(wifi_dma_health());
+         WIFI_TRY(wifi_rd(w, o, &value));
+         if (value != 0xffffffffu && (value & mask) == want) return 0;
+         wifi_sleep(NULL, 1000);
+@@ -595,7 +607,7 @@
+ {
+     (void)unused;
+     size_t rounded = round_page(bytes);
+-    if (!out || !bytes || rounded < bytes || wifi_allocations >= PEACH_WLFW_SEGMENTS + 2 ||
++    if (!out || !bytes || rounded < bytes || wifi_allocations >= WIFI_DMA_ALLOCATIONS ||
+         wifi_dma_next >= WIFI_DMA_LIMIT || rounded > WIFI_DMA_LIMIT - wifi_dma_next) return ENOMEM;
+     vm_offset_t va = 0;
+     if (kmem_alloc(kernel_map, &va, rounded, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+@@ -675,6 +687,62 @@
+ static const PeachWlfwOps wifi_wlfw_ops = {NULL, wifi_allocate_dma, wifi_wlfw_file,
+     wifi_wlfw_log, WIFI_IOVA, WIFI_DMA_LIMIT - WIFI_IOVA};
+ 
++/* Peach hif_io32.h: target register window through BAR0+0x80000, selected
++ * by BAR0+0x3278. One worker owns this selector; MHI uses only low BAR offsets. */
++static int wifi_target_offset(uint32_t target, uint32_t *bar)
++{
++    if ((target & 3) || target >= 0x2000000) return EINVAL;
++    WIFI_TRY(wifi_dma_health());
++    if (target < 0x80000) { *bar = target; return 0; }
++    uint32_t window = 0x80000000u | ((target >> 19) & 0x3f);
++    if (window != wifi_target_window) {
++        uint32_t check;
++        WIFI_TRY(wifi_wr(W_BAR, 0x3278, window));
++        WIFI_TRY(wifi_rd(W_BAR, 0x3278, &check));
++        if (check != window) return EIO;
++        wifi_target_window = window;
++    }
++    *bar = 0x80000 + (target & 0x7ffff);
++    return 0;
++}
++static int wifi_target_read(void *c, uint32_t target, uint32_t *value)
++{
++    (void)c;
++    uint32_t bar;
++    WIFI_TRY(wifi_target_offset(target, &bar));
++    return wifi_rd(W_BAR, bar, value);
++}
++static int wifi_target_write(void *c, uint32_t target, uint32_t value)
++{
++    (void)c;
++    uint32_t bar;
++    WIFI_TRY(wifi_target_offset(target, &bar));
++    WIFI_TRY(wifi_wr(W_BAR, bar, value));
++    wifi_barrier(NULL);
++    return 0;
++}
++static int wifi_protocol_progress(void *c)
++{ (void)c; return peach_wlfw_poll(&wifi_wlfw); }
++static int wifi_service_receive(void *c, unsigned service, const void *p, size_t n)
++{
++    (void)c;
++    if (service == 0x100) {
++        peach_wmi_receive(&wifi_wmi, p, n);
++        return wifi_wmi.error;
++    }
++    if (service == 0x300) {
++        peach_htt_receive(&wifi_htt, p, n);
++        return wifi_htt.error;
++    }
++    return PeachCeProtocol;
++}
++static const PeachCeOps wifi_ce_ops = {NULL, wifi_target_read, wifi_target_write,
++    wifi_barrier, peach_htc_receive, &wifi_htc};
++static const PeachHtcOps wifi_htc_ops = {NULL, wifi_protocol_progress, wifi_now,
++    wifi_sleep, wifi_wlfw_log, wifi_service_receive};
++static const PeachWmiOps wifi_wmi_ops = {NULL, wifi_allocate_dma, wifi_barrier,
++    wifi_wlfw_log, WIFI_IOVA, WIFI_DMA_LIMIT - WIFI_IOVA};
++
+ static int
+ wifi_stage_firmware(void)
+ {
+@@ -742,7 +810,48 @@
+         return EIO;
+     }
+     wifi_phase = 9;
+-    printf("NEZHA WIFI: FW_INIT_DONE received; CE/WMI/HTT not yet connected\n");
++    wifi_step = "prepare CE DMA";
++    PeachMhiDma ce_dma;
++    WIFI_TRY(wifi_allocate_dma(NULL, PEACH_CE_DMA_BYTES, &ce_dma));
++    if (peach_ce_prepare(&wifi_ce, ce_dma, &wifi_ce_ops) ||
++        peach_htc_init(&wifi_htc, &wifi_ce, &wifi_htc_ops) ||
++        peach_htt_init(&wifi_htt, &wifi_htc) ||
++        peach_wmi_init(&wifi_wmi, &wifi_htc, &wifi_wmi_ops)) return EIO;
++    wifi_step = "WLFW WLAN_CFG/MISSION";
++    if (peach_wlfw_wlan_enable(&wifi_wlfw)) return EIO;
++    wifi_phase = 10;
++    wifi_step = "Peach CE rings";
++    err = peach_ce_start(&wifi_ce);
++    if (err) {
++        printf("NEZHA WIFI: CE setup failed %d at %#x value %#x\n", err,
++            wifi_ce.last_register, wifi_ce.last_value);
++        return EIO;
++    }
++    wifi_phase = 11;
++    wifi_step = "HTC READY and WMI/HTT connect";
++    err = peach_htc_bootstrap(&wifi_htc);
++    if (err) {
++        printf("NEZHA WIFI: HTC failed: %d, CE %d at %#x value %#x\n", err, wifi_ce.error,
++            wifi_ce.last_register, wifi_ce.last_value);
++        return EIO;
++    }
++    wifi_phase = 12;
++    wifi_step = "WMI SERVICE_READY/INIT/READY";
++    err = peach_wmi_bootstrap(&wifi_wmi);
++    if (err) {
++        printf("NEZHA WIFI: WMI phase %u failed: %d event %#x tag %u\n", wifi_wmi.phase, err,
++            wifi_wmi.last_event, wifi_wmi.last_tag);
++        return EIO;
++    }
++    wifi_phase = 13;
++    wifi_step = "HTT version negotiation";
++    err = peach_htt_negotiate(&wifi_htt);
++    if (err) {
++        printf("NEZHA WIFI: HTT failed: %d\n", err);
++        return EIO;
++    }
++    wifi_phase = 14;
++    printf("NEZHA WIFI: WMI READY and HTT version confirmed; scan/association/DP/network interface pending\n");
+     return ENOTSUP;
+ }
+ 
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -3,6 +3,7 @@
+  * platform/cnss_utils/wlan_firmware_service_v01.{c,h}, cnss2/{qmi,main}.c.
+  * No Linux sockets, module ABI, fake replies or unowned DMA addresses. */
+ #include "PeachWlfw.h"
++#include "PeachCe.h"
+ #include <string.h>
+ 
+ #define CTRL 0xfffffffeu
+@@ -393,3 +394,42 @@
+     report(w, "WLFW FW_INIT_DONE", w->soc_id, w->memory_count);
+     return 0;
+ }
++
++int peach_wlfw_wlan_enable(PeachWlfw *w)
++{
++    if (!w || w->phase != 6 || !w->firmware_ready) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    /* cnss2/qmi.c WLAN_CFG schema: variable arrays carry an 8-bit count,
++     * all pipe fields are 32-bit. Use the vendor's Peach-selected table,
++     * including its terminator. No shadow/MSI capabilities are asserted. */
++    unsigned char *p = w->packet + 39;
++    static const char version[] = "UniXNU-Nezha";
++    p[0] = 0x10; p16(p + 1, sizeof(version) - 1);
++    memcpy(p + 3, version, sizeof(version) - 1);
++    size_t n = 3 + sizeof(version) - 1;
++    p += n;
++    p[0] = 0x11; p16(p + 1, 1 + 9 * 20); p[3] = 9;
++    for (unsigned i = 0; i < 9; i++) {
++        const PeachCeTarget *t = &peach_ce_target[i];
++        unsigned char *v = p + 4 + i * 20;
++        p32(v, t->pipe); p32(v + 4, t->direction); p32(v + 8, t->entries);
++        p32(v + 12, t->max_bytes); p32(v + 16, t->flags);
++    }
++    n += 4 + 9 * 20; p = w->packet + 39 + n;
++    p[0] = 0x12; p16(p + 1, 1 + 15 * 12); p[3] = 15;
++    for (unsigned i = 0; i < 15; i++) {
++        const PeachCeService *s = &peach_ce_services[i];
++        unsigned char *v = p + 4 + i * 12;
++        p32(v, s->service); p32(v + 4, s->direction); p32(v + 8, s->pipe);
++    }
++    n += 4 + 15 * 12;
++    w->phase = 7;
++    WTRY(request(w, 0x23, n));
++    n = scalar(w, 0, 1, 0, 4); /* MISSION */
++    n = scalar(w, n, 0x10, 0, 1); /* no hardware debug */
++    w->phase = 8;
++    WTRY(request(w, 0x22, n));
++    w->phase = 9;
++    report(w, "WLFW MISSION acknowledged", 9, 15);
++    return 0;
++}
+--- a/bsd/dev/qcom/PeachWlfw.h
++++ b/bsd/dev/qcom/PeachWlfw.h
+@@ -49,4 +49,7 @@
+  * result means FW_INIT_DONE was received, not that a Wi-Fi NIC exists. CE,
+  * HTC/WMI/HTT and network integration belong to the subsequent data path. */
+ int peach_wlfw_bootstrap(PeachWlfw *);
++/* Call with CE DMA prepared, before enabling the host-owned CE rings. Does
++ * not advertise MSI, shadow-register acceleration, MLO or a working NIC. */
++int peach_wlfw_wlan_enable(PeachWlfw *);
+ #endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -132,6 +132,10 @@
+ bsd/dev/qcom/PeachMhiFirmware.c	standard
+ bsd/dev/qcom/PeachMhiHost.c		standard
+ bsd/dev/qcom/PeachWlfw.c		standard
++bsd/dev/qcom/PeachCe.c		standard
++bsd/dev/qcom/PeachHtc.c		standard
++bsd/dev/qcom/PeachWmi.c		standard
++bsd/dev/qcom/PeachHtt.c		standard
+ bsd/dev/pandora_wifi.c			standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+--- /dev/null
++++ b/bsd/dev/qcom/PeachCe.c
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Register fields: fw-api/hw/peach/v2/soc_ce_seq_hwioreg.h and ce_*_desc.h.
++ * Ownership/assignment: hif/src/ce/{ce_assignment.h,ce_main.c}; SRNG setup:
++ * hal/wifi3.0/{hal_generic_api.h,hal_srng.c}. No Linux ABI is used. */
++#include "PeachCe.h"
++#if defined(KERNEL)
++#include <libkern/libkern.h>
++#else
++#include <string.h>
++#endif
++
++const PeachCeTarget peach_ce_target[9] = {
++    {0, 2, 32, 2048, 0}, {1, 1, 32, 2048, 0},
++    {2, 1, 32, 3520, 0}, {3, 2, 32, 3520, 0},
++    {4, 2, 256, 256, 8}, {5, 1, 0, 2048, 0},
++    {6, 3, 32, 16384, 0}, {7, 4, 0, 0, 8}, {8, 3, 32, 16384, 0},
++};
++const PeachCeService peach_ce_services[15] = {
++    {0x101, 2, 3}, {0x101, 1, 2}, {0x102, 2, 3}, {0x102, 1, 2},
++    {0x103, 2, 3}, {0x103, 1, 2}, {0x104, 2, 3}, {0x104, 1, 2},
++    {0x100, 2, 3}, {0x100, 1, 2}, {1, 2, 0}, {1, 1, 2},
++    {0x300, 2, 4}, {0x300, 1, 1}, {0, 0, 0},
++};
++/* SRNG pointers and lengths are in dwords, never byte addresses. */
++enum { CE_BASE = 0x01b80000, STRIDE = 0x2000, ENABLE = 0x40 };
++#define CTRY(c, expr) do { int err_ = (expr); if (err_) { (c)->error = err_; return err_; } } while (0)
++static uint32_t get32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static void put32(void *p, uint32_t v) { memcpy(p, &v, 4); }
++static void barrier(PeachCe *c) { c->ops.barrier(c->ops.context); }
++static int read32(PeachCe *c, uint32_t r, uint32_t *v)
++{
++    c->last_register = r;
++    int err = c->ops.read32(c->ops.context, r, v);
++    c->last_value = err ? 0xffffffffu : *v;
++    return err;
++}
++static int write32(PeachCe *c, uint32_t r, uint32_t v)
++{
++    c->last_register = r; c->last_value = v;
++    return c->ops.write32(c->ops.context, r, v);
++}
++static int invalid(PeachCe *c) { return c->error = PeachCeProtocol; }
++
++static int carve(PeachCe *c, size_t *used, size_t bytes, PeachMhiDma *out)
++{
++    size_t start = (*used + 63) & ~(size_t)63;
++    if (start > c->memory.capacity || bytes > c->memory.capacity - start) return PeachMhiInvalid;
++    *out = (PeachMhiDma){(unsigned char *)c->memory.bytes + start, c->memory.iova + start, bytes};
++    *used = start + bytes;
++    return 0;
++}
++static int prepare_ring(PeachCe *c, PeachCeRing *r, size_t *used,
++                         uint32_t base, uint32_t doorbell, unsigned n, unsigned dw)
++{
++    r->base = base; r->doorbell = doorbell; r->entries = n; r->dwords = dw;
++    CTRY(c, carve(c, used, n * dw * 4, &r->descriptors));
++    return carve(c, used, 4, &r->pointer);
++}
++int peach_ce_prepare(PeachCe *c, PeachMhiDma memory, const PeachCeOps *ops)
++{
++    if (!c || !ops || !ops->read32 || !ops->write32 || !ops->barrier ||
++        !ops->receive || !memory.bytes || ((uintptr_t)memory.bytes & 63) ||
++        (memory.iova & 63) || memory.capacity < PEACH_CE_DMA_BYTES ||
++        memory.iova >= 0x100000000ull || memory.capacity > 0x100000000ull - memory.iova)
++        return PeachMhiInvalid;
++    memset(c, 0, sizeof(*c)); c->ops = *ops; c->memory = memory;
++    memset(memory.bytes, 0, PEACH_CE_DMA_BYTES);
++    const unsigned entries[5] = {16, 512, 256, 32, 256};
++    const unsigned limits[5] = {2048, 2048, 3520, 3520, 256};
++    size_t used = 0;
++    for (unsigned i = 0; i < PEACH_CE_CHANNELS; i++) {
++        PeachCeChannel *ch = &c->channel[i];
++        ch->receive = i == 1 || i == 2; ch->limit = limits[i];
++        uint32_t base = CE_BASE + i * STRIDE + (ch->receive ? 0x1000 : 0);
++        CTRY(c, prepare_ring(c, &ch->ring, &used, base, base + 0x400,
++            entries[i], ch->receive ? 2 : 4));
++        if (ch->receive)
++            CTRY(c, prepare_ring(c, &ch->status, &used, base + 0x58,
++                base + 0x408, entries[i], 4));
++        CTRY(c, carve(c, &used, entries[i] * limits[i], &ch->buffers));
++    }
++    barrier(c); c->prepared = 1;
++    return 0;
++}
++
++static int start_ring(PeachCe *c, PeachCeRing *r, unsigned status, unsigned ringid)
++{
++    uint32_t v;
++    CTRY(c, read32(c, r->base + 0x10, &v));
++    /* A freshly reset host-owned CE must be inactive. Never overwrite a
++     * live ring, including if firmware ownership differs from this ABI. */
++    if (v == 0xffffffffu || (v & ENABLE)) return invalid(c);
++    CTRY(c, write32(c, r->base + 0x10, 0));
++    CTRY(c, write32(c, r->base, (uint32_t)r->descriptors.iova));
++    CTRY(c, write32(c, r->base + 4, (r->entries * r->dwords) << 8));
++    CTRY(c, write32(c, r->base + 8, r->dwords | (status ? ringid << 8 : 0)));
++    /* Explicitly turn off prior MSI state and timer/threshold interrupts. */
++    CTRY(c, write32(c, r->base + 0x4c, 0));
++    CTRY(c, write32(c, r->base + (status ? 0x24 : 0x30), 0));
++    if (!status) CTRY(c, write32(c, r->base + 0x34, 0));
++    CTRY(c, write32(c, r->base + (status ? 0x14 : 0x1c), (uint32_t)r->pointer.iova));
++    CTRY(c, write32(c, r->base + (status ? 0x18 : 0x20), 0));
++    CTRY(c, write32(c, r->doorbell, 0));
++    CTRY(c, write32(c, r->doorbell + 4, 0));
++    barrier(c);
++    CTRY(c, write32(c, r->base + 0x10, ENABLE | (status ? 0 : 2)));
++    CTRY(c, read32(c, r->base + 0x10, &v));
++    if ((v & 0x7f) != (ENABLE | (status ? 0u : 2u))) return invalid(c);
++    return 0;
++}
++static void post_rx(PeachCeChannel *ch, unsigned buffer)
++{
++    PeachCeRing *r = &ch->ring;
++    unsigned char *d = (unsigned char *)r->descriptors.bytes + r->wp * 8;
++    uint64_t addr = ch->buffers.iova + (uint64_t)buffer * ch->limit;
++    put32(d, (uint32_t)addr); put32(d + 4, (uint32_t)(addr >> 32));
++    r->wp = (r->wp + 1) & (r->entries - 1);
++}
++int peach_ce_start(PeachCe *c)
++{
++    if (!c || !c->prepared || c->started) return PeachMhiInvalid;
++    if (c->error) return c->error;
++    for (unsigned i = 0; i < PEACH_CE_CHANNELS; i++) {
++        PeachCeChannel *ch = &c->channel[i];
++        if (ch->receive) {
++            uint32_t v;
++            CTRY(c, read32(c, ch->ring.base + 0xb0, &v));
++            CTRY(c, write32(c, ch->ring.base + 0xb0, (v & ~0xffffu) | ch->limit));
++            CTRY(c, start_ring(c, &ch->status, 1, 100 + i));
++        }
++        CTRY(c, start_ring(c, &ch->ring, 0, 0));
++        if (ch->receive) {
++            /* Vendor CE workaround leaves two entries unposted. Buffers are
++             * reclaimed in order; rp identifies the next completed buffer. */
++            for (unsigned j = 0; j < ch->ring.entries - 2; j++) post_rx(ch, j);
++            barrier(c);
++            CTRY(c, write32(c, ch->ring.doorbell, ch->ring.wp * ch->ring.dwords));
++        }
++    }
++    c->started = 1;
++    return 0;
++}
++
++static int hardware_index(PeachCe *c, PeachCeRing *r, unsigned *index)
++{
++    barrier(c);
++    uint32_t dw = *(volatile uint32_t *)r->pointer.bytes;
++    if (dw >= r->entries * r->dwords || dw % r->dwords) return invalid(c);
++    *index = dw / r->dwords;
++    barrier(c);
++    return 0;
++}
++static int reap_tx(PeachCe *c, PeachCeRing *r)
++{
++    unsigned tail;
++    CTRY(c, hardware_index(c, r, &tail));
++    unsigned complete = (tail - r->rp) & (r->entries - 1);
++    unsigned posted = (r->wp - r->rp) & (r->entries - 1);
++    if (complete > posted) return invalid(c);
++    r->rp = tail;
++    return 0;
++}
++int peach_ce_send(PeachCe *c, unsigned pipe, unsigned metadata, const void *p, size_t n)
++{
++    if (!c || !c->started || pipe >= PEACH_CE_CHANNELS || !p || !n || metadata > 0xffff)
++        return PeachMhiInvalid;
++    if (c->error) return c->error;
++    PeachCeChannel *ch = &c->channel[pipe];
++    PeachCeRing *r = &ch->ring;
++    if (ch->receive || n > ch->limit) return PeachMhiInvalid;
++    CTRY(c, reap_tx(c, r));
++    unsigned next = (r->wp + 1) & (r->entries - 1);
++    if (next == r->rp) return PeachCeFull;
++    size_t off = r->wp * ch->limit;
++    memcpy((unsigned char *)ch->buffers.bytes + off, p, n);
++    unsigned char *d = (unsigned char *)r->descriptors.bytes + r->wp * 16;
++    uint64_t addr = ch->buffers.iova + off;
++    put32(d, (uint32_t)addr); put32(d + 4, (uint32_t)(addr >> 32) | (uint32_t)n << 16);
++    put32(d + 8, metadata); put32(d + 12, 0);
++    barrier(c); r->wp = next;
++    CTRY(c, write32(c, r->doorbell, r->wp * r->dwords));
++    return 0;
++}
++
++static int receive_one(PeachCe *c, unsigned pipe, unsigned *received)
++{
++    PeachCeChannel *ch = &c->channel[pipe];
++    PeachCeRing *s = &ch->status, *r = &ch->ring;
++    unsigned head;
++    CTRY(c, hardware_index(c, s, &head));
++    if (head == s->rp) return 0;
++    unsigned char *d = (unsigned char *)s->descriptors.bytes + s->rp * 16;
++    uint32_t info = get32(d), meta = get32(d + 12);
++    unsigned n = info >> 16;
++    /* Hardware can publish HP just before the status length becomes visible.
++     * Defer rather than consume an incomplete descriptor (vendor CE race). */
++    if (!n) return 0;
++    if (n > ch->limit || (info & 0x1f00) || ((meta >> 20) & 0xff) != 100 + pipe)
++        return invalid(c);
++    unsigned buffer = r->rp;
++    c->ops.receive(c->ops.receive_context, pipe,
++        (unsigned char *)ch->buffers.bytes + buffer * ch->limit, n);
++    put32(d, 0);
++    s->rp = (s->rp + 1) & (s->entries - 1);
++    /* Move this consumed buffer into the next free descriptor. The buffer
++     * sequence remains in-order even though two ring entries stay empty. */
++    /* Only entries-2 buffers circulate; r->rp is a buffer index on RX. */
++    r->rp++;
++    if (r->rp == r->entries - 2) r->rp = 0;
++    post_rx(ch, buffer);
++    barrier(c);
++    CTRY(c, write32(c, s->doorbell + 4, s->rp * s->dwords));
++    CTRY(c, write32(c, r->doorbell, r->wp * r->dwords));
++    *received = 1;
++    return 0;
++}
++int peach_ce_poll(PeachCe *c, unsigned budget)
++{
++    if (!c || !c->started || !budget || c->polling) return PeachMhiInvalid;
++    if (c->error) return c->error;
++    c->polling = 1;
++    int err = 0;
++    for (unsigned i = 0; i < PEACH_CE_CHANNELS && !err; i++)
++        if (!c->channel[i].receive) err = reap_tx(c, &c->channel[i].ring);
++    for (unsigned done = 0; done < budget && !err;) {
++        unsigned received = 0;
++        unsigned pipe = 1 + (c->next_channel++ & 1);
++        err = receive_one(c, pipe, &received);
++        if (err) break;
++        if (!received) {
++            pipe = 3 - pipe;
++            err = receive_one(c, pipe, &received);
++            if (!received) break;
++        }
++        done += received;
++    }
++    c->polling = 0;
++    return err;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachCe.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_CE_H
++#define PEACH_CE_H
++#include "PeachMhiFirmware.h"
++
++/* Peach v2 register/descriptor ABI, Kiwi CE assignment selected by the
++ * vendor's TARGET_TYPE_PEACH path. CE9-11 belong to MHI and are never touched.
++ * One worker owns all rings. Callbacks may copy/parse; they must not wait,
++ * recursively poll, or keep the borrowed RX buffer after returning. */
++#define PEACH_CE_DMA_BYTES 0x220000u
++#define PEACH_CE_CHANNELS 5u
++enum { PeachCeFull = -6, PeachCeProtocol = -20 };
++typedef struct { uint32_t pipe, direction, entries, max_bytes, flags; } PeachCeTarget;
++typedef struct { uint32_t service, direction, pipe; } PeachCeService;
++extern const PeachCeTarget peach_ce_target[9];
++extern const PeachCeService peach_ce_services[15];
++
++typedef struct {
++    void *context;
++    /* Target register offsets, not BAR offsets. The platform supplies the
++     * Peach PCI aperture, bus-fault containment and own-domain DMA checks. */
++    int (*read32)(void *, uint32_t, uint32_t *);
++    int (*write32)(void *, uint32_t, uint32_t);
++    void (*barrier)(void *);
++    void (*receive)(void *, unsigned pipe, const void *, size_t);
++    void *receive_context;
++} PeachCeOps;
++
++typedef struct {
++    PeachMhiDma descriptors, pointer;
++    uint32_t base, doorbell;
++    unsigned entries, dwords, wp, rp;
++} PeachCeRing;
++typedef struct {
++    PeachCeRing ring, status;
++    PeachMhiDma buffers;
++    unsigned limit, receive;
++} PeachCeChannel;
++typedef struct {
++    PeachCeOps ops;
++    PeachMhiDma memory;
++    PeachCeChannel channel[PEACH_CE_CHANNELS];
++    unsigned prepared, started, polling, next_channel;
++    uint32_t last_register, last_value;
++    int error;
++} PeachCe;
++
++/* Prepare DMA first; WLFW WLAN_CFG/MISSION precede hardware ring setup, as
++ * hif_pci_bus_configure does. DMA must be zeroed, coherent and retained. */
++int peach_ce_prepare(PeachCe *, PeachMhiDma, const PeachCeOps *);
++int peach_ce_start(PeachCe *);
++int peach_ce_poll(PeachCe *, unsigned budget);
++/* Copies into retained per-slot DMA; completion is reaped before reuse. */
++int peach_ce_send(PeachCe *, unsigned pipe, unsigned metadata, const void *, size_t);
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/PeachHtc.c
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Wire ABI: fw-api/fw/htc.h, htc_services.h. Credit allocation and PCI HTT
++ * policy follow htc/htc.c and dp/wifi3.0/dp_htt.c for a single WMI endpoint. */
++#include "PeachHtc.h"
++#if defined(KERNEL)
++#include <libkern/libkern.h>
++#else
++#include <string.h>
++#endif
++#define HTRY(h, expr) do { int err_ = (expr); if (err_) { (h)->error = err_; return err_; } } while (0)
++static unsigned u16(const unsigned char *p) { return p[0] | (unsigned)p[1] << 8; }
++static void p16(unsigned char *p, unsigned v) { p[0] = v; p[1] = v >> 8; }
++static void report(PeachHtc *h, const char *s, unsigned a, unsigned b)
++{ if (h->ops.log) h->ops.log(h->ops.context, s, a, b); }
++static int bad(PeachHtc *h) { return h->error = PeachCeProtocol; }
++
++int peach_htc_init(PeachHtc *h, PeachCe *ce, const PeachHtcOps *ops)
++{
++    if (!h || !ce || !ce->prepared || !ops || !ops->progress || !ops->now_us ||
++        !ops->sleep_us || !ops->receive) return PeachMhiInvalid;
++    memset(h, 0, sizeof(*h)); h->ce = ce; h->ops = *ops;
++    /* HTC control is a pseudo service on endpoint zero, not a CONNECT. */
++    h->endpoint[0] = (PeachHtcEndpoint){1, 0, 2, 256, 0, 0, 0, 0};
++    return 0;
++}
++static int trailer(PeachHtc *h, const unsigned char *p, size_t n)
++{
++    while (n) {
++        /* HTC_RECORD_HDR and HTC_CREDIT_REPORT are FOUR bytes in this ABI. */
++        if (n < 4 || p[1] > n - 4) return bad(h);
++        unsigned id = p[0], len = p[1];
++        p += 4; n -= 4;
++        if (id == 1) {
++            if (!len || (len & 3)) return bad(h);
++            for (unsigned i = 0; i < len; i += 4) {
++                unsigned ep = p[i], count = p[i + 1];
++                if (ep >= PEACH_HTC_ENDPOINTS || !h->endpoint[ep].service) return bad(h);
++                PeachHtcEndpoint *e = &h->endpoint[ep];
++                if (e->flow_control) {
++                    if (count > e->allocation - e->credits) return bad(h);
++                    e->credits += count;
++                }
++            }
++        }
++        p += len; n -= len;
++    }
++    return 0;
++}
++static void control_receive(PeachHtc *h, const unsigned char *p, size_t n)
++{
++    if (n < 2) { bad(h); return; }
++    unsigned id = u16(p);
++    if (id == 1) {
++        if (n < 8 || h->ready || !u16(p + 2) || !u16(p + 4) || p[6] < 3 ||
++            p[6] > PEACH_HTC_ENDPOINTS) { bad(h); return; }
++        h->credit_count = u16(p + 2); h->credit_size = u16(p + 4);
++        h->max_endpoints = p[6]; h->ready = 1;
++        report(h, "HTC READY credits/size", h->credit_count, h->credit_size);
++    } else if (id == 3) {
++        if (n < 12 || !h->pending_service || h->response_ready || u16(p + 2) != h->pending_service ||
++            p[4] || !p[5] || p[5] >= h->max_endpoints || !u16(p + 6) ||
++            p[8] > n - 12 || h->endpoint[p[5]].service) { bad(h); return; }
++        unsigned service = h->pending_service, ep = p[5], wmi = service == 0x100;
++        if (!wmi && service != 0x300) { bad(h); return; }
++        h->endpoint[ep] = (PeachHtcEndpoint){service, wmi ? 3u : 4u, wmi ? 2u : 1u,
++            u16(p + 6), h->pending_credits, h->pending_credits, wmi, 0};
++        if (wmi) h->wmi_endpoint = ep; else h->htt_endpoint = ep;
++        h->response_ready = 1;
++        report(h, "HTC connected service/endpoint", service, ep);
++    } else {
++        report(h, "unexpected HTC control", id, (unsigned)n); bad(h);
++    }
++}
++void peach_htc_receive(void *context, unsigned pipe, const void *packet, size_t n)
++{
++    PeachHtc *h = context;
++    const unsigned char *p = packet;
++    if (!h || h->error) return;
++    if (h->receiving || !p || n < 8) { bad(h); return; }
++    unsigned ep = p[0], flags = p[1], length = u16(p + 2);
++    if (ep >= PEACH_HTC_ENDPOINTS || !h->endpoint[ep].service ||
++        pipe != h->endpoint[ep].rx_pipe || length > n - 8 || (flags & 0xfc) ||
++        n - 8 - length > 3) { bad(h); return; }
++    unsigned tail = (flags & 2) ? p[4] : 0;
++    if ((flags & 2) && (!tail || tail > length)) { bad(h); return; }
++    h->receiving = 1;
++    if (tail && trailer(h, p + 8 + length - tail, tail)) { h->receiving = 0; return; }
++    if (length > tail) {
++        if (!ep) control_receive(h, p + 8, length - tail);
++        else {
++            int err = h->ops.receive(h->ops.context, h->endpoint[ep].service, p + 8, length - tail);
++            if (err) h->error = err;
++        }
++    }
++    h->receiving = 0;
++}
++int peach_htc_poll(PeachHtc *h)
++{
++    if (!h || !h->ce || h->receiving) return PeachMhiInvalid;
++    if (h->error) return h->error;
++    HTRY(h, h->ops.progress(h->ops.context));
++    HTRY(h, peach_ce_poll(h->ce, 32));
++    return h->error;
++}
++int peach_htc_send(PeachHtc *h, unsigned service, const void *payload, size_t n)
++{
++    if (!h || !h->ready || h->receiving || !payload || !n || n > sizeof(h->packet) - 8)
++        return PeachMhiInvalid;
++    if (h->error) return h->error;
++    PeachHtcEndpoint *e = NULL;
++    unsigned ep;
++    for (ep = 0; ep < PEACH_HTC_ENDPOINTS; ep++)
++        if (h->endpoint[ep].service == service) { e = &h->endpoint[ep]; break; }
++    if (!e || n > e->max_bytes || n + 8 > h->ce->channel[e->tx_pipe].limit) return PeachMhiInvalid;
++    unsigned credits = e->flow_control ? (unsigned)(n + 8 + h->credit_size - 1) / h->credit_size : 0;
++    if (credits > e->credits) return PeachCeFull;
++    memset(h->packet, 0, 8);
++    h->packet[0] = ep; h->packet[1] = e->flow_control ? 1 : 0;
++    p16(h->packet + 2, (unsigned)n); h->packet[5] = e->sequence;
++    memcpy(h->packet + 8, payload, n);
++    int err = peach_ce_send(h->ce, e->tx_pipe, ep, h->packet, n + 8);
++    if (err == PeachCeFull) return err;
++    if (err) { h->error = err; return err; }
++    e->credits -= credits; e->sequence = (e->sequence + 1) & 255;
++    return 0;
++}
++static int wait_flag(PeachHtc *h, const unsigned *flag)
++{
++    uint64_t end = h->ops.now_us(h->ops.context) + 10000000;
++    while (!*flag) {
++        HTRY(h, peach_htc_poll(h));
++        if (h->ops.now_us(h->ops.context) >= end) return h->error = PeachMhiTimeout;
++        if (!*flag) h->ops.sleep_us(h->ops.context, 1000);
++    }
++    return 0;
++}
++static int send_control(PeachHtc *h, const void *p, size_t n)
++{
++    uint64_t end = h->ops.now_us(h->ops.context) + 10000000;
++    int err;
++    while ((err = peach_htc_send(h, 1, p, n)) == PeachCeFull) {
++        HTRY(h, peach_htc_poll(h));
++        if (h->ops.now_us(h->ops.context) >= end) return h->error = PeachMhiTimeout;
++        h->ops.sleep_us(h->ops.context, 1000);
++    }
++    return err;
++}
++static int connect_service(PeachHtc *h, unsigned service, unsigned credits)
++{
++    unsigned char connect[8] = {0};
++    p16(connect, 2); p16(connect + 2, service);
++    /* PCI HTT does not use target HTC buffers; vendor explicitly disables
++     * its credit flow. WMI receives actual READY credits and keeps flow on. */
++    p16(connect + 4, credits << 8 | (service == 0x300 ? 8 : 0));
++    h->pending_service = service; h->pending_credits = credits; h->response_ready = 0;
++    HTRY(h, send_control(h, connect, sizeof(connect)));
++    HTRY(h, wait_flag(h, &h->response_ready));
++    h->pending_service = 0;
++    return 0;
++}
++int peach_htc_bootstrap(PeachHtc *h)
++{
++    if (!h || !h->ce || !h->ce->started || h->started) return PeachMhiInvalid;
++    HTRY(h, wait_flag(h, &h->ready));
++    unsigned credits = h->credit_count > 255 ? 255 : h->credit_count;
++    HTRY(h, connect_service(h, 0x100, credits));
++    HTRY(h, connect_service(h, 0x300, 0));
++    unsigned char setup[12] = {5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0};
++    HTRY(h, send_control(h, setup, sizeof(setup)));
++    h->started = 1;
++    report(h, "HTC setup complete WMI/HTT", h->wmi_endpoint, h->htt_endpoint);
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachHtc.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_HTC_H
++#define PEACH_HTC_H
++#include "PeachCe.h"
++#define PEACH_HTC_ENDPOINTS 32u
++typedef struct {
++    void *context;
++    int (*progress)(void *); /* MHI/QRTR service, no recursive HTC calls */
++    uint64_t (*now_us)(void *);
++    void (*sleep_us)(void *, unsigned);
++    void (*log)(void *, const char *, uint32_t, uint32_t);
++    /* Borrowed service payload, after validated HTC header/trailer removal. */
++    int (*receive)(void *, unsigned service, const void *, size_t);
++} PeachHtcOps;
++typedef struct {
++    unsigned service, tx_pipe, rx_pipe, max_bytes;
++    unsigned credits, allocation, flow_control, sequence;
++} PeachHtcEndpoint;
++typedef struct {
++    PeachCe *ce;
++    PeachHtcOps ops;
++    PeachHtcEndpoint endpoint[PEACH_HTC_ENDPOINTS];
++    unsigned ready, started, receiving, credit_size, credit_count, max_endpoints;
++    unsigned pending_service, pending_credits, response_ready, wmi_endpoint, htt_endpoint;
++    int error;
++    unsigned char packet[3520];
++} PeachHtc;
++int peach_htc_init(PeachHtc *, PeachCe *, const PeachHtcOps *);
++/* Install as PeachCeOps.receive before CE starts. Never waits or allocates. */
++void peach_htc_receive(void *, unsigned, const void *, size_t);
++int peach_htc_poll(PeachHtc *);
++/* Wait for real READY, connect WMI/HTT, then SETUP_COMPLETE_EX. */
++int peach_htc_bootstrap(PeachHtc *);
++/* No implicit wait; PeachCeFull means retry after progress/sleep. WMI credits
++ * remain enabled; HTT disables HTC credits as in vendor dp_htt.c. */
++int peach_htc_send(PeachHtc *, unsigned service, const void *, size_t);
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -0,0 +1,248 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Minimal single-station WMI initialization. Wire offsets/tags are from
++ * fw-api/fw/{wmi.h,wmi_unified.h,wmi_tlv_defs.h,wmi_services.h,wlan_defs.h}
++ * in sm8850-modules fdd80ae0d6665f8a018c3e06a6152bafdaf1269d.
++ * Resources follow wlan_tgt_def_config.h with one vdev and eight peers.
++ * No capability is inferred from a command send or a successful HTC setup. */
++#include "PeachWmi.h"
++#if defined(KERNEL)
++#include <libkern/libkern.h>
++#else
++#include <string.h>
++#endif
++enum { TAG_U32 = 16, TAG_ARRAY = 18, TAG_SERVICE = 32, TAG_MEMORY = 34,
++       TAG_READY = 35, TAG_INIT = 74, TAG_RESOURCES = 75, TAG_CHUNK = 76,
++       TAG_EXT = 428, TAG_AVAILABLE = 559, TAG_EXT2 = 820,
++       TAG_FW_READY = 1321, TAG_MODE = 1322, TAG_MODE_RESPONSE = 1323,
++       RESOURCE_WORDS = 88, VDEVS = 1, PEERS = 8 };
++static const uint32_t host_abi[6] = {0x01000000, 1822, 0x5f414351, 0x4c4d, 0, 0};
++#define WTRY(w, expr) do { int err_ = (expr); if (err_) { (w)->error = err_; return err_; } } while (0)
++static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static void p32(void *p, uint32_t v) { memcpy(p, &v, 4); }
++static void tlv(unsigned char *p, unsigned tag, unsigned bytes) { p32(p, tag << 16 | bytes); }
++static int bad(PeachWmi *w) { return w->error = PeachCeProtocol; }
++static void report(PeachWmi *w, const char *s, uint32_t a, uint32_t b)
++{ if (w->ops.log) w->ops.log(w->ops.context, s, a, b); }
++static unsigned service(PeachWmi *w, unsigned id)
++{ return id < 1024 && ((w->services[id / 32] >> (id & 31)) & 1); }
++static void add_service(PeachWmi *w, unsigned id)
++{ if (id < 1024) w->services[id / 32] |= 1u << (id & 31); }
++static int abi_compatible(const unsigned char *p)
++{
++    for (unsigned i = 0; i < 6; i++)
++        if (i != 1 && u32(p + 4 * i) != host_abi[i]) return 0;
++    return 1; /* vendor compares namespace + major/minor, ignores revision */
++}
++static int tlvs_valid(const unsigned char *p, size_t n)
++{
++    while (n) {
++        if (n < 4) return 0;
++        unsigned len = u32(p) & 0xffff;
++        if ((len & 3) || len > n - 4) return 0;
++        p += 4 + len; n -= 4 + len;
++    }
++    return 1;
++}
++int peach_wmi_init(PeachWmi *w, PeachHtc *h, const PeachWmiOps *ops)
++{
++    if (!w || !h || !ops || !ops->allocate || !ops->barrier ||
++        !ops->iova_bytes || ops->iova_base >= 0x100000000ull ||
++        ops->iova_bytes > 0x100000000ull - ops->iova_base) return PeachMhiInvalid;
++    memset(w, 0, sizeof(*w)); w->htc = h; w->ops = *ops;
++    return 0;
++}
++static int service_ready(PeachWmi *w, const unsigned char *p, size_t n)
++{
++    unsigned stage = 0, count = 0, seen_memory = 0;
++    if (w->service_ready) return bad(w);
++    while (n) {
++        unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
++        if (!stage) {
++            if (tag != TAG_SERVICE || len < 128 || !abi_compatible(p + 8)) return bad(w);
++            for (unsigned i = 0; i < 6; i++) w->firmware_abi[i] = u32(p + 8 + i * 4);
++            w->chains = u32(p + 40); w->max_fragments = u32(p + 36);
++            count = u32(p + 76);
++            if (!w->chains || w->chains > 8 || count > PEACH_WMI_MEMORY_REQUESTS) return bad(w);
++            w->requests = count;
++        } else if (stage == 2) {
++            if (tag != TAG_U32 || len != 128) return bad(w);
++            /* Legacy service bitmap uses FOUR bits per u32, as specified
++             * by WMI_SERVICE_IS_ENABLED; extended bitmaps use 32. */
++            for (unsigned i = 0; i < 128; i++)
++                if (u32(p + 4 + (i / 4) * 4) & (1u << (i & 3))) add_service(w, i);
++        } else if (stage == 3) {
++            if (tag != TAG_ARRAY || len != count * 20) return bad(w);
++            for (unsigned i = 0; i < count; i++) {
++                const unsigned char *v = p + 4 + i * 20;
++                if (u32(v) != (TAG_MEMORY << 16 | 16)) return bad(w);
++                PeachWmiMemory *m = &w->memory[i];
++                m->id = u32(v + 4); m->unit_size = u32(v + 8);
++                m->flags = u32(v + 12); m->units = u32(v + 16);
++                if (!m->unit_size || m->flags & ~15u) return bad(w);
++                for (unsigned j = 0; j < i; j++) if (w->memory[j].id == m->id) return bad(w);
++            }
++            seen_memory = 1;
++        }
++        p += len + 4; n -= len + 4; stage++;
++    }
++    if (!seen_memory) return bad(w);
++    w->service_ready = 1;
++    report(w, "WMI SERVICE_READY chains/memory", w->chains, w->requests);
++    return 0;
++}
++void peach_wmi_receive(PeachWmi *w, const void *packet, size_t n)
++{
++    const unsigned char *p = packet;
++    if (!w || w->error) return;
++    if (!p || n < 8 || !tlvs_valid(p + 4, n - 4)) { bad(w); return; }
++    unsigned id = u32(p) & 0xffffff;
++    p += 4; n -= 4;
++    unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
++    w->last_event = id; w->last_tag = tag;
++    switch (id) {
++    case 1: (void)service_ready(w, p, n); break;
++    case 2: {
++        if (!w->phase || tag != TAG_READY || len < 36 || !abi_compatible(p + 4) || u32(p + 36)) {
++            report(w, "WMI READY rejected/tag", len >= 36 ? u32(p + 36) : 0xffffffffu, tag);
++            bad(w); return;
++        }
++        uint32_t lo = u32(p + 28), hi = u32(p + 32);
++        for (unsigned i = 0; i < 4; i++) w->mac[i] = lo >> (i * 8);
++        w->mac[4] = hi; w->mac[5] = hi >> 8;
++        if ((lo & 1) || (!lo && !hi) || w->ready) { bad(w); return; }
++        w->ready = 1;
++        report(w, "WMI READY real MAC", lo, hi & 0xffff);
++        break;
++    }
++    case 3: {
++        if (tag != TAG_AVAILABLE || len < 20) { bad(w); return; }
++        uint32_t offset = u32(p + 4);
++        if ((offset & 31) || offset > 896) { bad(w); return; }
++        for (unsigned i = 0; i < 128; i++)
++            if (u32(p + 8 + (i / 32) * 4) & (1u << (i & 31))) add_service(w, offset + i);
++        break;
++    }
++    case 5:
++        if (tag != TAG_FW_READY || w->mode_required || w->service_ready) { bad(w); return; }
++        w->mode_required = 1;
++        break;
++    case 6:
++        if (tag != TAG_MODE_RESPONSE || len < 4 || !w->mode_sent || u32(p + 4)) { bad(w); return; }
++        w->mode_accepted = 1;
++        break;
++    case 0x4009:
++        if (tag != TAG_EXT || w->ext_ready) { bad(w); return; }
++        w->ext_ready = 1;
++        report(w, "WMI SERVICE_READY_EXT", len, 0);
++        break;
++    case 0x4022:
++        if (tag != TAG_EXT2 || w->ext2_ready) { bad(w); return; }
++        w->ext2_ready = 1;
++        report(w, "WMI SERVICE_READY_EXT2", len, 0);
++        break;
++    default:
++        if (w->unknown_events++ < 8) report(w, "WMI pending event", id, (uint32_t)n);
++        break;
++    }
++}
++static int progress(PeachWmi *w)
++{
++    WTRY(w, peach_htc_poll(w->htc));
++    return w->error;
++}
++static int send_command(PeachWmi *w, unsigned id, size_t n)
++{
++    if (w->error) return w->error;
++    if (n < 4 || n > sizeof(w->command)) return PeachMhiInvalid;
++    p32(w->command, id);
++    uint64_t end = w->htc->ops.now_us(w->htc->ops.context) + 10000000;
++    int err;
++    while ((err = peach_htc_send(w->htc, 0x100, w->command, n)) == PeachCeFull) {
++        WTRY(w, progress(w));
++        if (w->htc->ops.now_us(w->htc->ops.context) >= end) return w->error = PeachMhiTimeout;
++        w->htc->ops.sleep_us(w->htc->ops.context, 1000);
++    }
++    return err;
++}
++static int wait_flag(PeachWmi *w, const unsigned *flag)
++{
++    if (w->error) return w->error;
++    uint64_t end = w->htc->ops.now_us(w->htc->ops.context) + 10000000;
++    while (!*flag) {
++        WTRY(w, progress(w));
++        if (w->mode_required && !w->mode_sent) {
++            memset(w->command, 0, 12); tlv(w->command + 4, TAG_MODE, 4);
++            w->mode_sent = 1;
++            WTRY(w, send_command(w, 2, 12));
++        }
++        if (w->htc->ops.now_us(w->htc->ops.context) >= end) return w->error = PeachMhiTimeout;
++        if (!*flag) w->htc->ops.sleep_us(w->htc->ops.context, 1000);
++    }
++    return 0;
++}
++static int allocate_memory(PeachWmi *w)
++{
++    for (unsigned i = 0; i < w->requests; i++) {
++        PeachWmiMemory *m = &w->memory[i];
++        unsigned units = m->units;
++        if (m->flags & 1) units = VDEVS;
++        if (m->flags & 6) units = PEERS + 1; /* vendor includes target self peer */
++        uint64_t unit = ((uint64_t)m->unit_size + 3) & ~3ull;
++        uint64_t bytes = unit * units;
++        if (!bytes || bytes > 0x2000000 || bytes > w->ops.iova_bytes) return bad(w);
++        WTRY(w, w->ops.allocate(w->ops.context, (size_t)bytes, &m->dma));
++        if (!m->dma.bytes || m->dma.capacity < bytes || m->dma.iova < w->ops.iova_base ||
++            m->dma.iova - w->ops.iova_base >= w->ops.iova_bytes ||
++            bytes > w->ops.iova_bytes - (m->dma.iova - w->ops.iova_base)) return bad(w);
++        report(w, "WMI host memory id/bytes", m->id, (uint32_t)bytes);
++    }
++    w->ops.barrier(w->ops.context);
++    return 0;
++}
++static size_t build_init(PeachWmi *w)
++{
++    memset(w->command, 0, sizeof(w->command));
++    unsigned char *p = w->command + 4;
++    tlv(p, TAG_INIT, 28);
++    for (unsigned i = 0; i < 6; i++) p32(p + 4 + i * 4, host_abi[i]);
++    p32(p + 28, w->requests);
++    p += 32;
++    tlv(p, TAG_RESOURCES, RESOURCE_WORDS * 4 - 4);
++    /* Indices include the TLV header. Appended optional fields stay zero;
++     * no MLO, NAN, TDLS, IPA, monitor or accelerator features are enabled. */
++#define R(word, value) p32(p + 4 * (word), (value))
++    R(1, VDEVS); R(2, PEERS); R(3, VDEVS + 1); R(4, 1); R(5, 2);
++    R(6, 2 * (PEERS + VDEVS + 2)); R(7, 16);
++    R(8, (1u << w->chains) - 1); R(9, (1u << w->chains) - 1);
++    R(10, 100); R(11, 100); R(12, 100); R(13, 40);
++    R(14, 2); R(15, 1); R(16, 1); /* Ethernet decap, one scan, beacon miss */
++    R(29, 256); R(30, w->max_fragments > 10 ? 10 : w->max_fragments);
++    R(44, 1u << 30); /* explicitly disable IPA */
++    R(54, 1); R(63, 1); R(81, 1); /* pdev IDs, single STA/active vdev */
++#undef R
++    p += RESOURCE_WORDS * 4;
++    tlv(p, TAG_ARRAY, w->requests * 20); p += 4;
++    for (unsigned i = 0; i < w->requests; i++, p += 20) {
++        PeachWmiMemory *m = &w->memory[i];
++        tlv(p, TAG_CHUNK, 16); p32(p + 4, m->id); p32(p + 8, (uint32_t)m->dma.iova);
++        p32(p + 12, (uint32_t)m->dma.capacity); p32(p + 16, 0);
++    }
++    /* As vendor copy_hw_mode_in_init_cmd, omit mode selection when keeping
++     * the target's boot default; do not invent a hardware-mode index. */
++    return (size_t)(p - w->command);
++}
++int peach_wmi_bootstrap(PeachWmi *w)
++{
++    if (!w || !w->htc || !w->htc->started || w->phase) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    WTRY(w, wait_flag(w, &w->service_ready));
++    if (w->mode_required) WTRY(w, wait_flag(w, &w->mode_accepted));
++    if (service(w, 77)) WTRY(w, wait_flag(w, &w->ext_ready));
++    if (service(w, 220)) WTRY(w, wait_flag(w, &w->ext2_ready));
++    WTRY(w, allocate_memory(w));
++    w->phase = 1;
++    WTRY(w, send_command(w, 1, build_init(w)));
++    WTRY(w, wait_flag(w, &w->ready));
++    w->phase = 2;
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_WMI_H
++#define PEACH_WMI_H
++#include "PeachHtc.h"
++#define PEACH_WMI_MEMORY_REQUESTS 16u
++typedef struct {
++    void *context;
++    int (*allocate)(void *, size_t, PeachMhiDma *);
++    void (*barrier)(void *);
++    void (*log)(void *, const char *, uint32_t, uint32_t);
++    uint64_t iova_base, iova_bytes;
++} PeachWmiOps;
++typedef struct {
++    uint32_t id, unit_size, flags, units;
++    PeachMhiDma dma;
++} PeachWmiMemory;
++typedef struct {
++    PeachHtc *htc;
++    PeachWmiOps ops;
++    unsigned phase, service_ready, ext_ready, ext2_ready, ready;
++    unsigned mode_required, mode_sent, mode_accepted, unknown_events;
++    uint32_t firmware_abi[6], services[32], requests, chains, max_fragments;
++    uint32_t last_event, last_tag;
++    unsigned char mac[6];
++    int error;
++    PeachWmiMemory memory[PEACH_WMI_MEMORY_REQUESTS];
++    unsigned char command[2048];
++} PeachWmi;
++int peach_wmi_init(PeachWmi *, PeachHtc *, const PeachWmiOps *);
++/* HTC service callback: validates/copies capabilities, never allocates/waits. */
++void peach_wmi_receive(PeachWmi *, const void *, size_t);
++/* Actual SERVICE_READY -> host memory/INIT -> successful READY. Not scan,
++ * association, data transport or an iOS network-interface implementation. */
++int peach_wmi_bootstrap(PeachWmi *);
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* HTT v3 control ABI: fw-api/fw/htt.h, vendor dp/wifi3.0/dp_htt.c. */
++#include "PeachHtt.h"
++#if defined(KERNEL)
++#include <libkern/libkern.h>
++#else
++#include <string.h>
++#endif
++static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++int peach_htt_init(PeachHtt *h, PeachHtc *htc)
++{
++    if (!h || !htc) return PeachMhiInvalid;
++    memset(h, 0, sizeof(*h)); h->htc = htc;
++    h->address_bits = 32; h->metadata_version = 1;
++    return 0;
++}
++void peach_htt_receive(PeachHtt *h, const void *packet, size_t n)
++{
++    const unsigned char *p = packet;
++    if (!h || h->error) return;
++    if (!p || n < 4 || (n & 3)) { h->error = PeachCeProtocol; return; }
++    uint32_t word = u32(p);
++    /* Until DP rings and peers are configured, only VERSION_CONF is valid. */
++    if ((word & 255) || !h->requested || h->confirmed) { h->error = PeachCeProtocol; return; }
++    h->major = (word >> 16) & 255; h->minor = (word >> 8) & 255;
++    if (h->major != 3) { h->error = PeachCeProtocol; return; }
++    unsigned seen = 0;
++    for (size_t off = 4; off < n;) {
++        word = u32(p + off);
++        unsigned tag = word & 255, bytes = (word >> 8) & 255, value = word >> 16;
++        /* HTT option length includes its header, unlike a WMI TLV length. */
++        if (bytes < 4 || (bytes & 3) || bytes > n - off || (tag < 32 && (seen & (1u << tag)))) {
++            h->error = PeachCeProtocol; return;
++        }
++        if (tag < 32) seen |= 1u << tag;
++        if (tag == 1) {
++            if (bytes != 4 || value > 1) { h->error = PeachCeProtocol; return; }
++            h->address_bits = value ? 64 : 32;
++        } else if (tag == 5) {
++            if (bytes != 4 || value != 1) { h->error = PeachCeProtocol; return; }
++            h->metadata_version = value;
++        } else {
++            /* No optional HTT feature was requested. Do not accept an
++             * unsolicited format change and later misinterpret DMA. */
++            h->error = PeachCeProtocol; return;
++        }
++        off += bytes;
++    }
++    h->confirmed = 1;
++    if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
++        "HTT VERSION_CONF major/minor", h->major, h->minor);
++}
++int peach_htt_negotiate(PeachHtt *h)
++{
++    if (!h || !h->htc || !h->htc->started || h->requested) return PeachMhiInvalid;
++    if (h->error) return h->error;
++    uint32_t request = 0;
++    uint64_t end = h->htc->ops.now_us(h->htc->ops.context) + 10000000;
++    h->requested = 1;
++    int err;
++    while ((err = peach_htc_send(h->htc, 0x300, &request, 4)) == PeachCeFull) {
++        err = peach_htc_poll(h->htc);
++        if (err || h->error) return h->error = err ? err : h->error;
++        if (h->htc->ops.now_us(h->htc->ops.context) >= end) return h->error = PeachMhiTimeout;
++        h->htc->ops.sleep_us(h->htc->ops.context, 1000);
++    }
++    if (err) return h->error = err;
++    while (!h->confirmed) {
++        err = peach_htc_poll(h->htc);
++        if (err || h->error) return h->error = err ? err : h->error;
++        if (h->htc->ops.now_us(h->htc->ops.context) >= end) return h->error = PeachMhiTimeout;
++        if (!h->confirmed) h->htc->ops.sleep_us(h->htc->ops.context, 1000);
++    }
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachHtt.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_HTT_H
++#define PEACH_HTT_H
++#include "PeachHtc.h"
++typedef struct {
++    PeachHtc *htc;
++    unsigned requested, confirmed, major, minor, address_bits, metadata_version;
++    int error;
++} PeachHtt;
++int peach_htt_init(PeachHtt *, PeachHtc *);
++void peach_htt_receive(PeachHtt *, const void *, size_t);
++/* Real VERSION_REQ/CONF, retaining implicit V1 TCL metadata. A completed
++ * negotiation is not a configured DP path or evidence of packet exchange. */
++int peach_htt_negotiate(PeachHtt *);
++#endif

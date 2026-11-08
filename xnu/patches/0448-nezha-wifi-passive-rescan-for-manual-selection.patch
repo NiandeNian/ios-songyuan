@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -347,6 +347,9 @@
+         pos += 2 + size;
+     }
+     if (!ssid) return;
++    if (w->scan_target_bytes && (ssid_bytes != w->scan_target_bytes ||
++        memcmp(ssid, w->scan_target_ssid, ssid_bytes) ||
++        (w->scan_target_bssid_valid && memcmp(frame + 16, w->scan_target_bssid, 6)))) return;
+     int rssi = (int32_t)u32(p + 48);
+     if (rssi < -127 || rssi > 0) rssi = -128;
+     for (i = 0; i < w->bss_count && memcmp(w->bss[i].bssid, frame + 16, 6); i++) {}
+@@ -907,6 +910,20 @@
+     report(w, "WMI passive scan actual BSS/dropped", w->bss_count, w->bss_dropped);
+     return 0;
+ }
++int peach_wmi_passive_scan_target(PeachWmi *w, const unsigned char *ssid, unsigned bytes,
++                                   const unsigned char *bssid)
++{
++    if (!w || !ssid || !bytes || bytes > 32 || w->scan_active || w->scan_target_bytes ||
++        (bssid && ((bssid[0] & 1) || !memcmp(bssid, "\0\0\0\0\0\0", 6))))
++        return PeachMhiInvalid;
++    memcpy(w->scan_target_ssid, ssid, bytes); w->scan_target_bytes = bytes;
++    w->scan_target_bssid_valid = bssid != NULL;
++    if (bssid) memcpy(w->scan_target_bssid, bssid, 6);
++    report(w, "WMI manual passive scan target bytes/BSSID filter", bytes, bssid != NULL);
++    int err = peach_wmi_passive_scan(w);
++    w->scan_target_bytes = w->scan_target_bssid_valid = 0;
++    return err;
++}
+ int peach_wmi_request_radio_stats(PeachWmi *w)
+ {
+     if (!w || !w->ready || w->scan_active) return PeachMhiInvalid;
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -97,6 +97,8 @@
+     int error;
+     PeachWmiMemory memory[PEACH_WMI_MEMORY_REQUESTS];
+     unsigned char command[2048];
++    unsigned scan_target_bytes, scan_target_bssid_valid;
++    unsigned char scan_target_ssid[32], scan_target_bssid[6];
+ } PeachWmi;
+ int peach_wmi_init(PeachWmi *, PeachHtc *, const PeachWmiOps *);
+ /* HTC service callback: validates/copies capabilities, never allocates/waits. */
+@@ -118,6 +120,10 @@
+  * failure event; a new scan is allowed. Timeout or transport failure still
+  * requires containment because the firmware may retain the old request. */
+ int peach_wmi_passive_scan(PeachWmi *);
++/* One manual selection only; filters received BSS records on the host.
++ * It sends no directed probe and clears the filter before returning. */
++int peach_wmi_passive_scan_target(PeachWmi *, const unsigned char *ssid, unsigned bytes,
++                                   const unsigned char *bssid);
+ /* vdev0 only; type 0=self, 1=BSS. Optional firmware confirmation is waited
+  * for only when advertised. The caller must ALSO wait for a real HTT map.
+  * Delete retains the peer slot/queue memory; no drain or cache flush implied. */
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1339,6 +1339,23 @@
+ }
+ 
+ static int wifi_restart_mission(PeachMhiDma calibration);
++static unsigned wifi_select_bss(const PeachControlJoinData *j)
++{
++    unsigned selected = PEACH_WMI_BSS_ENTRIES;
++    for (unsigned i = 0; i < wifi_wmi.bss_count; i++) {
++        const PeachWmiBss *b = &wifi_wmi.bss[i];
++        if (b->ssid_bytes != j->ssid_bytes || memcmp(b->ssid, j->ssid, j->ssid_bytes) ||
++            (j->bssid_valid && memcmp(b->bssid, j->bssid, 6))) continue;
++        int rejected = peach_station_candidate(b, j->security);
++        if (rejected) {
++            printf("NEZHA WIFI: candidate rejected %d MHz %u capability %#x DTIM %u IE bytes/truncated %u/%u\n",
++                rejected, b->frequency, b->capability, b->dtim_period, b->ie_bytes, b->ies_truncated);
++            continue;
++        }
++        if (selected == PEACH_WMI_BSS_ENTRIES || b->rssi > wifi_wmi.bss[selected].rssi) selected = i;
++    }
++    return selected;
++}
+ static int wifi_connection_request(void)
+ {
+     if (!peach_net_take_request(&wifi_request)) return 0;
+@@ -1382,18 +1399,16 @@
+     }
+     peach_net_status(&wifi_wmi, PeachNetAssociating, 0);
+     PeachControlJoinData *j = &wifi_request.join;
+-    unsigned selected = PEACH_WMI_BSS_ENTRIES;
+-    for (unsigned i = 0; i < wifi_wmi.bss_count; i++) {
+-        const PeachWmiBss *b = &wifi_wmi.bss[i];
+-        if (b->ssid_bytes != j->ssid_bytes || memcmp(b->ssid, j->ssid, j->ssid_bytes) ||
+-            (j->bssid_valid && memcmp(b->bssid, j->bssid, 6))) continue;
+-        int rejected = peach_station_candidate(b, j->security);
+-        if (rejected) {
+-            printf("NEZHA WIFI: candidate rejected %d MHz %u capability %#x DTIM %u IE bytes/truncated %u/%u\n",
+-                rejected, b->frequency, b->capability, b->dtim_period, b->ie_bytes, b->ies_truncated);
+-            continue;
+-        }
+-        if (selected == PEACH_WMI_BSS_ENTRIES || b->rssi > wifi_wmi.bss[selected].rssi) selected = i;
++    unsigned selected = wifi_select_bss(j);
++    if (selected == PEACH_WMI_BSS_ENTRIES) {
++        /* A manual selection may have fallen out of a later full scan.
++         * One host-filtered passive sweep gives that selected AP a slot. */
++        wifi_step = "passive rescan for manual selection";
++        err = peach_wmi_passive_scan_target(&wifi_wmi, j->ssid, j->ssid_bytes,
++            j->bssid_valid ? j->bssid : NULL);
++        if (err == PeachWmiScanFailed) err = 0;
++        if (err) goto clear_request;
++        selected = wifi_select_bss(j);
+     }
+     if (selected == PEACH_WMI_BSS_ENTRIES) {
+         printf("NEZHA WIFI: no usable candidate in %u BSS, scan dropped %u\n",

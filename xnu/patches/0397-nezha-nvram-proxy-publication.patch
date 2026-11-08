@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -136,6 +136,15 @@
+ void
+ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+ {
++#if defined(PANDORA)
++	/* /options is already initialized from the boot-time NVRAM proxy. Keep
++	 * the normal publication and DT traversal: AppleImage4 waits for both
++	 * IODTNVRAM and IONVRAM before its start can finish. There is no flash
++	 * controller on this port; the existing proxy remains volatile. */
++	IODTPlatformExpert::processTopLevel(root);
++	publishResource("IONVRAM");
++	IOLog("NEZHA: boot NVRAM proxy published (volatile)\n");
++#else
+ 	/*
+ 	 * The stock implementation requires an Apple NVRAM /options node.
+ 	 * SWEET has no NVRAM controller; publish real CPU/device nodes without
+@@ -147,6 +156,7 @@
+ 		cpus->release();
+ 	}
+ 	createNubs(this, IODTFindMatchingEntries(root, kIODTExclusive, excludeList()));
++#endif
+ 
+ 	/*
+ 	 * No AppleARMIO driver publishes the /arm-io children: do it here so

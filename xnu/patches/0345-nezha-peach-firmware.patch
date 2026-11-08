@@ -1,0 +1,319 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -129,6 +129,7 @@
+ bsd/dev/qcom/QcomGlink.c		standard
+ bsd/dev/qcom/ShengGpr.c			standard
+ bsd/dev/qcom/FatVolume.c		standard
++bsd/dev/qcom/PeachMhiFirmware.c	standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -61,6 +61,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ void pandora_adsp_init(void);
++int pandora_firmware_pread(const char *name, uint64_t off, void *dst, size_t len, uint64_t *size);
+ 
+ #define AD_PAS_MAIN      1u
+ #define AD_PAS_DTB       36u
+@@ -477,6 +478,8 @@
+ static unsigned ad_nfiles;
+ static FatVolume ad_fat;
+ static int ad_fat_state;                 /* 0 not tried, 1 mounted, -1 not usable */
++LCK_GRP_DECLARE(ad_fat_grp, "pandora_firmware");
++LCK_MTX_DECLARE(ad_fat_lock, &ad_fat_grp);
+ 
+ /* One file: in the firmware partition's FAT, or in the pack. */
+ struct fw_file {
+@@ -527,7 +530,7 @@
+ 
+ /* The firmware partition's FAT, once. */
+ static int
+-fw_mount(void)
++fw_mount_locked(void)
+ {
+ 	if (ad_fat_state) {
+ 		return ad_fat_state > 0 ? 0 : ENOENT;
+@@ -558,13 +561,24 @@
+ }
+ 
+ static int
++fw_mount(void)
++{
++	lck_mtx_lock(&ad_fat_lock);
++	int err = fw_mount_locked();
++	lck_mtx_unlock(&ad_fat_lock);
++	return err;
++}
++
++static int
+ fw_open(const char *name, bool part, struct fw_file *f)
+ {
+ 	bzero(f, sizeof(*f));
+ 	if (part) {
+ 		char path[64];
+ 		snprintf(path, sizeof(path), "image/%s", name);
++		lck_mtx_lock(&ad_fat_lock);
+ 		int rc = fat_open(&ad_fat, path, &f->fat);
++		lck_mtx_unlock(&ad_fat_lock);
+ 		if (rc || f->fat.directory) {
+ 			return rc == FatNotFound ? ENOENT : EIO;
+ 		}
+@@ -588,9 +602,31 @@
+ 		return EINVAL;
+ 	}
+ 	if (f->in_fat) {
+-		return fat_read(&ad_fat, &f->fat, off, dst, (size_t)len) ? EIO : 0;
++		lck_mtx_lock(&ad_fat_lock);
++		int err = fat_read(&ad_fat, &f->fat, off, dst, (size_t)len) ? EIO : 0;
++		lck_mtx_unlock(&ad_fat_lock);
++		return err;
+ 	}
+ 	return pandora_fw_read(f->pack_off + off, dst, len);
++}
++
++/* Shared read-only firmware access for Peach MHI/QMI. The existing firmware
++ * volume supports nested paths (image/peach/...), so the 7.3 MiB amss20.bin
++ * need not be squeezed into the 2 MiB GPU/install pack. len=0 queries size.
++ * pandora_slot must name the Android active slot; never guess the other slot. */
++int
++pandora_firmware_pread(const char *name, uint64_t off, void *dst, size_t len, uint64_t *size)
++{
++	if (!name || !name[0] || name[0] == '/' || strnlen(name, 48) >= 48 ||
++	    strnstr(name, "..", 48) || (len && !dst)) {
++		return EINVAL;
++	}
++	int err = fw_mount();
++	struct fw_file f;
++	if (!err) err = fw_open(name, true, &f);
++	if (err) return err;
++	if (size) *size = f.size;
++	return fw_pread(&f, off, dst, len);
+ }
+ 
+ struct elf32_phdr {
+--- /dev/null
++++ b/bsd/dev/qcom/PeachMhiFirmware.c
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "PeachMhiFirmware.h"
++
++static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static uint32_t le32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++static void put64(uint8_t *p, uint64_t v)
++{
++    for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
++}
++
++/* Validate the two actual ELF32 images before any DMA publication. Preserve
++ * signed metadata/hash segments verbatim: do not rebuild/rebase these ELFs. */
++static int check_elf(PeachFirmwareRead read, void *ctx, uint64_t base, uint64_t size, uint16_t machine)
++{
++    uint8_t h[52], p[32];
++    if (size < sizeof(h)) return PeachMhiInvalid;
++    if (read(ctx, base, h, sizeof(h))) return PeachMhiIoError;
++    if (le32(h) != 0x464c457f || h[4] != 1 || h[5] != 1 || h[6] != 1 ||
++        le16(h + 16) != 2 || le16(h + 18) != machine || le32(h + 20) != 1 ||
++        le16(h + 40) != sizeof(h) || le16(h + 42) != sizeof(p)) return PeachMhiInvalid;
++    uint32_t offset = le32(h + 28);
++    unsigned count = le16(h + 44);
++    if (!count || count > 128 || offset < sizeof(h) ||
++        offset > size || (uint64_t)count * sizeof(p) > size - offset) return PeachMhiInvalid;
++    unsigned loadable = 0;
++    for (unsigned i = 0; i < count; i++) {
++        if (read(ctx, base + offset + i * sizeof(p), p, sizeof(p))) return PeachMhiIoError;
++        uint32_t off = le32(p + 4), bytes = le32(p + 16);
++        if (off > size || bytes > size - off) return PeachMhiInvalid;
++        if (le32(p) == 1) {
++            if (bytes > le32(p + 20)) return PeachMhiInvalid;
++            if (bytes) loadable++;
++        }
++    }
++    return loadable ? PeachMhiOk : PeachMhiInvalid;
++}
++
++static int valid_dma(const PeachMhiDma *b, size_t size)
++{
++    return b->bytes && size && b->capacity >= size && b->iova && !(b->iova & 15) &&
++           (uint64_t)(size - 1) <= UINT64_MAX - b->iova;
++}
++
++int peach_mhi_firmware_stage(PeachMhiFirmware *f, PeachFirmwareRead read, void *ctx, uint64_t bytes)
++{
++    if (!f || !read || f->phase || bytes <= PEACH_MHI_SEGMENT_BYTES ||
++        bytes > (uint64_t)(PEACH_MHI_MAX_SEGMENTS + 1) * PEACH_MHI_SEGMENT_BYTES)
++        return PeachMhiInvalid;
++    uint64_t rest = bytes - PEACH_MHI_SEGMENT_BYTES;
++    unsigned count = (unsigned)((rest + PEACH_MHI_SEGMENT_BYTES - 1) / PEACH_MHI_SEGMENT_BYTES);
++    if (!valid_dma(&f->sbl, PEACH_MHI_SEGMENT_BYTES) || !valid_dma(&f->vectors, count * 16))
++        return PeachMhiInvalid;
++    for (unsigned i = 0; i < count; i++) {
++        size_t n = rest > PEACH_MHI_SEGMENT_BYTES ? PEACH_MHI_SEGMENT_BYTES : (size_t)rest;
++        if (!valid_dma(&f->amss[i], n)) return PeachMhiInvalid;
++        rest -= n;
++    }
++    int error = check_elf(read, ctx, 0, PEACH_MHI_SEGMENT_BYTES, 40); /* ARM TME */
++    if (!error) error = check_elf(read, ctx, PEACH_MHI_SEGMENT_BYTES,
++                                bytes - PEACH_MHI_SEGMENT_BYTES, 164); /* QDSP6 */
++    if (error) return error;
++    if (read(ctx, 0, f->sbl.bytes, PEACH_MHI_SEGMENT_BYTES)) return PeachMhiIoError;
++    rest = bytes - PEACH_MHI_SEGMENT_BYTES;
++    uint64_t off = PEACH_MHI_SEGMENT_BYTES;
++    for (unsigned i = 0; i < count; i++) {
++        size_t n = rest > PEACH_MHI_SEGMENT_BYTES ? PEACH_MHI_SEGMENT_BYTES : (size_t)rest;
++        if (read(ctx, off, f->amss[i].bytes, n)) return PeachMhiIoError;
++        put64((uint8_t *)f->vectors.bytes + 16 * i, f->amss[i].iova);
++        put64((uint8_t *)f->vectors.bytes + 16 * i + 8, n);
++        off += n;
++        rest -= n;
++    }
++    f->count = count;
++    f->phase = 1;
++    return PeachMhiOk;
++}
++
++static int valid_io(const PeachMhiIo *io, uint32_t session)
++{
++    return io && io->read32 && io->write32 && io->sync && io->now_us && io->sleep_us &&
++           io->bar_bytes >= 0x100 && session && session <= 0x3fffffff;
++}
++
++static int discover(PeachMhiFirmware *f, const PeachMhiIo *io)
++{
++    if (io->read32(io->context, 0x28, &f->bhi) || io->read32(io->context, 0x2c, &f->bhie))
++        return PeachMhiIoError;
++    if ((f->bhi & 3) || (f->bhie & 3) || f->bhi < 0x100 || f->bhie < 0x100 ||
++        f->bhi > io->bar_bytes - 0x40 || f->bhie > io->bar_bytes - 0x48)
++        return PeachMhiInvalid;
++    return PeachMhiOk;
++}
++
++static int write32(const PeachMhiIo *io, uint32_t offset, uint32_t value)
++{
++    return io->write32(io->context, offset, value) ? PeachMhiIoError : PeachMhiOk;
++}
++
++static int wait_status(PeachMhiFirmware *f, const PeachMhiIo *io, uint32_t offset, uint32_t session)
++{
++    uint64_t start = io->now_us(io->context);
++    for (;;) {
++        if (io->read32(io->context, offset, &f->last_status)) return PeachMhiIoError;
++        unsigned state = f->last_status >> 30;
++        if (state == 2 && (!session || (f->last_status & 0x3fffffff) == session)) return PeachMhiOk;
++        if (state == 3) return PeachMhiDeviceError;
++        if (io->now_us(io->context) - start >= 10000000) return PeachMhiTimeout;
++        io->sleep_us(io->context, 1000);
++    }
++}
++
++int peach_mhi_download_sbl(PeachMhiFirmware *f, const PeachMhiIo *io, uint32_t session)
++{
++    if (!f || f->phase != 1 || !valid_io(io, session)) return PeachMhiInvalid;
++    int error = discover(f, io);
++    if (error) return error;
++    uint32_t ee;
++    if (io->read32(io->context, f->bhi + 0x28, &ee)) return PeachMhiIoError;
++    if (ee != 0) return PeachMhiWrongEnvironment;
++    io->sync(io->context, &f->sbl, PEACH_MHI_SEGMENT_BYTES);
++    f->phase = 4; /* An attempted transfer requires containment/reset on failure. */
++    if ((error = write32(io, f->bhi + 0x2c, 0)) ||
++        (error = write32(io, f->bhi + 0x0c, (uint32_t)(f->sbl.iova >> 32))) ||
++        (error = write32(io, f->bhi + 0x08, (uint32_t)f->sbl.iova)) ||
++        (error = write32(io, f->bhi + 0x10, PEACH_MHI_SEGMENT_BYTES)) ||
++        (error = write32(io, f->bhi + 0x18, session))) return error;
++    error = wait_status(f, io, f->bhi + 0x2c, 0);
++    if (!error) f->phase = 2;
++    return error;
++}
++
++int peach_mhi_download_amss(PeachMhiFirmware *f, const PeachMhiIo *io, uint32_t session)
++{
++    if (!f || f->phase != 2 || !valid_io(io, session)) return PeachMhiInvalid;
++    uint32_t ee;
++    if (io->read32(io->context, f->bhi + 0x28, &ee)) return PeachMhiIoError;
++    if (ee != 1) return PeachMhiWrongEnvironment;
++    const uint8_t *vectors = f->vectors.bytes;
++    for (unsigned i = 0; i < f->count; i++)
++        io->sync(io->context, &f->amss[i], le32(vectors + i * 16 + 8));
++    io->sync(io->context, &f->vectors, f->count * 16);
++    f->phase = 4;
++    int error;
++    if ((error = write32(io, f->bhie + 0x30, (uint32_t)(f->vectors.iova >> 32))) ||
++        (error = write32(io, f->bhie + 0x2c, (uint32_t)f->vectors.iova)) ||
++        (error = write32(io, f->bhie + 0x34, f->count * 16)) ||
++        (error = write32(io, f->bhie + 0x3c, session))) return error;
++    error = wait_status(f, io, f->bhie + 0x44, session);
++    if (!error) f->phase = 3;
++    return error;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachMhiFirmware.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#ifndef PEACH_MHI_FIRMWARE_H
++#define PEACH_MHI_FIRMWARE_H
++#include <stddef.h>
++#include <stdint.h>
++
++/* Peach amss20.bin: 512 KiB TME/SBL followed by the WLAN ELF, not a single
++ * WCN7850 image. These routines only prepare/download firmware. They do not
++ * establish MHI channels, associate with an AP, or publish a network device. */
++#define PEACH_MHI_SEGMENT_BYTES (512u * 1024u)
++#define PEACH_MHI_MAX_SEGMENTS 32u
++
++enum {
++    PeachMhiOk = 0,
++    PeachMhiInvalid = -1,
++    PeachMhiIoError = -2,
++    PeachMhiTimeout = -3,
++    PeachMhiDeviceError = -4,
++    PeachMhiWrongEnvironment = -5,
++};
++
++typedef int (*PeachFirmwareRead)(void *context, uint64_t offset, void *to, size_t size);
++typedef struct {
++    void *bytes;
++    uint64_t iova;
++    size_t capacity;
++} PeachMhiDma;
++
++typedef struct {
++    void *context;
++    /* Offsets are in the endpoint's BAR0. Accessors must contain bus faults.
++     * write32 must order posted MMIO writes; sync publishes CPU DMA writes. */
++    int (*read32)(void *, uint32_t offset, uint32_t *value);
++    int (*write32)(void *, uint32_t offset, uint32_t value);
++    void (*sync)(void *, const PeachMhiDma *, size_t size);
++    uint64_t (*now_us)(void *);
++    void (*sleep_us)(void *, unsigned);
++    uint32_t bar_bytes;
++} PeachMhiIo;
++
++typedef struct {
++    PeachMhiDma sbl;
++    PeachMhiDma amss[PEACH_MHI_MAX_SEGMENTS];
++    PeachMhiDma vectors; /* little-endian {u64 IOVA, u64 length} pairs */
++    unsigned count;
++    uint32_t last_status;
++    uint32_t bhi, bhie;
++    unsigned phase; /* 0 unprepared, 1 staged, 2 SBL done, 3 AMSS done, 4 error/reset required */
++} PeachMhiFirmware;
++
++/* DMA buffers must already belong to the endpoint's isolated SMMU domain.
++ * Keep ALL buffers mapped until reset/disconnection has stopped endpoint DMA,
++ * including on an error/timeout. This layer never frees DMA memory. */
++int peach_mhi_firmware_stage(PeachMhiFirmware *, PeachFirmwareRead, void *context,
++                            uint64_t file_bytes);
++/* Call with PCIe/power/DMA ready and EE=PBL. session is a fresh nonzero 30-bit
++ * value supplied by the kernel RNG. These functions sleep and need a worker. */
++int peach_mhi_download_sbl(PeachMhiFirmware *, const PeachMhiIo *, uint32_t session);
++/* The host must first finish RESET->READY, program MHI contexts/event rings,
++ * enter M0 and wait for EE=SBL. This call checks EE; it cannot replace that
++ * host state machine. The caller must verify EE=AMSS after it succeeds. */
++int peach_mhi_download_amss(PeachMhiFirmware *, const PeachMhiIo *, uint32_t session);
++#endif

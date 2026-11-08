@@ -1,0 +1,44 @@
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -268,9 +268,16 @@
+         (!memcmp(frame + 4, w->mac, 6) || (frame[4] & 1))) {
+         unsigned subtype = fc & 0xfc;
+         if (subtype == 0xb0 || subtype == 0x10 || subtype == 0x30 ||
+-            subtype == 0xa0 || subtype == 0xc0 || subtype == 0xd0) {
+-            if ((fc & 0x4000) || bytes > PEACH_WMI_MGMT_BYTES ||
+-                w->mgmt_count == PEACH_WMI_MGMT_FRAMES) { bad(w); return; }
++            subtype == 0xa0 || subtype == 0xc0) {
++            /* These are on-air packets, not firmware control responses.
++             * This legacy STA implements no action/PMF/fragment path. An
++             * unsupported or malformed frame must not poison the WMI
++             * transport, nor may ordinary RX pressure stop the radio. */
++            unsigned response = subtype == 0xb0 || subtype == 0x10 || subtype == 0x30;
++            if ((fc & 0x4400) || (u16(frame + 22) & 15) ||
++                bytes < (response ? 30u : 26u) || bytes > PEACH_WMI_MGMT_BYTES ||
++                (response && memcmp(frame + 4, w->mac, 6))) return;
++            if (w->mgmt_count == PEACH_WMI_MGMT_FRAMES) { w->mgmt_dropped++; return; }
+             PeachWmiMgmt *m = &w->mgmt[(w->mgmt_head + w->mgmt_count) % PEACH_WMI_MGMT_FRAMES];
+             m->bytes = bytes; m->frequency = frequency; m->rssi = (int32_t)u32(p + 48);
+             memcpy(m->frame, frame, bytes); w->mgmt_count++;
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -86,7 +86,7 @@
+     unsigned char vdev_bssid[6];
+     PeachMhiDma mgmt_dma;
+     unsigned mgmt_in_flight, mgmt_done, mgmt_id, mgmt_status;
+-    unsigned mgmt_head, mgmt_count;
++    unsigned mgmt_head, mgmt_count, mgmt_dropped;
+     PeachWmiMgmt mgmt[PEACH_WMI_MGMT_FRAMES];
+     PeachWmiKey keys[5]; /* pairwise slot0, GTK indices 0..3 in slots1..4 */
+     unsigned key_pending, key_done, key_index, key_group;
+--- a/bsd/dev/qcom/PeachStation.c
++++ b/bsd/dev/qcom/PeachStation.c
+@@ -104,7 +104,7 @@
+ int peach_station_candidate(const PeachWmiBss *b, unsigned security)
+ {
+     if (!b || security > PeachStationWpa2Psk || !b->ssid_bytes || b->ssid_bytes > 32 ||
+-        b->ies_truncated || (b->capability & 3) != 1 ||
++        b->ies_truncated || !b->beacon_interval || !b->dtim_period || (b->capability & 3) != 1 ||
+         (b->frequency >= 2500 && (b->frequency < 4900 || b->frequency >= 5925)))
+         return PeachMhiInvalid;
+     int err = bss_security(security, b);

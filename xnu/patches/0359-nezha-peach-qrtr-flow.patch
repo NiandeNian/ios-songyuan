@@ -1,0 +1,44 @@
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -7,6 +7,8 @@
+ #include <string.h>
+ 
+ #define CTRL 0xfffffffeu
++#define QRTR_TX_FLOW_LOW 5u
++#define QRTR_TX_FLOW_HIGH 10u
+ #define WTRY(expr) do { int e_ = (expr); if (e_) return e_; } while (0)
+ static uint16_t u16(const unsigned char *p) { return p[0] | (uint16_t)p[1] << 8; }
+ static uint32_t u32(const unsigned char *p)
+@@ -164,8 +166,11 @@
+     }
+     if (size < 20 || u32(p) != type) { w->error = PeachWlfwProtocol; return; }
+     if (type == 7) {
+-        if (dn == w->local_node && u32(p + 4) == w->local_node &&
+-            u32(p + 8) == w->local_port && sn == w->server_node && sp == w->server_port)
++        /* RESUME_TX names the receiver of the original DATA, i.e. this
++         * flow's remote WLFW endpoint. qrtr_tx_resume keys by that payload,
++         * not by the sender's local endpoint or the outer source port. */
++        if (w->server && dn == w->local_node && sn == w->server_node &&
++            u32(p + 4) == w->server_node && u32(p + 8) == w->server_port)
+             w->flow_pending = 0;
+         return;
+     }
+@@ -236,15 +241,15 @@
+ {
+     if (w->awaiting || !w->server || bytes > sizeof(w->packet) - 42) return PeachMhiInvalid;
+     uint64_t end = now(w) + 10000000;
+-    while (w->flow_pending >= 16 || w->control_count) {
++    while (w->flow_pending >= QRTR_TX_FLOW_HIGH || w->control_count) {
+         WTRY(peach_wlfw_poll(w));
+         if (now(w) >= end) return PeachMhiTimeout;
+-        if (w->flow_pending >= 16 || w->control_count) pause_poll(w);
++        if (w->flow_pending >= QRTR_TX_FLOW_HIGH || w->control_count) pause_poll(w);
+     }
+     if (!++w->transaction) ++w->transaction;
+     w->awaiting = w->transaction; w->message = (uint16_t)message; w->response_ready = 0;
+     header(w->packet, 1, w->local_node, w->local_port, w->server_node, w->server_port,
+-        (unsigned)bytes + 7, w->flow_pending >= 7);
++        (unsigned)bytes + 7, w->flow_pending + 1 == QRTR_TX_FLOW_LOW);
+     w->packet[32] = 0; /* QMI_REQUEST */
+     p16(w->packet + 33, w->awaiting); p16(w->packet + 35, message); p16(w->packet + 37, (unsigned)bytes);
+     size_t length = (39 + bytes + 3) & ~(size_t)3;

@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -1918,7 +1918,10 @@
+ static vm_offset_t gpu_pool_va;
+ static uint64_t gpu_pool_pa, gpu_pool_bytes;
+ static bool gpu_pool_carved;    /* RAM the loader kept from XNU (ADT pandora-gpu-pool), mapped write-combined */
+-#define GPU_POOL_EXTENTS  512u
++#define GPU_MAX_BOS       4096u
++/* N live pool BOs and the one level-13 buffer leave at most N + 2 free
++ * intervals, including alignment gaps. Releasing a BO must never lose space. */
++#define GPU_POOL_EXTENTS  (GPU_MAX_BOS + 2u)
+ static uint64_t gpu_ext_off[GPU_POOL_EXTENTS], gpu_ext_len[GPU_POOL_EXTENTS];
+ static unsigned gpu_next;
+ 
+@@ -1966,18 +1969,20 @@
+ }
+ 
+ /* Zero pool bytes [off, off + len), a window at a time for the carved pool. */
+-static void
++static bool
+ gpu_pool_zero(uint64_t off, uint64_t len)
+ {
+ 	for (uint64_t at = 0; at < len; at += GPU_POOL_WINDOW) {
+ 		uint64_t n = MIN(GPU_POOL_WINDOW, len - at);
+ 		vm_offset_t va = gpu_pool_map(off + at, n);
+-		if (va) {
+-			bzero((void *)va, (size_t)n);
+-			gpu_pool_unmap(va, off + at, n);
+-		}
++		if (!va) {
++			return false;
++		}
++		bzero((void *)va, (size_t)n);
++		gpu_pool_unmap(va, off + at, n);
+ 	}
+ 	gpu_pool_sync(off, len, true);
++	return true;
+ }
+ 
+ static void
+@@ -2296,7 +2301,6 @@
+ LCK_GRP_DECLARE(gpu_lck_grp, "pandora_gpu");
+ LCK_MTX_DECLARE(gpu_lock, &gpu_lck_grp);
+ 
+-#define GPU_MAX_BOS       4096u
+ #define GPU_MAX_CLIENTS   15u       /* 0332: the 4 GiB windows at 4..64 GiB of the 36-bit space (4 with the 32-bit layout) */
+ #define GPU_MAX_IBS       128u      /* NativeAdrenoAbiMaxBuffers (tools/turnip/abi_128.py, 0194) */
+ struct gpu_bo {
+@@ -2655,11 +2659,28 @@
+ 	lck_mtx_lock(&gpu_lock);
+ 	const unsigned i = gpu_bo_free_slot();   /* 0331 */
+ 	const uint64_t off = i < GPU_MAX_BOS ? gpu_pool_alloc(bytes, 1ull << align_log2) : ~0ull;
++	if (off == ~0ull) {
++		static unsigned reported;
++		if (reported++ < 8) {
++			uint64_t free_bytes = 0, largest = 0;
++			for (unsigned j = 0; j < gpu_next; j++) {
++				free_bytes += gpu_ext_len[j];
++				largest = MAX(largest, gpu_ext_len[j]);
++			}
++			printf("PANDORA GPU: BO allocation refused: client %d bytes %#llx align %u "
++			    "slot %u free %#llx largest %#llx extents %u\n", client, bytes, align_log2,
++			    i, free_bytes, largest, gpu_next);
++		}
++	}
+ 	if (off != ~0ull) {
+ 		struct gpu_bo *b = &gpu_bos[i];
+ 		/* Zeroed, and out of the CPU caches when the kernel's view is cacheable: the
+ 		 * client maps it write-combined and the GPU reads it non-cacheably. */
+-		gpu_pool_zero(off, bytes);
++		if (!gpu_pool_zero(off, bytes)) {
++			gpu_pool_free(off, bytes);
++			lck_mtx_unlock(&gpu_lock);
++			return ENOMEM;
++		}
+ 		*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen, .off = off, .bytes = bytes };
+ 		*handle = ((uint64_t)b->gen << 32) | (i + 1);
+ 		err = 0;

@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -795,6 +795,15 @@
+     tlv(p, TAG_ARRAY, 0); p += 4; /* no MLO MAC; same ABI as native non-MLO vdev */
+     WTRY(w, send_command(w, 0x5001, (size_t)(p - w->command)));
+     w->vdev_sent = 1; /* submission only: this ABI has no VDEV_CREATE ACK */
++    /* Keep the firmware's exception path consistent with the Ethernet-II
++     * TCL bank and RX resource configuration, including pre-key EAPOL. */
++    const unsigned params[] = {0x30, 0x5b}; /* TX_ENCAP_TYPE / RX_DECAP_TYPE */
++    for (unsigned i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
++        memset(w->command, 0, 20); tlv(w->command + 4, 95, 12);
++        p32(w->command + 12, params[i]); p32(w->command + 16, 2);
++        WTRY(w, send_command(w, 0x5008, 20));
++    }
++    report(w, "WMI vdev TX/RX Ethernet encapsulation submitted", 2, 2);
+     return 0;
+ }
+ int peach_wmi_passive_scan(PeachWmi *w)

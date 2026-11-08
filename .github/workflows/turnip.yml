@@ -1,0 +1,191 @@
+name: turnip
+
+# Turnip (Mesa freedreno Vulkan) with UniXNU's Darwin kernel backend, cross-built for iOS 16
+# arm64, plus tools/vktest (tools/turnip/build_ios.sh). Mesa, UniXNU's patches and NativeAdreno's
+# ABI header are fetched at pinned commits; nothing from them is committed here.
+on:
+  workflow_dispatch:
+  # A push that touches the build also starts it (the repository is public: no minute limit)
+  push:
+    paths:
+      - .github/workflows/turnip.yml
+      - tools/turnip/**
+      - tools/vktest/**
+      - tools/metal/**
+      - wsl/adreno/NativeAdrenoABI.h
+
+concurrency:
+  group: turnip-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UNIXNU_SHA: 1a01c2afa197d975d04da892325c56b6b14aaecb
+  NATIVEADRENO_SHA: b686b9054f57d393c80195b82568a09f8ca106a2
+  MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  # UniXNU's pins for its Metal plugin (drivers/NativeMetal submodule, gpu-metal-vulkan-inputs.json)
+  NATIVEMETAL_SHA: ce5e19e33e05e1873d38d818e23cabfe0ac708c3
+  M2V_SHA: 720ef1ce9ae2a2068999a8675717418b9416283e
+  ADRENOPM4_SHA: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
+  NATIVEMOBILEDISPLAY_SHA: 8666a9950c9699b368931d18cac92c0fdb2ce9c0
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: write         # the rolling turnip-ci pre-release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          brew install glslang bison flex ninja
+          python3 -m venv venv
+          echo "$PWD/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Sources
+        run: |
+          mkdir -p out
+          exec > >(tee -a out/build.log) 2>&1
+          fetch() {  # DIR URL SHA
+            git init -q "$1"
+            git -C "$1" fetch -q --depth 1 "$2" "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          fetch unixnu https://github.com/UniXNU/UniXNU.git "$UNIXNU_SHA"
+          fetch nativeadreno https://github.com/UniXNU/NativeAdreno.git "$NATIVEADRENO_SHA"
+          fetch mesa https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa "$MESA_SHA" ||
+            fetch mesa https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SHA"
+          venv/bin/pip install -q -r unixnu/scripts/requirements-adreno-compiler.txt
+          for p in $(python3 -c 'import json; print(" ".join(json.load(open("unixnu/scripts/data/adreno-compiler-inputs.json"))["patches"]))'); do
+            echo "== $p"
+            git -C mesa apply --whitespace=nowarn "$PWD/unixnu/$p"
+          done
+          # How each render pass is drawn (GMEM or sysmem, with Turnip's reason), for the Metal plugin's log.
+          python3 tools/turnip/pandora_rpstats.py mesa
+          # Fence waits of up to 100 ms a kernel call, not 1 ms (the kernel sleeps until the fence's interrupt).
+          python3 tools/turnip/pandora_wait.py mesa
+          # A DSB SY where command streams in write-combined memory are handed on (post15's half-seen IB packet).
+          python3 tools/turnip/pandora_dsb.py mesa
+          # Checks that name a freed or zeroed BO before the GPU uses it (pandora-turnip: lines in syslog), as on the phone
+          # since post25 (out-root/turnip/bochk4).
+          python3 tools/turnip/pandora_bocheck.py mesa
+          python3 tools/turnip/pandora_bocheck_submit.py mesa
+          python3 tools/turnip/pandora_bocheck_finish.py mesa
+          # The GPU hang's root cause: darwin_bo_finish zeroed a tu_bo after the reap had already freed its slot, so a
+          # BO newly made in that slot lost its address (0331 kernel side, PLAN post27-post28).
+          python3 tools/turnip/pandora_bo_finish_order.py mesa
+          ls nativeadreno/NativeAdrenoABI.h
+          # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
+          python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h
+          cmp nativeadreno/NativeAdrenoABI.h <(tr -d '\r' < wsl/adreno/NativeAdrenoABI.h)
+
+      - name: Build
+        timeout-minutes: 20   # 2 min when healthy; run 12 hung here for over 30
+        run: |
+          mkdir -p out
+          set -o pipefail
+          bash tools/turnip/build_ios.sh mesa nativeadreno out 2>&1 | tee -a out/build.log
+
+      # Logs need a GitHub sign-in; the run's summary page does not, so errors and the tail go there.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### errors'; echo '```'
+            grep -E 'error:|FAILED:|fatal|ERROR:' out/build.log 2>/dev/null | head -60 || true
+            echo '```'; echo '### last lines'; echo '```'
+            tail -40 out/build.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnip-ios
+          path: |
+            out/libvulkan_freedreno.dylib
+            out/vktest
+            out/SHA256SUMS
+            out/build.log
+            out/build/tu/meson-logs/meson-log.txt
+          if-no-files-found: warn
+
+      # Artifacts need a sign-in to download; the rolling pre-release turnip-ci does not, so the
+      # test machine fetches the build from there (the owner agreed to publish these outputs).
+      - name: Pre-release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "commit $GITHUB_SHA run $GITHUB_RUN_NUMBER" > out/BUILD.txt
+          gh release view turnip-ci >/dev/null 2>&1 || gh release create turnip-ci --prerelease \
+            --target "$GITHUB_SHA" --title "Turnip CI build (test only)" \
+            --notes "Rolling test build from .github/workflows/turnip.yml: Turnip (Mesa, MIT) with UniXNU's Darwin kernel backend for iOS 16 arm64, and tools/vktest, for on-device GPU tests. Not a release. BUILD.txt names the commit."
+          # xz copies of the large files as well (16 MiB -> 1, 21 MiB -> 5): downloads here run at ~1 MB/min.
+          python3 -c 'import lzma,sys; open(sys.argv[1]+".xz","wb").write(lzma.compress(open(sys.argv[1],"rb").read(),preset=9))' out/libvulkan_freedreno.dylib
+          gh release upload turnip-ci out/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib.xz out/vktest out/SHA256SUMS out/BUILD.txt --clobber
+
+      # NativeMetal (UniXNU's Metal plugin, adapted to iOS 16) and tools/metal/mtltest: a failure here
+      # leaves the Turnip build above published.
+      - name: Metal plugin
+        id: metal
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          exec > >(tee -a out/metal.log) 2>&1
+          brew install shaderc spirv-tools llvm
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+          fetch() {  # DIR URL SHA
+            git init -q "$1"
+            git -C "$1" fetch -q --depth 1 "$2" "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          fetch nativemetal https://github.com/UniXNU/NativeMetal.git "$NATIVEMETAL_SHA"
+          fetch metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA"
+          rm -rf unixnu/kits/AdrenoPM4   # a submodule of UniXNU, not in its plain checkout
+          fetch unixnu/kits/AdrenoPM4 https://github.com/UniXNU/AdrenoPM4.git "$ADRENOPM4_SHA"
+          # NativeMetal includes ../NativeMobileDisplay/ (its sibling under UniXNU's drivers/)
+          fetch NativeMobileDisplay https://github.com/UniXNU/NativeMobileDisplay.git "$NATIVEMOBILEDISPLAY_SHA"
+          bash tools/metal/build_plugin.sh unixnu nativemetal nativeadreno metal2vulkan mesa out/metal
+
+      - name: Metal summary
+        if: always()
+        run: |
+          {
+            echo '### metal errors'; echo '```'
+            grep -E 'error(\[|:)|FAILED|fatal|ERROR' out/metal.log 2>/dev/null | head -60 || true
+            echo '```'; echo '### metal last lines'; echo '```'
+            tail -40 out/metal.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Metal pre-release
+        if: steps.metal.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out/metal
+          cp NativeAdrenoMetal.bundle/NativeAdrenoMetal NativeAdrenoMetal
+          cp NativeAdrenoMetal.bundle/Info.plist NativeAdrenoMetal.Info.plist
+          cp SHA256SUMS SHA256SUMS.metal
+          python3 -c 'import lzma,sys; open(sys.argv[1]+".xz","wb").write(lzma.compress(open(sys.argv[1],"rb").read(),preset=9))' NativeAdrenoMetal
+          gh release upload turnip-ci NativeAdrenoMetal NativeAdrenoMetal.xz NativeAdrenoMetal.Info.plist mtltest SHA256SUMS.metal --clobber
+
+      # The Metal build log on the pre-release too (artifacts need a sign-in; the release does not).
+      - name: Metal log to the pre-release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -f out/metal.log ] && gh release upload turnip-ci out/metal.log --clobber || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-log
+          path: out/metal.log
+          if-no-files-found: ignore

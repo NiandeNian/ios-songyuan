@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pandora_touch.c b/bsd/dev/pandora_touch.c
+--- a/bsd/dev/pandora_touch.c
++++ b/bsd/dev/pandora_touch.c
+@@ -1480,7 +1480,7 @@ pt_thread(void *arg, wait_result_t result)
+ 	pt_sleep(delay_s * 1000u);
+ 	pt.gcc = ml_io_map(PT_GCC_PA, 0x1f0000);
+-	pt.tlmm = ml_io_map(PT_TLMM_PA, 0xa0000);
++	pt.tlmm = ml_io_map(PT_TLMM_PA, (PT_AVDD + 1u) * 0x1000u);
+ 	pt.se = ml_io_map(PT_SE_PA, 0x4000);
+ 	if (!pt.gcc || !pt.tlmm || !pt.se) {
+ 		goto out;
+ 	}

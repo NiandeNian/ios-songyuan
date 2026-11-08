@@ -1,0 +1,84 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -285,6 +285,31 @@
+     }
+     w->awaiting = 0;
+     if (w->result) { report(w, "QMI rejected", message, w->remote_error); return PeachWlfwRejected; }
++    return 0;
++}
++int peach_wlfw_read_word(PeachWlfw *w, uint32_t offset, unsigned memory_type, uint32_t *value)
++{
++    if (!w || !value || (offset & 3) || w->phase != 9 || !w->firmware_ready || w->awaiting)
++        return PeachMhiInvalid;
++    if (w->error) return w->error;
++    /* Matching cnss_utils IDL: three mandatory u32 TLVs, exactly 21 bytes.
++     * memory_type belongs to ATHDIAG, not the WLFW DMA allocation enum. */
++    size_t n = scalar(w, 0, 1, offset, 4);
++    n = scalar(w, n, 2, memory_type, 4);
++    n = scalar(w, n, 3, 4, 4);
++    int err = request(w, 0x30, n);
++    if (err == PeachMhiTimeout) {
++        /* This read has no state or DMA ownership to roll back. Retire its
++         * transaction so a late reply cannot occupy the next request. */
++        w->awaiting = 0; w->response_ready = 0;
++    }
++    if (err) return err;
++    size_t bytes;
++    const unsigned char *data = field(w, w->response, w->response_bytes, 0x10, &bytes);
++    if (w->error) return w->error;
++    /* QMI_DATA_LEN is u16 on the wire; data_valid is TLV presence only. */
++    if (!data || bytes != 6 || u16(data) != 4) return PeachWlfwProtocol;
++    *value = u32(data + 2);
+     return 0;
+ }
+ static int wait_flag(PeachWlfw *w, const unsigned *flag)
+diff --git a/bsd/dev/qcom/PeachWlfw.h b/bsd/dev/qcom/PeachWlfw.h
+--- a/bsd/dev/qcom/PeachWlfw.h
++++ b/bsd/dev/qcom/PeachWlfw.h
+@@ -56,4 +56,7 @@
+ /* Call with CE DMA prepared, before enabling the host-owned CE rings. Does
+  * not advertise MSI, shadow-register acceleration, MLO or a working NIC. */
+ int peach_wlfw_wlan_enable(PeachWlfw *, const unsigned char mac[6]);
++/* Optional one-word diagnostic through WLFW ATHDIAG_READ (0x30). The
++ * firmware may reject it; no direct host access to protected SRAM. */
++int peach_wlfw_read_word(PeachWlfw *, uint32_t offset, unsigned memory_type, uint32_t *value);
+ #endif
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -801,6 +801,26 @@
+     wifi_barrier(NULL);
+     return 0;
+ }
++static int wifi_peer_metadata_diagnostic(void)
++{
++    int enabled = 0;
++    (void)PE_parse_boot_argn("nezha_wifi_fw_diag", &enabled, sizeof(enabled));
++    if (enabled != 1) return 0;
++    /* Fixed to the collected Nezha amss20 image. A PCIe read of this SRAM
++     * returned all ones followed by memss_security: never repeat that probe.
++     * Ask the running firmware instead, after WMI READY, using ATHDIAG space 0. */
++    uint32_t getter = 0;
++    int err = peach_wlfw_read_word(&wifi_wlfw, 0x015598b4, 0, &getter);
++    if (err) {
++        printf("NEZHA WIFI: V1A QMI readback unavailable %d result/error %u/%u; proof pending\n",
++            err, wifi_wlfw.result, wifi_wlfw.remote_error);
++        return wifi_fault || wifi_host.poisoned || wifi_wlfw.error ? err : 0;
++    }
++    printf("NEZHA WIFI: V1A QMI readback [0x015598b4]=%#x selected %u expected 0x01e2be08 match %u\n",
++        getter, wifi_wmi.peer_metadata_version,
++        wifi_wmi.peer_metadata_version == 2 && getter == 0x01e2be08);
++    return 0;
++}
+ static int wifi_packet_receive(void *c, const void *packet, size_t bytes, const PeachRxInfo *info)
+ {
+     (void)c;
+@@ -1213,6 +1233,7 @@
+             wifi_wmi.last_event, wifi_wmi.last_tag);
+         return EIO;
+     }
++    WIFI_TRY(wifi_peer_metadata_diagnostic());
+     wifi_phase = 13;
+     wifi_step = "HTT version negotiation";
+     err = peach_htt_negotiate(&wifi_htt);

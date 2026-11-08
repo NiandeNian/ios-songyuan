@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -457,6 +457,26 @@
+         if ((offset & 31) || offset > 896) { bad(w); return; }
+         for (unsigned i = 0; i < 128; i++)
+             if (u32(p + 8 + (i / 32) * 4) & (1u << (i & 31))) add_service(w, offset + i);
++        /* The following UINT32 TLV continues at segment_offset + 128.
++         * Native Peach advertises MGMT_SRNG (420) here, not in the fixed
++         * 128..255 bitmap. Ignoring this array silently loses that path. */
++        size_t next = len + 4;
++        unsigned base = offset + 128;
++        while (next < n) {
++            unsigned header = u32(p + next), bytes = header & 0xffff;
++            if (header >> 16 != TAG_U32 || (bytes & 3) ||
++                bytes > n - next - 4 || bytes / 4 > (1024 - base) / 32) {
++                bad(w); return;
++            }
++            for (unsigned i = 0; i < bytes / 4; i++) {
++                uint32_t bits = u32(p + next + 4 + i * 4);
++                for (unsigned bit = 0; bit < 32; bit++)
++                    if (bits & (1u << bit)) add_service(w, base + i * 32 + bit);
++            }
++            base += bytes * 8;
++            next += bytes + 4;
++        }
++        report(w, "WMI extended capabilities through/MGMT_SRNG", base, service(w, 420));
+         break;
+     }
+     case 5:

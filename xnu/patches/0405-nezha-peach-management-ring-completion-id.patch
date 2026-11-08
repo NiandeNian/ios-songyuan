@@ -1,0 +1,11 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -117,6 +117,7 @@
+         if (h->minor == 143) {
+             if (reply_pdev) reply_pdev--;
+             if (reply_id == 5) reply_id = 3;
++            else if (reply_id == 15) reply_id = 0; /* observed HOST4/MGMT completion */
+             else if (reply_id == 0 || reply_id == 7) reply_id = 2;
+         }
+         if (n != 4 || !h->confirmed || !h->setup_pending || !h->setup_sent ||

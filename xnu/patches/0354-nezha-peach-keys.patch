@@ -1,0 +1,134 @@
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -22,6 +22,7 @@
+        TAG_START = 88, TAG_STARTED = 40, TAG_STOP = 93, TAG_STOPPED = 41,
+        TAG_MGMT_TX = 422, TAG_MGMT_DONE = 423, TAG_TX_PARAMS = 644,
+        TAG_ASSOC = 101, TAG_ASSOC_CONF = 434, TAG_VHT_RATES = 102, TAG_UP = 92,
++       TAG_KEY = 96, TAG_KEY_DONE = 42,
+        TAG_FW_READY = 1321, TAG_MODE = 1322, TAG_MODE_RESPONSE = 1323,
+        RESOURCE_WORDS = 88, VDEVS = 1, PEERS = 8 };
+ static const uint32_t host_abi[6] = {0x01000000, 1822, 0x5f414351, 0x4c4d, 0, 0};
+@@ -311,6 +312,13 @@
+     unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
+     w->last_event = id; w->last_tag = tag;
+     switch (id) {
++    case 0x5003: /* WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID */
++        if (tag != TAG_KEY_DONE || len < 24 || !w->key_pending || w->key_done ||
++            u32(p + 4) || memcmp(p + 8, w->vdev_bssid, 6) ||
++            u32(p + 16) != w->key_index || (u32(p + 20) & 1) != w->key_group ||
++            (u32(p + 20) & ~0x31u) || u32(p + 24)) { bad(w); return; }
++        w->key_done = 1;
++        break;
+     case 0x6006: { /* WMI_PEER_ASSOC_CONF_EVENTID */
+         if (tag != TAG_ASSOC_CONF || len < 16 || u32(p + 4) || u32(p + 16)) { bad(w); return; }
+         PeachWmiPeer *s = peer_find(w, p + 8);
+@@ -833,3 +841,38 @@
+     WTRY(w, send_command(w, 0x5005, 48)); w->vdev_up_sent = 1;
+     return 0;
+ }
++int peach_wmi_install_ccmp(PeachWmi *w, const PeachHtt *h, unsigned group, unsigned index,
++                           const unsigned char key[16], uint64_t rsc)
++{
++    if (!w || !h || !key || group > 1 || index > 3 || (!group && index) ||
++        rsc >= 0x1000000000000ull || !w->vdev_up_sent || w->vdev_stop_sent || w->key_pending)
++        return PeachMhiInvalid;
++    if (w->error || h->error) return w->error = w->error ? w->error : h->error;
++    PeachWmiPeer *s = peer_find(w, w->vdev_bssid);
++    const PeachHttPeer *p = peach_htt_peer(h, 0, w->vdev_bssid);
++    if (!s || !s->protected_network || !s->assoc_sent || s->delete_sent || !p)
++        return PeachMhiInvalid;
++    PeachWmiKey *slot = &w->keys[group ? index + 1 : 0];
++    /* A retransmitted M3/group message must not reinstall an existing key
++     * or lower PN. The handshake owner still checks replay/MIC itself. */
++    if (slot->installed && !memcmp(slot->bytes, key, 16)) return 0;
++    if (slot->generation == 0xffffffffu) return bad(w);
++    uint32_t generation = p->generation;
++    memset(w->command, 0, 128);
++    unsigned char *out = w->command + 4;
++    tlv(out, TAG_KEY, 100); peer_mac(out + 8, s->mac);
++    p32(out + 16, index); p32(out + 20, group); p32(out + 24, 4);
++    p32(out + 28, (uint32_t)rsc); p32(out + 32, (uint32_t)(rsc >> 32));
++    p32(out + 84, 16); tlv(out + 104, 17, 16); memcpy(out + 108, key, 16);
++    w->key_pending = 1; w->key_done = 0; w->key_group = group; w->key_index = index;
++    int err = send_command(w, 0x5009, 128);
++    /* HTC/CE already copied the command into their retained TX storage. */
++    memset(w->command, 0, 128);
++    if (err) return w->error = err; /* pending/old/new DMA state is unknown */
++    WTRY(w, wait_flag(w, &w->key_done));
++    p = peach_htt_peer(h, 0, s->mac);
++    if (!p || p->generation != generation) return bad(w);
++    memcpy(slot->bytes, key, 16); slot->rsc = rsc;
++    slot->generation++; slot->installed = 1; w->key_pending = 0;
++    return 0;
++}
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -57,6 +57,13 @@
+     unsigned aid, capabilities, protected_network, rate_count;
+     unsigned char rates[12]; /* 500kbps, including the basic-rate bit */
+ } PeachWmiAssociation;
++
++typedef struct {
++    unsigned installed;
++    uint32_t generation;
++    uint64_t rsc;
++    unsigned char bytes[16];
++} PeachWmiKey;
+ typedef struct {
+     PeachHtc *htc;
+     PeachWmiOps ops;
+@@ -81,6 +88,8 @@
+     unsigned mgmt_in_flight, mgmt_done, mgmt_id, mgmt_status;
+     unsigned mgmt_head, mgmt_count;
+     PeachWmiMgmt mgmt[PEACH_WMI_MGMT_FRAMES];
++    PeachWmiKey keys[5]; /* pairwise slot0, GTK indices 0..3 in slots1..4 */
++    unsigned key_pending, key_done, key_index, key_group;
+     int error;
+     PeachWmiMemory memory[PEACH_WMI_MEMORY_REQUESTS];
+     unsigned char command[2048];
+@@ -119,4 +128,10 @@
+ int peach_wmi_peer_assoc(PeachWmi *, const PeachHtt *, const PeachWmiAssociation *);
+ /* No ACK in this ABI: success records vdev_up_sent, not a connected NIC. */
+ int peach_wmi_vdev_up(PeachWmi *);
++/* Caller has authenticated the EAPOL key material. AES-CCMP128 only,
++ * serialized matching INSTALL_KEY_COMPLETE required. Repeated same key is
++ * not reinstalled and does not reset its replay counter. ACK/SEC_IND alone
++ * do not authorize the port; RX PN setup and the 4-way exchange remain. */
++int peach_wmi_install_ccmp(PeachWmi *, const PeachHtt *, unsigned group, unsigned index,
++                           const unsigned char key[16], uint64_t rsc);
+ #endif
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -62,6 +62,21 @@
+     if (!p || n < 4 || (n & 3)) { h->error = PeachCeProtocol; return; }
+     uint32_t word = u32(p);
+     h->last_message = word;
++    if ((word & 255) == 0xb) { /* htt_sec_ind: 7 words, not a key ACK */
++        unsigned type = (word >> 8) & 127, unicast = (word >> 15) & 1;
++        if (!h->confirmed || n != 28 || (type && type != 6)) {
++            h->error = PeachCeProtocol; return; /* none / AES-CCMP128 only */
++        }
++        for (unsigned i = 0; i < PEACH_HTT_PEERS; i++) {
++            PeachHttPeer *s = &h->peers[i];
++            if (!s->mapped || s->peer != (word >> 16)) continue;
++            if (s->security_generation[unicast] == 0xffffffffu) break;
++            s->security[unicast] = type; s->security_valid[unicast] = 1;
++            s->security_generation[unicast]++;
++            return;
++        }
++        h->error = PeachCeProtocol; return;
++    }
+     if ((word & 255) == 3 || (word & 255) == 4 ||
+         (word & 255) == 0x1e || (word & 255) == 0x1f) {
+         (void)peer_message(h, p, n);
+--- a/bsd/dev/qcom/PeachHtt.h
++++ b/bsd/dev/qcom/PeachHtt.h
+@@ -8,6 +8,8 @@
+ typedef struct {
+     unsigned mapped, vdev, peer, ast, hash, ast_valid, hash_valid;
+     uint32_t generation;
++    unsigned security[2], security_valid[2]; /* multicast / unicast */
++    uint32_t security_generation[2];
+     unsigned char mac[6];
+ } PeachHttPeer;
+ typedef struct {

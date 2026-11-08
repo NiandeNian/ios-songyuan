@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -88,10 +88,11 @@
+         v += 9; len -= 9;
+         report(w, "requested memory type/bytes", type, bytes);
+         if (cfg) report(w, "requested memory type/configs", type, cfg);
+-        /* MSA/LPASS and pageable/MLO memory need additional ownership or
+-         * protocols. Do not advertise those capabilities or invent support. */
++        /* LPASS_SHARED (11) uses the same owned DMA allocation as CNSS2;
++         * its optional WFDS/ADSP consumer is not enabled here. MSA and
++         * pageable/MLO memory still need additional ownership or protocols. */
+         if (!bytes || type < 1 || type > 12 || type == 6 || type == 8 ||
+-            type == 9 || type == 11 || cfg > 2 || cfg * 13 > len) {
++            type == 9 || cfg > 2 || cfg * 13 > len) {
+             w->error = PeachWlfwUnsupported; return;
+         }
+         for (unsigned j = 0; j < cfg; j++, v += 13, len -= 13) {

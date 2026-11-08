@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -240,18 +240,25 @@
+     if (r->type == PeachHttSwToHw) command[3] |= 1u << 25;
+     command[4] = (uint32_t)r->head.iova; command[5] = (uint32_t)(r->head.iova >> 32);
+     command[6] = (uint32_t)r->tail.iova; command[7] = (uint32_t)(r->tail.iova >> 32);
+-    command[12] = 1u << 19; /* require firmware completion */
++    /* Native Peach sends RXDMA_HOST_BUF/SW-to-HW without a response.
++     * HTT 3.143 does not emit DONE for that hardware-buffer configuration;
++     * it still emits real DONE for HOST1, HOST4 and the RXDMA destination. */
++    unsigned no_reply = h->minor == 143 && r->id == 0 && r->type == PeachHttSwToHw;
++    command[12] = no_reply ? 0 : 1u << 19;
+     h->setup_pending = 1; h->setup_sent = h->setup_done = 0;
+     h->setup_pdev = r->pdev; h->setup_id = r->id; h->setup_status = 0xffffffffu;
+     h->htc->ce->ops.barrier(h->htc->ce->ops.context);
+     int err = send_message(h, command, sizeof(command));
+     if (err) return err;
+     h->setup_sent = 1;
+-    err = wait_flag(h, &h->setup_done);
+-    if (err) return err; /* retain all DMA after submission, including timeout */
++    if (!no_reply) {
++        err = wait_flag(h, &h->setup_done);
++        if (err) return err; /* retain all DMA after submission, including timeout */
++    }
+     h->configured[r->pdev] |= 1u << r->id;
+     h->setup_pending = 0;
+     if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
++        no_reply ? "HTT RXMAC setup submitted pdev/ring" :
+         "HTT SRING_SETUP confirmed pdev/ring", r->pdev, r->id);
+     return 0;
+ }
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -912,7 +912,7 @@
+         };
+         WIFI_TRY(peach_htt_setup_ring(&wifi_htt, &wifi_rxmac[i]));
+     }
+-    printf("NEZHA WIFI: %u firmware-owned RXMAC rings configured\n", wifi_rxmac_count);
++    printf("NEZHA WIFI: %u firmware-owned RXMAC ring setups submitted\n", wifi_rxmac_count);
+     return 0;
+ }
+ static int wifi_setup_srng(void)

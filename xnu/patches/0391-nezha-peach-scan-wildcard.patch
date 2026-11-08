@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -271,7 +271,8 @@
+          * resume and still needs its real terminal event or timeout. */
+         w->scan_finished = 1;
+     }
+-    report(w, "WMI real scan event/reason", event, reason);
++    if (event == 8) report(w, "WMI scan channel MHz/reason", u32(p + 12), reason);
++    else report(w, "WMI real scan event/reason", event, reason);
+     return 0;
+ }
+ static void management_event(PeachWmi *w, const unsigned char *p, size_t n)
+@@ -672,14 +673,18 @@
+     unsigned sequence = (w->scan_id + 1) & 0xfff;
+     w->scan_id = 0xa000 | (sequence ? sequence : 1); w->scan_requestor = 0xa001;
+     p32(p + 4, w->scan_id); p32(p + 8, w->scan_requestor);
+-    p32(p + 16, 1); p32(p + 20, 0x73); /* low priority, started/completed/failures */
++    p32(p + 16, 1); p32(p + 20, 0x7b); /* low priority, channel/start/completion/failures */
+     p32(p + 24, 120); p32(p + 28, 120); /* passive dwell in ms */
+     p32(p + 48, 25); p32(p + 52, 15000);
+     p32(p + 60, 0x21); /* PASSIVE + FILTER_PROBE_REQ; no probes or active DFS */
+     p32(p + 68, w->channel_count);
++    p32(p + 72, 1); /* broadcast BSSID, as in ath12k_wmi_start_scan_init */
+     p += 172; tlv(p, TAG_U32, w->channel_count * 4); p += 4;
+     for (unsigned i = 0; i < w->channel_count; i++, p += 4) p32(p, w->channels[i].frequency);
+-    const unsigned empty_tags[] = {19,19,17,18,17,19,19};
++    tlv(p, 19, 0); p += 4; /* no SSID filter */
++    tlv(p, 19, 8); p += 4;
++    memset(p, 255, 6); p += 8; /* wmi_mac_addr broadcast; reserved bits zero */
++    const unsigned empty_tags[] = {17,18,17,19,19};
+     for (unsigned i = 0; i < sizeof(empty_tags) / sizeof(empty_tags[0]); i++, p += 4)
+         tlv(p, empty_tags[i], 0);
+     w->scan_active = 1; w->scan_sent = w->scan_started = w->scan_done = 0;

@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/qcom/PeachRsn.c b/bsd/dev/qcom/PeachRsn.c
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -254,21 +254,33 @@
+         equal(fingerprint, r->response_digest, 20)) {
+         schedule(r, ReplyAgain); return 0; /* reuse response; never reinstall/reset PN */
+     }
++    unsigned repeat_m3 = pair && r->phase == PeachRsnConnected;
+     if (!r->have_replay || replay <= r->replay ||
+-        (pair ? r->phase != PeachRsnM3 || !equal(key + 13, r->anonce, 32) :
++        (pair ? (r->phase != PeachRsnM3 && !repeat_m3) || !equal(key + 13, r->anonce, 32) :
+                 r->phase != PeachRsnConnected)) return 0;
+     size_t plain_bytes;
+     int err = unwrap(r, key + 95, data_bytes, &plain_bytes);
+     if (!err) err = key_data(r, plain_bytes, !pair);
+     if (err) return fail(r, err); /* authenticated but unsupported/inconsistent key data */
++    erase(r->plain, sizeof(r->plain));
++    if (repeat_m3) {
++        /* A lost M4 can cause a signed M3 with a newer counter. Answer it
++         * only for the installed keys; never reinstall or reset any PN. */
++        const PeachWmiKey *t = &r->station->wmi->keys[0];
++        const PeachWmiKey *g = &r->station->wmi->keys[r->group_index + 1];
++        unsigned same = t->installed && g->installed &&
++            equal(t->bytes, r->ptk + 32, 16) && equal(g->bytes, r->gtk, 16);
++        erase(r->gtk, sizeof(r->gtk));
++        if (!same) return 0;
++    }
+     uint64_t rsc = 0;
+     for (unsigned i = 0; i < 8; i++) rsc |= (uint64_t)key[61 + i] << (8 * i);
+     if (rsc >= 0x1000000000000ull) return fail(r, PeachCeProtocol);
+     r->group_rsc = rsc; r->replay = r->response_replay = replay;
+     r->have_response = 1; r->response_group = !pair;
+-    memcpy(r->response_digest, fingerprint, 20); erase(r->plain, sizeof(r->plain));
++    memcpy(r->response_digest, fingerprint, 20);
+     make_reply(r, e, pair ? 0x030a : 0x0302, 0, 0);
+-    schedule(r, pair ? ReplyM4 : ReplyGroup); return 0;
++    schedule(r, repeat_m3 ? ReplyAgain : pair ? ReplyM4 : ReplyGroup); return 0;
+ }
+ static int install(PeachRsn *r, unsigned pair)
+ {

@@ -1,0 +1,258 @@
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -19,6 +19,8 @@
+        TAG_RULE_EXT = 937, TAG_REG_EXT = 938,
+        TAG_PEER_CREATE = 97, TAG_PEER_DELETE = 98, TAG_PEER_QUEUE = 549,
+        TAG_PEER_CONFIRM = 868, TAG_PEER_DELETED = 451,
++       TAG_START = 88, TAG_STARTED = 40, TAG_STOP = 93, TAG_STOPPED = 41,
++       TAG_MGMT_TX = 422, TAG_MGMT_DONE = 423, TAG_TX_PARAMS = 644,
+        TAG_FW_READY = 1321, TAG_MODE = 1322, TAG_MODE_RESPONSE = 1323,
+        RESOURCE_WORDS = 88, VDEVS = 1, PEERS = 8 };
+ static const uint32_t host_abi[6] = {0x01000000, 1822, 0x5f414351, 0x4c4d, 0, 0};
+@@ -244,17 +246,31 @@
+     unsigned bytes = u32(p + 20), frequency = u32(p + 68);
+     if (n - off < 4 || u32(p + off) >> 16 != 17 ||
+         bytes > (u32(p + off) & 0xffff)) { bad(w); return; }
+-    if (!w->scan_active || !w->scan_sent || w->scan_done || u32(p + 24) ||
+-        u32(p + 64) != w->radio.pdev || bytes < 36) return;
++    if (u32(p + 24) || u32(p + 64) != w->radio.pdev || bytes < 24) return;
++    const unsigned char *frame = p + off + 4;
++    unsigned fc = u16(frame);
++    if (fc & 3 || (fc & 12)) return;
++    if (w->vdev_started && !w->vdev_stop_sent && frequency == w->vdev_frequency &&
++        !memcmp(frame + 16, w->vdev_bssid, 6) && !memcmp(frame + 10, w->vdev_bssid, 6) &&
++        (!memcmp(frame + 4, w->mac, 6) || (frame[4] & 1))) {
++        unsigned subtype = fc & 0xfc;
++        if (subtype == 0xb0 || subtype == 0x10 || subtype == 0x30 ||
++            subtype == 0xa0 || subtype == 0xc0 || subtype == 0xd0) {
++            if ((fc & 0x4000) || bytes > PEACH_WMI_MGMT_BYTES ||
++                w->mgmt_count == PEACH_WMI_MGMT_FRAMES) { bad(w); return; }
++            PeachWmiMgmt *m = &w->mgmt[(w->mgmt_head + w->mgmt_count) % PEACH_WMI_MGMT_FRAMES];
++            m->bytes = bytes; m->frequency = frequency; m->rssi = (int32_t)u32(p + 48);
++            memcpy(m->frame, frame, bytes); w->mgmt_count++;
++        }
++    }
++    if (!w->scan_active || !w->scan_sent || w->scan_done || bytes < 36) return;
+     unsigned i;
+     for (i = 0; i < w->channel_count && w->channels[i].frequency != frequency; i++) {}
+     if (i == w->channel_count) return;
+-    const unsigned char *frame = p + off + 4;
+-    unsigned fc = u16(frame);
+     if ((fc & 3) || ((fc & 0xfc) != 0x80 && (fc & 0xfc) != 0x50) ||
+         (frame[16] & 1) || !memcmp(frame + 16, "\0\0\0\0\0\0", 6)) return;
+     const unsigned char *ssid = NULL;
+-    unsigned ssid_bytes = 0;
++    unsigned ssid_bytes = 0, dtim_period = 0;
+     for (size_t pos = 36; pos < bytes;) {
+         if (bytes - pos < 2 || frame[pos + 1] > bytes - pos - 2) return;
+         unsigned size = frame[pos + 1];
+@@ -262,6 +278,7 @@
+             if (ssid || size > 32) return;
+             ssid = frame + pos + 2; ssid_bytes = size;
+         }
++        if (frame[pos] == 5 && size >= 4) dtim_period = frame[pos + 3];
+         pos += 2 + size;
+     }
+     if (!ssid) return;
+@@ -278,6 +295,7 @@
+         b->ssid_bytes = ssid_bytes; memcpy(b->ssid, ssid, ssid_bytes);
+     }
+     b->beacon_interval = u16(frame + 32); b->capability = u16(frame + 34);
++    if (dtim_period) b->dtim_period = dtim_period;
+     b->ies_truncated = bytes - 36 > sizeof(b->ies);
+     b->ie_bytes = b->ies_truncated ? sizeof(b->ies) : bytes - 36;
+     memcpy(b->ies, frame + 36, b->ie_bytes);
+@@ -292,6 +310,27 @@
+     unsigned tag = u32(p) >> 16, len = u32(p) & 0xffff;
+     w->last_event = id; w->last_tag = tag;
+     switch (id) {
++    case 0x5001: /* WMI_VDEV_START_RESP_EVENTID */
++        if (tag != TAG_STARTED || len < 36 || !w->vdev_start_sent || w->vdev_started ||
++            u32(p + 4) || u32(p + 8) != w->vdev_request || u32(p + 12) || u32(p + 16) ||
++            u32(p + 28) != w->radio.pdev || u32(p + 32) != 1 || u32(p + 36) != 1) {
++            bad(w); return;
++        }
++        w->vdev_started = 1;
++        break;
++    case 0x5002: /* WMI_VDEV_STOPPED_EVENTID */
++        if (tag != TAG_STOPPED || len < 4 || u32(p + 4) || !w->vdev_stop_sent || w->vdev_stopped) {
++            bad(w); return;
++        }
++        w->vdev_stopped = 1; w->vdev_started = 0;
++        break;
++    case 0x7006: /* WMI_MGMT_TX_COMPLETION_EVENTID */
++        if (tag != TAG_MGMT_DONE || len < 12 || !w->mgmt_in_flight || w->mgmt_done ||
++            u32(p + 4) != w->mgmt_id || u32(p + 12) != w->radio.pdev || u32(p + 8) > 3) {
++            bad(w); return;
++        }
++        w->mgmt_status = u32(p + 8); w->mgmt_done = 1; w->mgmt_in_flight = 0;
++        break;
+     case 0x601a: /* WMI_PEER_CREATE_CONF_EVENTID */
+     case 0x6007: { /* WMI_PEER_DELETE_RESP_EVENTID */
+         if (tag != (id == 0x601a ? TAG_PEER_CONFIRM : TAG_PEER_DELETED) ||
+@@ -639,3 +678,92 @@
+     if (!mapped || mapped->generation != generation) return bad(w);
+     return 0;
+ }
++int peach_wmi_vdev_start(PeachWmi *w, unsigned bss_index, unsigned pmf)
++{
++    if (!w || !w->ready || !w->vdev_sent || w->scan_active || !w->scan_done ||
++        w->vdev_start_sent || bss_index >= w->bss_count || pmf > 1 || !service(w, 76))
++        return PeachMhiInvalid;
++    if (w->error) return w->error;
++    const PeachWmiBss *b = &w->bss[bss_index];
++    const PeachWmiRegDomain *r = &w->regulatory[w->radio.phy];
++    if (!r->valid || r->generation != w->scan_reg_generation || !b->beacon_interval ||
++        !b->dtim_period || (b->capability & 3) != 1 || b->ies_truncated) return PeachMhiInvalid;
++    const PeachWmiScanChannel *c = NULL;
++    for (unsigned i = 0; i < w->channel_count; i++)
++        if (w->channels[i].frequency == b->frequency) { c = &w->channels[i]; break; }
++    if (!c) return PeachMhiInvalid;
++    if (!w->mgmt_dma.bytes) {
++        WTRY(w, w->ops.allocate(w->ops.context, PEACH_WMI_MGMT_BYTES, &w->mgmt_dma));
++        PeachMhiDma d = w->mgmt_dma;
++        if (!d.bytes || d.capacity < PEACH_WMI_MGMT_BYTES || !d.iova || (d.iova & 3) ||
++            ((uintptr_t)d.bytes & 3) || d.iova < w->ops.iova_base ||
++            d.iova - w->ops.iova_base > w->ops.iova_bytes ||
++            PEACH_WMI_MGMT_BYTES > w->ops.iova_bytes - (d.iova - w->ops.iova_base)) return bad(w);
++    }
++    /* 36-word fixed struct, wmi_channel and all eight optional arrays.
++     * No HT/VHT/HE/EHT or MLO capability is advertised by this start. */
++    memset(w->command, 0, sizeof(w->command));
++    unsigned char *p = w->command + 4;
++    tlv(p, TAG_START, 140); p32(p + 8, ++w->vdev_request);
++    p32(p + 12, b->beacon_interval); p32(p + 16, b->dtim_period);
++    p32(p + 20, pmf << 1); p32(p + 76, 1); p32(p + 80, 1);
++    p32(p + 132, 1); p32(p + 136, 1);
++    p += 144; tlv(p, TAG_CHANNEL, 24); p32(p + 4, c->frequency); p32(p + 8, c->frequency);
++    unsigned mode = c->frequency < 2500 ? ((c->flags & 4) ? 2 : 1) : 0;
++    p32(p + 16, mode | ((c->flags & 2) ? 1u << 10 : 0));
++    p32(p + 20, c->power << 8 | c->power << 16);
++    p32(p + 24, c->antenna | c->power << 8); p += 28;
++    for (unsigned i = 0; i < 8; i++, p += 4) tlv(p, TAG_ARRAY, 0);
++    w->vdev_frequency = b->frequency; w->vdev_reg_generation = r->generation;
++    memcpy(w->vdev_bssid, b->bssid, 6); w->mgmt_head = w->mgmt_count = 0;
++    WTRY(w, send_command(w, 0x5003, (size_t)(p - w->command))); w->vdev_start_sent = 1;
++    WTRY(w, wait_flag(w, &w->vdev_started));
++    if (!r->valid || r->generation != w->vdev_reg_generation) return bad(w);
++    return 0;
++}
++int peach_wmi_vdev_stop(PeachWmi *w)
++{
++    if (!w || !w->vdev_started || w->vdev_stop_sent || w->mgmt_in_flight) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    memset(w->command, 0, 12); tlv(w->command + 4, TAG_STOP, 4);
++    WTRY(w, send_command(w, 0x5006, 12)); w->vdev_stop_sent = 1;
++    return wait_flag(w, &w->vdev_stopped);
++}
++int peach_wmi_mgmt_tx(PeachWmi *w, const void *packet, size_t bytes)
++{
++    const unsigned char *frame = packet;
++    if (!w || !frame || !w->vdev_started || w->vdev_stop_sent || w->mgmt_in_flight ||
++        !w->mgmt_dma.bytes || bytes < 24 || bytes > PEACH_WMI_MGMT_BYTES ||
++        w->mgmt_id == 0xffffffffu || (u16(frame) & 0x430f) ||
++        memcmp(frame + 4, w->vdev_bssid, 6) || memcmp(frame + 10, w->mac, 6) ||
++        memcmp(frame + 16, w->vdev_bssid, 6)) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    const PeachWmiRegDomain *r = &w->regulatory[w->radio.phy];
++    if (!r->valid || r->generation != w->vdev_reg_generation) return bad(w);
++    memcpy(w->mgmt_dma.bytes, frame, bytes); w->ops.barrier(w->ops.context);
++    memset(w->command, 0, sizeof(w->command));
++    unsigned char *p = w->command + 4;
++    size_t prefix = bytes < 64 ? bytes : 64, padded = (prefix + 3) & ~(size_t)3;
++    tlv(p, TAG_MGMT_TX, 40); p32(p + 8, ++w->mgmt_id);
++    p32(p + 12, w->vdev_frequency); p32(p + 16, (uint32_t)w->mgmt_dma.iova);
++    p32(p + 20, (uint32_t)(w->mgmt_dma.iova >> 32));
++    p32(p + 24, (uint32_t)bytes); p32(p + 28, (uint32_t)prefix);
++    p += 44; tlv(p, 17, (unsigned)padded); p += 4;
++    memcpy(p, frame, prefix); p += padded;
++    /* tx_params_valid=0 still requires this fixed TLV. */
++    tlv(p, TAG_TX_PARAMS, 8); p += 12;
++    for (unsigned i = 0; i < 2; i++, p += 4) tlv(p, TAG_ARRAY, 0);
++    w->mgmt_done = 0; w->mgmt_status = 0xffffffffu;
++    WTRY(w, send_command(w, 0x7008, (size_t)(p - w->command))); w->mgmt_in_flight = 1;
++    WTRY(w, wait_flag(w, &w->mgmt_done));
++    return w->mgmt_status ? PeachMhiDeviceError : 0;
++}
++int peach_wmi_mgmt_rx(PeachWmi *w, PeachWmiMgmt *out)
++{
++    if (!w || !out) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    if (!w->mgmt_count) return PeachWmiNoFrame;
++    *out = w->mgmt[w->mgmt_head];
++    w->mgmt_head = (w->mgmt_head + 1) % PEACH_WMI_MGMT_FRAMES; w->mgmt_count--;
++    return 0;
++}
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -8,6 +8,9 @@
+ #define PEACH_WMI_SCAN_CHANNELS 64u
+ #define PEACH_WMI_BSS_ENTRIES 32u
+ #define PEACH_WMI_PEERS 8u
++#define PEACH_WMI_MGMT_BYTES 1024u
++#define PEACH_WMI_MGMT_FRAMES 4u
++enum { PeachWmiNoFrame = 1 };
+ typedef struct {
+     void *context;
+     int (*allocate)(void *, size_t, PeachMhiDma *);
+@@ -31,7 +34,7 @@
+ } PeachWmiRegDomain;
+ typedef struct { unsigned frequency, flags, power, antenna; } PeachWmiScanChannel;
+ typedef struct {
+-    unsigned frequency, ssid_bytes, ie_bytes, ies_truncated;
++    unsigned frequency, ssid_bytes, ie_bytes, ies_truncated, dtim_period;
+     int rssi;
+     unsigned char bssid[6], ssid[32], ies[512];
+     uint16_t capability, beacon_interval;
+@@ -42,6 +45,12 @@
+     uint32_t queues_sent;
+     unsigned char mac[6];
+ } PeachWmiPeer;
++
++typedef struct {
++    unsigned bytes, frequency;
++    int rssi;
++    unsigned char frame[PEACH_WMI_MGMT_BYTES];
++} PeachWmiMgmt;
+ typedef struct {
+     PeachHtc *htc;
+     PeachWmiOps ops;
+@@ -59,6 +68,13 @@
+     PeachWmiScanChannel channels[PEACH_WMI_SCAN_CHANNELS];
+     PeachWmiBss bss[PEACH_WMI_BSS_ENTRIES];
+     PeachWmiPeer peers[PEACH_WMI_PEERS];
++    unsigned vdev_start_sent, vdev_started, vdev_request, vdev_frequency, vdev_reg_generation;
++    unsigned vdev_stop_sent, vdev_stopped;
++    unsigned char vdev_bssid[6];
++    PeachMhiDma mgmt_dma;
++    unsigned mgmt_in_flight, mgmt_done, mgmt_id, mgmt_status;
++    unsigned mgmt_head, mgmt_count;
++    PeachWmiMgmt mgmt[PEACH_WMI_MGMT_FRAMES];
+     int error;
+     PeachWmiMemory memory[PEACH_WMI_MEMORY_REQUESTS];
+     unsigned char command[2048];
+@@ -82,4 +98,13 @@
+  * submission: this ABI has no queue-setup ACK. Protected RX needs PN setup. */
+ int peach_wmi_peer_queue(PeachWmi *, const PeachHtt *, const unsigned char mac[6],
+                          unsigned tid, PeachMhiDma);
++/* Start on a scanned, regulatory-valid 20MHz BSS; wait for matching
++ * successful START_RESP. No authentication/association or network link. */
++int peach_wmi_vdev_start(PeachWmi *, unsigned bss_index, unsigned pmf);
++int peach_wmi_vdev_stop(PeachWmi *);
++/* One retained pass-by-reference buffer. Reuse only after matching real
++ * MGMT_TX_COMPLETION. RX frames are copied out of CE before callback return.
++ * These primitives do not manufacture auth/association responses. */
++int peach_wmi_mgmt_tx(PeachWmi *, const void *, size_t);
++int peach_wmi_mgmt_rx(PeachWmi *, PeachWmiMgmt *);
+ #endif
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -82,7 +82,7 @@
+ static uint64_t wifi_context_offset, wifi_dma_next, wifi_check_at;
+ static uint32_t wifi_context_control;
+ static unsigned wifi_table_next, wifi_allocations;
+-#define WIFI_DMA_ALLOCATIONS (PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 6)
++#define WIFI_DMA_ALLOCATIONS (PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 7)
+ static vm_offset_t wifi_owned_dma[WIFI_DMA_ALLOCATIONS];
+ #define WIFI_IOVA 0x20000000ull
+ #define WIFI_DMA_BYTES 0x920000u

@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -347,15 +347,25 @@
+         pos += 2 + size;
+     }
+     if (!ssid) return;
++    int rssi = (int32_t)u32(p + 48);
++    if (rssi < -127 || rssi > 0) rssi = -128;
+     for (i = 0; i < w->bss_count && memcmp(w->bss[i].bssid, frame + 16, 6); i++) {}
+     if (i == w->bss_count) {
+-        if (i == PEACH_WMI_BSS_ENTRIES) { w->bss_dropped++; return; }
+-        w->bss_count++;
++        if (i == PEACH_WMI_BSS_ENTRIES) {
++            /* A full cache must not retain only the first scanned
++             * channels and discard a nearby AP seen later in the sweep. */
++            unsigned weakest = 0;
++            for (unsigned j = 1; j < w->bss_count; j++)
++                if (w->bss[j].rssi < w->bss[weakest].rssi) weakest = j;
++            w->bss_dropped++;
++            if (rssi <= w->bss[weakest].rssi) return;
++            i = weakest;
++        } else w->bss_count++;
++        memset(&w->bss[i], 0, sizeof(w->bss[i]));
+     }
+     PeachWmiBss *b = &w->bss[i];
+     b->seen_us = w->htc->ops.now_us(w->htc->ops.context);
+-    b->frequency = frequency; b->rssi = (int32_t)u32(p + 48);
+-    if (b->rssi < -127 || b->rssi > 0) b->rssi = -128; /* unknown, never estimate */
++    b->frequency = frequency; b->rssi = rssi;
+     memcpy(b->bssid, frame + 16, 6);
+     if (ssid_bytes || !b->ssid_bytes) {
+         b->ssid_bytes = ssid_bytes; memcpy(b->ssid, ssid, ssid_bytes);

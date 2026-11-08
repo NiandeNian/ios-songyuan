@@ -1,0 +1,2052 @@
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -62,6 +62,13 @@
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ void pandora_adsp_init(void);
+ int pandora_firmware_pread(const char *name, uint64_t off, void *dst, size_t len, uint64_t *size);
++void pandora_wifi_init(void);
++void pandora_rpmh_lock(void);
++void pandora_rpmh_unlock(void);
++int pandora_rpmh_resource(const char *, uint32_t, uint32_t);
++int pandora_rpmh_arc(const char *, uint32_t);
++void pandora_apps_smmu_lock(void);
++void pandora_apps_smmu_unlock(void);
+ 
+ #define AD_PAS_MAIN      1u
+ #define AD_PAS_DTB       36u
+@@ -325,6 +332,27 @@
+ /* ---- RPMh ARC level vote (apps RSC DRV 2, v3 layout, cmd-db) ---------------------- */
+ 
+ static vm_offset_t ad_rsc, ad_db;
++LCK_GRP_DECLARE(ad_rpmh_grp, "pandora_rpmh");
++LCK_MTX_DECLARE(ad_rpmh_mutex, &ad_rpmh_grp);
++LCK_GRP_DECLARE(ad_apps_smmu_grp, "pandora_apps_smmu");
++LCK_MTX_DECLARE(ad_apps_smmu_mutex, &ad_apps_smmu_grp);
++
++void pandora_rpmh_lock(void) { lck_mtx_lock(&ad_rpmh_mutex); }
++void pandora_rpmh_unlock(void) { lck_mtx_unlock(&ad_rpmh_mutex); }
++void pandora_apps_smmu_lock(void) { lck_mtx_lock(&ad_apps_smmu_mutex); }
++void pandora_apps_smmu_unlock(void) { lck_mtx_unlock(&ad_apps_smmu_mutex); }
++
++static int
++rpmh_map_locked(void)
++{
++	if (!ad_rsc) ad_rsc = ad_map(AD_RSC_PA, 0x10000, VM_WIMG_IO);
++	if (!ad_db) ad_db = ad_map(AD_CMDDB_PA, AD_CMDDB_SIZE, VM_WIMG_IO);
++	if (!ad_rsc || !ad_db) return ENOMEM;
++	uint32_t id = ad_rd(ad_rsc, 0), cfg = ad_rd(ad_rsc, 0x0c);
++	unsigned ntcs = (cfg >> 12) & 63, ncpt = (cfg >> 27) & 31;
++	return ad_rd(ad_db, 4) == 0x0c0330dbu && id != 0xffffffffu &&
++	    ((id >> 16) & 255) >= 3 && ntcs >= 3 && ntcs <= 16 && ncpt >= 1 && ncpt <= 16 ? 0 : ENODEV;
++}
+ 
+ static uint16_t
+ db16(uint32_t off)
+@@ -347,12 +375,15 @@
+ 		}
+ 		uint32_t entries = 144 + db16(h + 2), data = 144 + db16(h + 4);
+ 		unsigned count = db16(h + 6);
++		if ((entries & 3) || entries > AD_CMDDB_SIZE || count > (AD_CMDDB_SIZE - entries) / 24 ||
++		    data > AD_CMDDB_SIZE) return EINVAL;
+ 		for (unsigned j = 0; j < count && entries + 24 * (j + 1) <= AD_CMDDB_SIZE; j++) {
+ 			uint32_t e = entries + 24 * j;
+ 			if (ad_rd(ad_db, e) == key[0] && ad_rd(ad_db, e + 4) == key[1]) {
+ 				*addr = ad_rd(ad_db, e + 16);
+ 				*auxlen = db16(e + 20);
+ 				*aux = data + db16(e + 22);
++				if (*aux > AD_CMDDB_SIZE || *auxlen > AD_CMDDB_SIZE - *aux) return EINVAL;
+ 				return 0;
+ 			}
+ 		}
+@@ -361,14 +392,16 @@
+ }
+ 
+ static int
+-rpmh_write1(uint32_t addr, uint32_t data)
++rpmh_write1_locked(uint32_t addr, uint32_t data)
+ {
+ 	const uint32_t tcs = 0xd00, stride = 0x2a0;
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < 3 && chosen < 0; t++) {
+ 		uint32_t b = tcs + t * stride;
+-		if (ad_rd(ad_rsc, b + 0x28) != 0 && ad_rd(ad_rsc, b + 0x24) == 0 &&
+-		    ad_rd(ad_rsc, b + 0x2c) == 0 && ad_rd(ad_rsc, b + 0x20) == 0) {
++		uint32_t status = ad_rd(ad_rsc, b + 0x28);
++		if (status != 0 && status != 0xffffffffu && ad_rd(ad_rsc, b + 0x24) == 0 &&
++		    ad_rd(ad_rsc, b + 0x2c) == 0 && ad_rd(ad_rsc, b + 0x20) == 0 &&
++		    !(ad_rd(ad_rsc, tcs + 4) & (1u << t))) {
+ 			chosen = (int)t;
+ 		}
+ 	}
+@@ -387,13 +420,17 @@
+ 	ad_wr(ad_rsc, b + 0x24, 1u << 16);
+ 	ad_wr(ad_rsc, b + 0x24, (1u << 16) | (1u << 24));
+ 	bool done = false;
+-	for (int us = 0; us < 100000 && !done; us++) {
++	for (unsigned ms = 0; ms < 100 && !done; ms++) {
+ 		uint32_t cs = ad_rd(ad_rsc, b + 0x40);
+-		done = (cs & 0x10100u) == 0x10100u && ad_rd(ad_rsc, b + 0x28) != 0;
++		uint32_t status = ad_rd(ad_rsc, b + 0x28);
++		done = cs != 0xffffffffu && (cs & 0x10100u) == 0x10100u && status != 0 && status != 0xffffffffu;
+ 		if (!done) {
+-			delay(1);
+-		}
+-	}
++			ad_sleep(1);
++		}
++	}
++	/* A timed-out command may still be running. Leave its TCS unavailable;
++	 * another client must not reuse it or restore its IRQ before completion. */
++	if (!done) return ETIMEDOUT;
+ 	ad_wr(ad_rsc, b + 0x24, 1u << 16);
+ 	ad_wr(ad_rsc, b + 0x24, 0);
+ 	ad_wr(ad_rsc, b + 0x2c, 0);
+@@ -403,6 +440,32 @@
+ 	return done ? 0 : ETIMEDOUT;
+ }
+ 
++static int
++rpmh_write1(uint32_t addr, uint32_t data)
++{
++	pandora_rpmh_lock();
++	int err = rpmh_map_locked();
++	if (!err) err = rpmh_write1_locked(addr, data);
++	pandora_rpmh_unlock();
++	return err;
++}
++
++/* Nezha board resources use the same serialized ACTIVE TCS pool as ADSP.
++ * The resource address is looked up in this boot's CMD-DB, never hardcoded. */
++int
++pandora_rpmh_resource(const char *name, uint32_t offset, uint32_t value)
++{
++	if (!name || !name[0] || strnlen(name, 9) > 8 || (offset & 3) || offset > 12) return EINVAL;
++	pandora_rpmh_lock();
++	uint32_t addr = 0, aux = 0, len = 0;
++	int err = rpmh_map_locked();
++	if (!err) err = cmddb_find(name, &addr, &aux, &len);
++	if (!err && (((addr >> 16) & 7u) != 4 || (addr & 15u))) err = EINVAL;
++	if (!err) err = rpmh_write1_locked(addr + offset, value);
++	pandora_rpmh_unlock();
++	return err;
++}
++
+ /* ARC: the vote is the index of the first level in the aux table at or above vlvl. */
+ static int
+ arc_vote(const char *res, uint32_t vlvl)
+@@ -413,6 +476,7 @@
+ 		printf("PANDORA ADSP: cmd-db %s not found\n", res);
+ 		return err;
+ 	}
++	if (!len || (len & 1) || ((addr >> 16) & 7) != 3) return EINVAL;
+ 	uint32_t hlvl = 0, n = len / 2, got = 0;
+ 	for (; hlvl < n; hlvl++) {
+ 		got = db16(aux + 2 * hlvl);
+@@ -421,12 +485,22 @@
+ 		}
+ 	}
+ 	if (hlvl == n) {
+-		hlvl = n - 1;
++		return ERANGE;
+ 	}
+ 	err = rpmh_write1(addr, hlvl);
+ 	printf("PANDORA ADSP: ARC %s addr %#x levels %u: vote hlvl %u (level %u) -> %d\n", res, addr, n,
+ 	    hlvl, got, err);
+ 	return err;
++}
++
++int
++pandora_rpmh_arc(const char *name, uint32_t level)
++{
++	if (!name || !name[0] || strnlen(name, 9) > 8) return EINVAL;
++	pandora_rpmh_lock();
++	int err = rpmh_map_locked();
++	pandora_rpmh_unlock();
++	return err ? err : arc_vote(name, level);
+ }
+ 
+ /* BCM vote (include/soc/qcom/tcs.h BCM_TCS_CMD): commit, valid, x average, y peak, 14 bits each. */
+@@ -874,8 +948,10 @@
+ 	}
+ 	ad_qmp = ad_map(AD_QMP_PA, 0x400, VM_WIMG_IO);
+ 	ad_ipcc = ad_map(AD_IPCC_PA, 0x1000, VM_WIMG_IO);
+-	ad_rsc = ad_map(AD_RSC_PA, 0x10000, VM_WIMG_IO);
+-	ad_db = ad_map(AD_CMDDB_PA, AD_CMDDB_SIZE, VM_WIMG_IO);
++	pandora_rpmh_lock();
++	int rpmh_err = rpmh_map_locked();
++	pandora_rpmh_unlock();
++	if (rpmh_err) return rpmh_err;
+ 	ad_smem_va = ad_map(AD_SMEM_PA, AD_SMEM_SIZE, VM_WIMG_IO);
+ 	ad_mutex = ad_map(AD_MUTEX_PA, 0x1000, VM_WIMG_IO);
+ 	if (!ad_qmp || !ad_ipcc || !ad_rsc || !ad_db || !ad_smem_va || !ad_mutex) {
+@@ -3118,6 +3194,7 @@
+ void
+ pandora_adsp_init(void)
+ {
++	pandora_wifi_init();
+ 	thread_t thread;
+ 	int on = 0, battery = 0;
+ 	(void)PE_parse_boot_argn("pandora_adsp", &on, sizeof(on));
+--- a/bsd/dev/pandora_touch.c
++++ b/bsd/dev/pandora_touch.c
+@@ -46,6 +46,10 @@
+     void *parameter, integer_t priority, thread_t *new_thread);
+ extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ void pandora_touch_init(void);
++extern void pandora_rpmh_lock(void);
++extern void pandora_rpmh_unlock(void);
++extern void pandora_apps_smmu_lock(void);
++extern void pandora_apps_smmu_unlock(void);
+ 
+ #define PT_GCC_PA     0x00100000u
+ #define PT_SE_PA      0x01a80000u
+@@ -383,7 +387,7 @@
+ 
+ /* Stream matches for the GPI and the QUP, pointing where UFS's 0x60 points. Idempotent. */
+ static int
+-pt_smmu_setup(void)
++pt_smmu_setup_locked(void)
+ {
+ 	static const uint16_t sid[] = {0x536, 0x523};
+ 	uint32_t nsmr = pt_rd(pt_smmu, 0x20) & 0xff, s2cr = 0;
+@@ -428,6 +432,15 @@
+ 		    pt_rd(pt_smmu, 0xc00 + 4 * freei));
+ 	}
+ 	return 0;
++}
++
++static int
++pt_smmu_setup(void)
++{
++	pandora_apps_smmu_lock();
++	int err = pt_smmu_setup_locked();
++	pandora_apps_smmu_unlock();
++	return err;
+ }
+ 
+ static int
+@@ -746,7 +759,7 @@
+ 
+ /* One ACTIVE TCS with three commands (voltage, mode, enable), as sweet_rpmh.c. */
+ static int
+-pt_rpmh_vote(void)
++pt_rpmh_vote_locked(void)
+ {
+ 	pt_step("apps RSC DRV 2", PT_RSC_PA);
+ 	rh_drv = ml_io_map(PT_RSC_PA, 0x10000);
+@@ -833,6 +846,15 @@
+ 	pt_wr(rh_drv, tcs + 8, bit);
+ 	(void)rh_sync(tcs + 0, irq_en);
+ 	return 0;
++}
++
++static int
++pt_rpmh_vote(void)
++{
++	pandora_rpmh_lock();
++	int err = pt_rpmh_vote_locked();
++	pandora_rpmh_unlock();
++	return err;
+ }
+ 
+ /* ---- TouchComm ----------------------------------------------------------------- */
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -130,6 +130,9 @@
+ bsd/dev/qcom/ShengGpr.c			standard
+ bsd/dev/qcom/FatVolume.c		standard
+ bsd/dev/qcom/PeachMhiFirmware.c	standard
++bsd/dev/qcom/PeachMhiHost.c		standard
++bsd/dev/qcom/PeachWlfw.c		standard
++bsd/dev/pandora_wifi.c			standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+--- /dev/null
++++ b/bsd/dev/pandora_wifi.c
+@@ -0,0 +1,804 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Nezha/SM8850 Peach: board power, CESTA v3, PCIe0 and isolated firmware DMA.
++ * Register sequences follow Qualcomm's pci-msm.c, crm-v2.c, clk-rpmh.c and
++ * rpmh-regulator.c, plus this phone's captured DT. No Linux module ABI.
++ * Opt-in nezha_wifi=1; this bring-up path does not publish a working NIC.
++ * All buffers and mappings live until reboot, including on failure. */
++#if defined(PANDORA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/random.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
++#include "adreno/ArmSmmu4KStreams.h"
++#include "qcom/PeachMhiFirmware.h"
++#include "qcom/PeachMhiHost.h"
++#include "qcom/PeachWlfw.h"
++#include "qcom/NezhaPcieData.h"
++
++extern kern_return_t thread_terminate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t,
++    vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
++extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
++extern int pandora_rpmh_resource(const char *, uint32_t, uint32_t);
++extern int pandora_rpmh_arc(const char *, uint32_t);
++extern void pandora_apps_smmu_lock(void);
++extern void pandora_apps_smmu_unlock(void);
++extern int pandora_firmware_pread(const char *, uint64_t, void *, size_t, uint64_t *);
++void pandora_wifi_init(void);
++
++enum { W_GCC, W_PARF, W_PHY, W_SM, W_CRM, W_COMMON, W_CRMC, W_DBI,
++       W_ATU, W_CFG, W_BAR, W_SMMU, W_EN, W_SW, W_PERST, W_SOL, W_NWIN };
++struct wifi_window { uint64_t pa; size_t bytes; vm_offset_t va; };
++static struct wifi_window wifi_windows[W_NWIN] = {
++    {0x00100000, 0xb0000, 0}, {0x01c00000, 0x3000, 0},
++    {0x01c06000, 0x2000, 0}, {0x01d07000, 0x7000, 0},
++    {0x01d01000, 0x2000, 0}, {0x01d06000, 0x200, 0},
++    {0x01d03800, 0x2000, 0}, {0x400000000, 0x10000, 0},
++    {0x410000000, 0x1000, 0}, {0x400100000, 0x4000, 0},
++    {0x40400000, 0x200000, 0}, {0x15000000, 0x100000, 0},
++    {0x0f110000, 0x1000, 0}, {0x0f112000, 0x2000, 0},
++    {0x0f166000, 0x3000, 0}, {0x0f1cc000, 0x2000, 0},
++};
++static int wifi_fault, wifi_wait;
++static unsigned wifi_phase, wifi_bank, wifi_slot;
++static const char *wifi_step = "init";
++static uint64_t wifi_arena_pa, wifi_tables_pa;
++static vm_offset_t wifi_arena, wifi_tables;
++static ArmSmmu4KIo wifi_smmu_io;
++static ArmSmmu4KConfig wifi_table_config;
++static ArmSmmu4KResult wifi_table_result;
++static ArmSmmu4KContextConfig wifi_context;
++static ArmSmmu4KStreamState wifi_stream;
++static ArmSmmu4KStreamResult wifi_stream_result;
++static PeachMhiFirmware wifi_firmware;
++static PeachMhiHost wifi_host;
++static PeachWlfw wifi_wlfw;
++static uint64_t wifi_context_offset, wifi_dma_next, wifi_check_at;
++static uint32_t wifi_context_control;
++static unsigned wifi_table_next, wifi_allocations;
++static vm_offset_t wifi_owned_dma[PEACH_WLFW_SEGMENTS + 2];
++#define WIFI_IOVA 0x20000000ull
++#define WIFI_DMA_BYTES 0x920000u
++#define WIFI_DMA_LIMIT 0x28000000ull
++#define WIFI_TABLE_BYTES 0x50000u
++#define WIFI_TRY(expr) do { int err_ = (expr); if (err_) return err_; } while (0)
++
++static void
++wifi_sleep(void *unused, unsigned us)
++{
++    (void)unused;
++    uint64_t deadline;
++    clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++    (void)assert_wait_deadline(&wifi_wait, THREAD_UNINT, deadline);
++    thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++wifi_now(void *unused)
++{
++    (void)unused;
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++    return ns / 1000;
++}
++
++/* Use kernel_map rather than the small shared io_map submap. Merely mapping
++ * an unpowered window performs no device access. Partial mappings are retained. */
++static int
++wifi_map(unsigned index)
++{
++    struct wifi_window *w = &wifi_windows[index];
++    uint64_t pa = w->pa & ~(uint64_t)PAGE_MASK;
++    vm_size_t bytes = round_page(w->bytes + (w->pa - pa));
++    vm_offset_t va = 0;
++    if (w->va) return 0;
++    if (kmem_alloc(kernel_map, &va, bytes, KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT,
++        VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return ENOMEM;
++    for (vm_size_t off = 0; off < bytes; off += PAGE_SIZE) {
++        if (pmap_enter_options_addr(kernel_pmap, va + off, pa + off,
++            VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE,
++            PMAP_OPTIONS_NOWAIT, NULL) != KERN_SUCCESS) return ENOMEM;
++    }
++    w->va = va + (w->pa - pa);
++    return 0;
++}
++
++static int
++wifi_access(unsigned window, size_t off, uint64_t *value, unsigned write, unsigned wide)
++{
++    struct wifi_window *w = &wifi_windows[window];
++    size_t bytes = wide ? 8 : 4;
++    if (wifi_fault) return EIO;
++    if (!w->va || (off & (bytes - 1)) || off > w->bytes - bytes) return EINVAL;
++    if (fuxi_gpu_access(w->va + off, value, write, wide)) {
++        wifi_fault = 1;
++        printf("NEZHA WIFI: MMIO fault in %s at %#llx (%s); stopping\n",
++            wifi_step, w->pa + off, write ? "write" : "read");
++        return EIO;
++    }
++    return 0;
++}
++
++static int wifi_rd(unsigned w, size_t o, uint32_t *v)
++{
++    uint64_t value = 0;
++    int err = wifi_access(w, o, &value, 0, 0);
++    *v = (uint32_t)value;
++    return err;
++}
++static int wifi_wr(unsigned w, size_t o, uint32_t v)
++{
++    uint64_t value = v;
++    return wifi_access(w, o, &value, 1, 0);
++}
++static int wifi_modify(unsigned w, size_t o, uint32_t clear, uint32_t set)
++{
++    uint32_t value;
++    WIFI_TRY(wifi_rd(w, o, &value));
++    return wifi_wr(w, o, (value & ~clear) | set);
++}
++static int wifi_poll(unsigned w, size_t o, uint32_t mask, uint32_t want, unsigned ms)
++{
++    uint64_t end = wifi_now(NULL) + ms * 1000ull;
++    do {
++        uint32_t value;
++        WIFI_TRY(wifi_rd(w, o, &value));
++        if (value != 0xffffffffu && (value & mask) == want) return 0;
++        wifi_sleep(NULL, 1000);
++    } while (wifi_now(NULL) < end);
++    return ETIMEDOUT;
++}
++
++/* All pin settings below are from the captured pinctrl states. The pinctrl-
++ * canoe source gives mux selector 1 for gpio18/19/103's requested functions. */
++static int wifi_pin(unsigned w, size_t off, unsigned mux, unsigned pull,
++                    unsigned drive, int output)
++{
++    if (output >= 0) WIFI_TRY(wifi_modify(w, off + 4, 2, output ? 2 : 0));
++    return wifi_modify(w, off, 0x3ff, pull | mux << 2 | drive << 6 |
++        (output >= 0 ? 1u << 9 : 0));
++}
++
++static int
++wifi_power(void)
++{
++    /* CNSS vreg list order with this board's DT voltage/load overrides.
++     * Mode is sent only when the provider defines it; 5 is PMIC7 LDO OPM.
++     * wcal-pbs is a calibration trigger, not a rail in cnss_vreg_list. */
++    static const struct { const char *name; uint16_t mv; uint8_t mode; } rails[] = {
++        {"L3G_E0", 1200, 5}, {"L3K_E1", 1200, 7}, {"L2G_E0", 1800, 5},
++        {"S2J_E1", 892, 0}, {"S8F_E0", 1876, 0}, {"S7F_E0", 1328, 7},
++        {"S1J_E1", 892, 0},
++    };
++    wifi_step = "board power";
++    WIFI_TRY(wifi_pin(W_PERST, 0, 0, 1, 0, 0));
++    WIFI_TRY(wifi_pin(W_EN, 0, 0, 1, 0, 0));
++    wifi_sleep(NULL, 5000);
++    for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++        WIFI_TRY(pandora_rpmh_resource(rails[i].name, 0, rails[i].mv));
++        if (rails[i].mode) WIFI_TRY(pandora_rpmh_resource(rails[i].name, 8, rails[i].mode));
++        WIFI_TRY(pandora_rpmh_resource(rails[i].name, 4, 1));
++    }
++    WIFI_TRY(pandora_rpmh_resource("C1A_E0", 4, 1));
++    WIFI_TRY(wifi_modify(W_SW, 0, 0x3c, 1u << 2));
++    WIFI_TRY(wifi_modify(W_SW, 0x1000, 0x3c, 1u << 2));
++    WIFI_TRY(wifi_pin(W_SOL, 0, 0, 1, 1, 0));
++    WIFI_TRY(wifi_pin(W_SOL, 0x1000, 0, 0, 0, -1));
++    WIFI_TRY(wifi_pin(W_PERST, 0x1000, 1, 3, 0, -1));
++    WIFI_TRY(wifi_pin(W_PERST, 0x2000, 0, 3, 0, -1));
++    WIFI_TRY(wifi_pin(W_EN, 0, 0, 3, 7, 1));
++    wifi_sleep(NULL, 1000);
++    wifi_phase = 1;
++    return 0;
++}
++
++static int
++wifi_cesta(unsigned perf)
++{
++    uint32_t cfg, enabled, update, busy;
++    wifi_step = "CESTA v3";
++    WIFI_TRY(wifi_rd(W_COMMON, 0x0c, &enabled));
++    WIFI_TRY(wifi_rd(W_COMMON, 4, &cfg));
++    unsigned resources = (cfg >> 6) & 15, nodes = (cfg >> 26) & 31;
++    unsigned states = cfg & 15, channels = (cfg >> 4) & 3;
++    if (!enabled || enabled == 0xffffffffu || channels != 2 || states != 2 ||
++        resources < 1 || resources > 2 || nodes > 16 || perf > 5 ||
++        (nodes && 0xb0 + (nodes - 1) * 0x2c + 0x14 + states * 4 > 0x370)) return ENOTSUP;
++    WIFI_TRY(wifi_rd(W_CRM, 0x374, &update));
++    WIFI_TRY(wifi_rd(W_CRM, 0x370, &busy));
++    if (update & ~3u || update == 3 || (busy & ~3u)) return EBUSY;
++    unsigned old = update == 2 ? 1 : 0, target = update ? old ^ 1 : 0;
++    /* Preserve every other resource and passthrough vote in HW DRV0. Only
++     * RC0 PERF_OL state 0/1 belongs to this driver. Do not touch HW DRV1. */
++    for (unsigned type = 0; type < 2; type++) {
++        unsigned n = type ? nodes : resources, base = type ? 0xb0 : 0;
++        for (unsigned r = 0; r < n; r++) for (unsigned s = 0; s < states; s++) {
++            uint32_t value;
++            size_t off = base + r * 0x2c + s * 4;
++            WIFI_TRY(wifi_rd(W_CRM, off + old * 0x14, &value));
++            if (!type && !r) value = perf;
++            WIFI_TRY(wifi_wr(W_CRM, off + target * 0x14, value));
++        }
++    }
++    WIFI_TRY(wifi_wr(W_CRM, 0x374, 1u << target));
++    WIFI_TRY(wifi_poll(W_CRM, 0x370, 1u << target, 1u << target, 10));
++    return 0;
++}
++
++static int
++wifi_pcie_resources(void)
++{
++    wifi_step = "PCIe state manager";
++    WIFI_TRY(wifi_wr(W_SM, 0x1040, 0));
++    WIFI_TRY(wifi_wr(W_SM, 0x1048, 0));
++    for (unsigned i = 0; i < sizeof(wifi_sm_seq) / 4; i++)
++        WIFI_TRY(wifi_wr(W_SM, 4 * i, wifi_sm_seq[i]));
++    for (unsigned i = 0; i < sizeof(wifi_sm_branch) / 4; i++)
++        WIFI_TRY(wifi_wr(W_SM, 0x1000 + 4 * i, wifi_sm_branch[i]));
++    WIFI_TRY(wifi_modify(W_SM, 0x1090, 0, 1));
++    /* GCC's captured mx provider has init-voltage-level=384. */
++    WIFI_TRY(pandora_rpmh_arc("lmx.lvl", 384));
++    wifi_step = "PCIe PHY GDSC";
++    WIFI_TRY(wifi_modify(W_GCC, 0x6c000, 0xfff002, 0x222000));
++    WIFI_TRY(wifi_modify(W_GCC, 0x5214c, 4, 0));
++    WIFI_TRY(wifi_poll(W_GCC, 0x6c004, 1u << 16, 1u << 16, 10));
++    WIFI_TRY(wifi_modify(W_GCC, 0x6c000, 0, 1u << 11));
++    WIFI_TRY(wifi_cesta(4)); /* DT target Gen3 -> performance level 4. */
++    wifi_phase = 2;
++    return 0;
++}
++
++static int
++wifi_atu(unsigned region, uint32_t type, uint64_t base, uint64_t end, uint64_t target)
++{
++    unsigned off = region * 0x200;
++    WIFI_TRY(wifi_wr(W_ATU, off, type));
++    WIFI_TRY(wifi_wr(W_ATU, off + 8, (uint32_t)base));
++    WIFI_TRY(wifi_wr(W_ATU, off + 12, (uint32_t)(base >> 32)));
++    WIFI_TRY(wifi_wr(W_ATU, off + 16, (uint32_t)end));
++    WIFI_TRY(wifi_wr(W_ATU, off + 20, (uint32_t)target));
++    WIFI_TRY(wifi_wr(W_ATU, off + 24, (uint32_t)(target >> 32)));
++    WIFI_TRY(wifi_wr(W_ATU, off + 4, 1u << 31));
++    return wifi_poll(W_ATU, off + 4, 1u << 31, 1u << 31, 10);
++}
++
++/* The controller's hardware BDF-to-SID table uses the PCIe CRC8 hash. This
++ * computes that required register index, not a file-integrity check. */
++static unsigned wifi_sid_hash(unsigned bdf)
++{
++    unsigned crc = 0;
++    for (int shift = 8; shift >= 0; shift -= 8) {
++        crc ^= (bdf >> shift) & 255;
++        for (unsigned i = 0; i < 8; i++) crc = (crc << 1) ^ ((crc & 128) ? 7 : 0);
++        crc &= 255;
++    }
++    return crc;
++}
++
++static int
++wifi_core_preset(uint32_t capability)
++{
++    /* Extended capability offsets vary with Synopsys IP revision. */
++    unsigned offset = 0x100, gen = capability & 15, lanes = (capability >> 4) & 63;
++    WIFI_TRY(wifi_modify(W_DBI, 0x8bc, 0, 1));
++    for (unsigned visited = 0; offset && visited < 64; visited++) {
++        uint32_t header;
++        if ((offset & 3) || offset < 0x100 || offset > 0xfc0) return EINVAL;
++        WIFI_TRY(wifi_rd(W_DBI, offset, &header));
++        if (!header || header == 0xffffffffu) break;
++        unsigned id = header & 65535;
++        if ((id == 0x19 && gen >= 3) || (id == 0x26 && gen >= 4)) {
++            unsigned first = id == 0x19 ? 12 : 32, step = id == 0x19 ? 2 : 4;
++            for (unsigned i = 0; i < lanes; i += step)
++                WIFI_TRY(wifi_wr(W_DBI, offset + first + i / step * 4, 0x55555555));
++        }
++        unsigned next = header >> 20;
++        if (next && next <= offset) return EINVAL;
++        offset = next;
++    }
++    return wifi_modify(W_DBI, 0x8bc, 1, 0);
++}
++
++/* Polling must suppress interrupts at the endpoint, not just at PARF.
++ * Never enable bus mastering before every discovered MSI/MSI-X is disabled
++ * and legacy INTx is masked. Capability offsets come from this endpoint. */
++static int
++wifi_mask_interrupts(void)
++{
++    uint32_t value, next;
++    WIFI_TRY(wifi_rd(W_CFG, 4, &value));
++    WIFI_TRY(wifi_wr(W_CFG, 4, (value & 0xfffbu) | 0x400));
++    if (value & 0x100000) {
++        WIFI_TRY(wifi_rd(W_CFG, 0x34, &next));
++        next &= 255;
++        uint64_t visited = 0;
++        for (unsigned n = 0; next && n < 48; n++) {
++            if ((next & 3) || next < 0x40 || next > 0xfc || visited & 1ull << (next / 4))
++                return EINVAL;
++            visited |= 1ull << (next / 4);
++            WIFI_TRY(wifi_rd(W_CFG, next, &value));
++            uint32_t masked = value;
++            if ((value & 255) == 5) masked &= ~(1u << 16);
++            if ((value & 255) == 0x11) masked = (masked & ~(1u << 31)) | 1u << 30;
++            if (masked != value) {
++                WIFI_TRY(wifi_wr(W_CFG, next, masked));
++                uint32_t check;
++                WIFI_TRY(wifi_rd(W_CFG, next, &check));
++                if (check != masked) return EIO;
++            }
++            next = (value >> 8) & 255;
++        }
++        if (next) return EINVAL;
++    }
++    WIFI_TRY(wifi_rd(W_CFG, 4, &value));
++    return (value & 0x404) == 0x400 ? 0 : EIO;
++}
++
++static int
++wifi_pcie_link(void)
++{
++    uint32_t value;
++    wifi_step = "PCIe core reset";
++    WIFI_TRY(wifi_modify(W_GCC, 0x6b000, 0, 1));
++    WIFI_TRY(wifi_modify(W_GCC, 0x6c01c, 0, 1));
++    wifi_sleep(NULL, 1000);
++    WIFI_TRY(wifi_modify(W_GCC, 0x6c01c, 1, 0));
++    WIFI_TRY(wifi_modify(W_GCC, 0x6b000, 1, 0));
++    wifi_sleep(NULL, 1000);
++    wifi_step = "PCIe PARF";
++    WIFI_TRY(wifi_wr(W_PARF, 0x1000, 4));
++    WIFI_TRY(wifi_modify(W_PARF, 0x40, 1, 0));
++    WIFI_TRY(wifi_wr(W_PARF, 0, 0x365e));
++    WIFI_TRY(wifi_modify(W_PARF, 0x174, 0, 1u << 4));
++    WIFI_TRY(wifi_wr(W_PARF, 0x22c, 0)); /* Ring polling; no unhandled IRQs. */
++    WIFI_TRY(wifi_wr(W_PARF, 0x508, 0));
++    WIFI_TRY(wifi_wr(W_PARF, 0x350, 0));
++    WIFI_TRY(wifi_wr(W_PARF, 0x354, 4));
++    WIFI_TRY(wifi_wr(W_PARF, 0x634, 0x10000000));
++    WIFI_TRY(wifi_wr(W_PARF, 0x638, 4));
++    WIFI_TRY(wifi_wr(W_PARF, 0x358, 0));
++    WIFI_TRY(wifi_wr(W_PARF, 0x35c, 0x80000000));
++    WIFI_TRY(wifi_modify(W_PARF, 0x1a8, 1u << 31, 0));
++    WIFI_TRY(wifi_modify(W_PARF, 0x1a4, 1, 0));
++    WIFI_TRY(wifi_modify(W_PARF, 0x4a0, 1, 0));
++    wifi_step = "PCIe PHY sequence";
++    WIFI_TRY(wifi_wr(W_PHY, 0x440, 3));
++    for (unsigned i = 0; i < sizeof(wifi_phy_seq) / sizeof(wifi_phy_seq[0]); i++) {
++        WIFI_TRY(wifi_wr(W_PHY, wifi_phy_seq[i][0], wifi_phy_seq[i][1]));
++        if (wifi_phy_seq[i][2]) wifi_sleep(NULL, wifi_phy_seq[i][2]);
++    }
++    wifi_sleep(NULL, 1000);
++    WIFI_TRY(wifi_poll(W_PHY, 0x414, 1u << 7, 0, 100));
++    wifi_sleep(NULL, 10000); /* DT qcom,ep-latency=10 ms. */
++    WIFI_TRY(wifi_modify(W_DBI, 0x714, 0, 1u << 5));
++    WIFI_TRY(wifi_modify(W_DBI, 0x80c, 0x1f00, 1u << 8));
++    WIFI_TRY(wifi_rd(W_DBI, 0x7c, &value));
++    for (unsigned gen = 3; gen <= (value & 15) && gen <= 4; gen++) {
++        WIFI_TRY(wifi_modify(W_DBI, 0x890, 3u << 24, (gen - 3) << 24));
++        WIFI_TRY(wifi_modify(W_DBI, 0x8a8, 0xffff00, 0));
++        WIFI_TRY(wifi_modify(W_DBI, 0x890, 1, 0));
++        WIFI_TRY(wifi_modify(W_DBI, 0x8ac, 31, 0));
++    }
++    WIFI_TRY(wifi_core_preset(value));
++    WIFI_TRY(wifi_modify(W_DBI, 0x9c, 15, 3));
++    WIFI_TRY(wifi_rd(W_DBI, 0x78, &value));
++    WIFI_TRY(wifi_wr(W_DBI, 0x78, (value & 0x8fff) | 0x5000));
++    WIFI_TRY(wifi_modify(W_PARF, 0x2c4, 1, 0));
++    WIFI_TRY(wifi_pin(W_PERST, 0, 0, 1, 0, 1));
++    wifi_sleep(NULL, 1000);
++    wifi_step = "PCIe link training";
++    WIFI_TRY(wifi_modify(W_PARF, 0x1b0, 0, 1u << 8));
++    WIFI_TRY(wifi_poll(W_DBI, 0xf28, 0x400, 0x400, 100));
++    WIFI_TRY(wifi_poll(W_DBI, 0x80, 1u << 29, 1u << 29, 100));
++    WIFI_TRY(wifi_rd(W_DBI, 0x80, &value));
++    printf("NEZHA WIFI: PCIe Gen%u x%u\n", (value >> 16) & 15, (value >> 20) & 63);
++    WIFI_TRY(wifi_modify(W_DBI, 0x80, 0xffff0003u, 0)); /* No ASPM until MHI PM exists. */
++    WIFI_TRY(wifi_wr(W_DBI, 0xb40, 20));
++    WIFI_TRY(wifi_modify(W_PARF, 0x2c48, 0, 9));
++    for (unsigned i = 0; i < 256; i++) WIFI_TRY(wifi_wr(W_PARF, 0x2000 + 4 * i, 0));
++    WIFI_TRY(wifi_wr(W_PARF, 0x2000 + 4 * wifi_sid_hash(0x100), 0x01000100));
++    WIFI_TRY(wifi_modify(W_PARF, 0x2c00, 1, 0));
++    /* CFG0 only bus 1. Region 2 maps the captured 32-bit MEM range. */
++    WIFI_TRY(wifi_atu(0, 4, 0x400100000, 0x40010ffff, 0x01000000));
++    WIFI_TRY(wifi_atu(2, 0, 0x40300000, 0x43ffffff, 0x40300000));
++    wifi_step = "Peach endpoint";
++    WIFI_TRY(wifi_rd(W_CFG, 0, &value));
++    if (value != 0x110e17cb) return ENODEV;
++    WIFI_TRY(wifi_mask_interrupts());
++    WIFI_TRY(wifi_rd(W_CFG, 4, &value));
++    WIFI_TRY(wifi_wr(W_CFG, 4, value & 0xfff8));
++    uint32_t bar, size;
++    WIFI_TRY(wifi_rd(W_CFG, 0x10, &bar));
++    if ((bar & 7) != 4) return ENOTSUP;
++    WIFI_TRY(wifi_wr(W_CFG, 0x10, 0xffffffffu));
++    WIFI_TRY(wifi_rd(W_CFG, 0x10, &size));
++    WIFI_TRY(wifi_wr(W_CFG, 0x10, bar));
++    if ((size & ~15u) != 0xffe00000u) return ENOTSUP;
++    WIFI_TRY(wifi_wr(W_CFG, 0x10, 0x40400000 | (bar & 15)));
++    WIFI_TRY(wifi_wr(W_CFG, 0x14, 0));
++    WIFI_TRY(wifi_rd(W_CFG, 0x18, &bar));
++    if (bar & 1) return ENOTSUP;
++    WIFI_TRY(wifi_wr(W_CFG, 0x18, 0x40300000 | (bar & 15)));
++    if ((bar & 6) == 4) WIFI_TRY(wifi_wr(W_CFG, 0x1c, 0));
++    WIFI_TRY(wifi_wr(W_DBI, 0x18, 0x00010100));
++    WIFI_TRY(wifi_wr(W_DBI, 0x20, 0x43f04030));
++    WIFI_TRY(wifi_wr(W_DBI, 0x24, 0x0000fff0));
++    WIFI_TRY(wifi_rd(W_DBI, 4, &value));
++    WIFI_TRY(wifi_wr(W_DBI, 4, (value & 0xffff) | 6));
++    WIFI_TRY(wifi_rd(W_CFG, 4, &value));
++    WIFI_TRY(wifi_wr(W_CFG, 4, (value & 0xfffb) | 2));
++    wifi_phase = 3;
++    return 0;
++}
++
++static int wifi_smmu_read32(void *c, size_t o, uint32_t *v)
++{ (void)c; return wifi_rd(W_SMMU, o, v); }
++static int wifi_smmu_write32(void *c, size_t o, uint32_t v)
++{ (void)c; return wifi_wr(W_SMMU, o, v); }
++static int wifi_smmu_read64(void *c, size_t o, uint64_t *v)
++{ (void)c; return wifi_access(W_SMMU, o, v, 0, 1); }
++static int wifi_smmu_write64(void *c, size_t o, uint64_t v)
++{ (void)c; return wifi_access(W_SMMU, o, &v, 1, 1); }
++static int wifi_smmu_barrier(void *c)
++{ (void)c; __asm__ volatile("dsb sy" ::: "memory"); return wifi_fault ? EIO : 0; }
++
++static vm_offset_t wifi_contig(size_t bytes, uint64_t *pa)
++{
++    vm_offset_t va = 0;
++    if (kmem_alloc_contig(kernel_map, &va, bytes, PAGE_MASK, 0, 0,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return 0;
++    *pa = ptoa_64(pmap_find_phys(kernel_pmap, va));
++    return va;
++}
++
++/* pmap changes every CPU alias and performs the required cache/TLB transition.
++ * Use normal NC for shared rings/data, avoiding an assumption that a newly
++ * powered endpoint already has snoop attributes configured like Android. */
++static void wifi_nocache(vm_offset_t va, size_t bytes)
++{
++    for (size_t off = 0; off < bytes; off += PAGE_SIZE)
++        pmap_set_cache_attributes(pmap_find_phys(kernel_pmap, va + off), VM_WIMG_WCOMB);
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++wifi_dma_locked(void)
++{
++    uint32_t id0, id1, id2;
++    WIFI_TRY(wifi_rd(W_SMMU, 0x20, &id0));
++    WIFI_TRY(wifi_rd(W_SMMU, 0x24, &id1));
++    WIFI_TRY(wifi_rd(W_SMMU, 0x28, &id2));
++    unsigned slots = id0 & 255, banks = id1 & 255, s2banks = (id1 >> 16) & 255;
++    uint64_t page = id1 & (1u << 31) ? 0x10000 : 0x1000;
++    uint64_t cbbase = page << (((id1 >> 28) & 7) + 1);
++    if (!(id0 & 1u << 27) || !slots || !banks || banks > 128 || s2banks >= banks ||
++        cbbase + banks * page > wifi_windows[W_SMMU].bytes || id0 & 1u << 8) return ENOTSUP;
++    bool used[128] = {false}, asid_used[256] = {false};
++    wifi_slot = ~0u;
++    for (unsigned s = 0; s < slots; s++) {
++        uint32_t smr, route;
++        WIFI_TRY(wifi_rd(W_SMMU, 0x800 + s * 4, &smr));
++        WIFI_TRY(wifi_rd(W_SMMU, 0xc00 + s * 4, &route));
++        if (!(smr & 1u << 31)) { if (wifi_slot == ~0u) wifi_slot = s; continue; }
++        if (((0x1401u ^ smr) & ~(smr >> 16) & 0x7fff) == 0) return EBUSY;
++        if (((route >> 16) & 3) == 0 && (route & 255) < banks) used[route & 255] = true;
++    }
++    wifi_bank = ~0u;
++    for (unsigned b = s2banks; b < banks; b++) {
++        uint32_t ctl;
++        WIFI_TRY(wifi_rd(W_SMMU, cbbase + b * page, &ctl));
++        if (!(ctl & 1) && !used[b]) { if (wifi_bank == ~0u) wifi_bank = b; continue; }
++        if (ctl & 1) {
++            uint64_t ttbr;
++            WIFI_TRY(wifi_access(W_SMMU, cbbase + b * page + 0x20, &ttbr, 0, 1));
++            if ((ttbr >> 48) < 256) asid_used[ttbr >> 48] = true;
++        }
++    }
++    unsigned asid = 1;
++    while (asid < 256 && asid_used[asid]) asid++;
++    if (wifi_slot == ~0u || wifi_bank == ~0u || asid == 256) return EBUSY;
++    wifi_smmu_io = (ArmSmmu4KIo){NULL, wifi_windows[W_SMMU].bytes,
++        wifi_smmu_read32, wifi_smmu_read64, wifi_smmu_write32, wifi_smmu_write64, wifi_smmu_barrier};
++    /* The endpoint is still in PBL with PCI_COMMAND_MASTER clear. Only a free
++     * exact stream slot and a disabled unreferenced stage-1 bank are claimed. */
++    WIFI_TRY(wifi_wr(W_SMMU, 0xc00 + wifi_slot * 4, 2u << 16));
++    ArmSmmu4KStream route = {wifi_slot, 0x1401};
++    if (ArmSmmu4KCheckFaultedStreams(&wifi_smmu_io, &route, 1, wifi_bank,
++        &wifi_stream_result) != ArmSmmu4KSuccess) return EBUSY;
++    wifi_arena = wifi_contig(WIFI_DMA_BYTES, &wifi_arena_pa);
++    wifi_tables = wifi_contig(WIFI_TABLE_BYTES, &wifi_tables_pa);
++    if (!wifi_arena || !wifi_tables) return ENOMEM;
++    wifi_nocache(wifi_arena, WIFI_DMA_BYTES);
++    static const uint8_t widths[] = {32, 36, 40, 42, 44, 48};
++    unsigned encoding = (id2 >> 4) & 15;
++    if (encoding >= sizeof(widths) || (wifi_arena_pa + WIFI_DMA_BYTES) >> widths[encoding] ||
++        (wifi_tables_pa + WIFI_TABLE_BYTES) >> widths[encoding]) return ENOTSUP;
++    wifi_table_config = (ArmSmmu4KConfig){32, widths[encoding], wifi_tables_pa,
++        (WIFI_DMA_LIMIT - WIFI_IOVA) / 0x1000};
++    ArmSmmu4KRange range = {WIFI_IOVA, wifi_arena_pa, WIFI_DMA_BYTES,
++        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2};
++    if (ArmSmmu4KBuild(&wifi_table_config, &range, 1, (uint64_t *)wifi_tables,
++        WIFI_TABLE_BYTES / 0x1000, &wifi_table_result) != ArmSmmu4KSuccess) return ENOTSUP;
++    clean_dcache64(wifi_tables_pa, WIFI_TABLE_BYTES, TRUE);
++    wifi_context = (ArmSmmu4KContextConfig){&wifi_table_config, NULL, &wifi_table_result,
++        NULL, id0, id2, asid, 0, 0, 0};
++    /* No qcom,actlr entry in the captured apps SMMU DT matches SID 0x1401. */
++    WIFI_TRY(wifi_wr(W_SMMU, cbbase + wifi_bank * page + 4, 0));
++    uint32_t actlr;
++    WIFI_TRY(wifi_rd(W_SMMU, cbbase + wifi_bank * page + 4, &actlr));
++    if (actlr) return EIO;
++    ArmSmmu4KProgramResult result;
++    if (ArmSmmu4KProgramDisabledContext(&wifi_smmu_io, wifi_bank, &wifi_context,
++        1000, &result) != ArmSmmu4KSuccess) return EIO;
++    if (ArmSmmu4KAttachStreams(&wifi_smmu_io, &wifi_stream, &route, 1, wifi_bank,
++        &wifi_context, &wifi_stream_result) != ArmSmmu4KSuccess) return EIO;
++    wifi_context_offset = cbbase + wifi_bank * page;
++    /* The common programming/attachment helpers run while bus mastering is
++     * off. From here the owned bank uses bounded FSR polling, with CFIE clear;
++     * do not send faults to an IRQ for which this port has no dispatcher. */
++    WIFI_TRY(wifi_rd(W_SMMU, wifi_context_offset, &wifi_context_control));
++    wifi_context_control &= ~(1u << 6);
++    WIFI_TRY(wifi_wr(W_SMMU, wifi_context_offset, wifi_context_control));
++    uint32_t control;
++    WIFI_TRY(wifi_rd(W_SMMU, wifi_context_offset, &control));
++    if (control != wifi_context_control) return EIO;
++    wifi_table_next = (unsigned)wifi_table_result.table_pages;
++    wifi_dma_next = WIFI_IOVA + WIFI_DMA_BYTES;
++    printf("NEZHA WIFI: SID 0x1401 -> bank %u slot %u ASID %u, IOVA %#llx/%#x\n",
++        wifi_bank, wifi_slot, asid, WIFI_IOVA, WIFI_DMA_BYTES);
++    wifi_phase = 4;
++    return 0;
++}
++
++static int
++wifi_dma_health(void)
++{
++    if (!wifi_context_offset) return 0;
++    uint64_t now = wifi_now(NULL);
++    if (now < wifi_check_at) return wifi_fault ? EIO : 0;
++    wifi_check_at = now + 1000;
++    uint32_t fsr, control, smr, s2cr;
++    WIFI_TRY(wifi_rd(W_SMMU, wifi_context_offset + 0x58, &fsr));
++    WIFI_TRY(wifi_rd(W_SMMU, wifi_context_offset, &control));
++    WIFI_TRY(wifi_rd(W_SMMU, 0x800 + wifi_slot * 4, &smr));
++    WIFI_TRY(wifi_rd(W_SMMU, 0xc00 + wifi_slot * 4, &s2cr));
++    if ((fsr & 0xc00001feu) || control != wifi_context_control ||
++        smr != 0x80001401u || s2cr != wifi_bank) {
++        uint64_t far = 0;
++        if (fsr & 0xc00001feu) (void)wifi_access(W_SMMU, wifi_context_offset + 0x60, &far, 0, 1);
++        printf("NEZHA WIFI: own DMA fault/change FSR=%#x FAR=%#llx SCTLR=%#x SMR=%#x S2CR=%#x\n",
++            fsr, far, control, smr, s2cr);
++        wifi_fault = 1;
++        return EIO;
++    }
++    return 0;
++}
++
++/* Append only previously invalid LPAE entries in our owned domain. IOVAs are
++ * monotonic; no reuse, unmap, replacement or device-visible address is returned
++ * on failure. Initial tables and every partially mapped allocation are kept.
++ * As arm-smmu/io-pgtable-arm, new valid mappings need table clean + publication,
++ * not invalidation of other contexts or the shared global SMMU. */
++static int
++wifi_allocate_dma(void *unused, size_t bytes, PeachMhiDma *out)
++{
++    (void)unused;
++    size_t rounded = round_page(bytes);
++    if (!out || !bytes || rounded < bytes || wifi_allocations >= PEACH_WLFW_SEGMENTS + 2 ||
++        wifi_dma_next >= WIFI_DMA_LIMIT || rounded > WIFI_DMA_LIMIT - wifi_dma_next) return ENOMEM;
++    vm_offset_t va = 0;
++    if (kmem_alloc(kernel_map, &va, rounded, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++        VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return ENOMEM;
++    wifi_owned_dma[wifi_allocations++] = va;
++    wifi_nocache(va, rounded);
++    pandora_apps_smmu_lock();
++    int err = wifi_dma_health();
++    uint64_t iova = wifi_dma_next;
++    for (size_t off = 0; !err && off < rounded; off += 0x1000) {
++        uint64_t address = iova + off;
++        uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, va + off)) + ((va + off) & PAGE_MASK);
++        if (!pa || (pa & 0xfff) || pa >> wifi_table_config.output_bits) { err = EIO; break; }
++        uint64_t *table = (uint64_t *)wifi_tables;
++        for (unsigned level = wifi_table_result.start_level; level < 3; level++) {
++            unsigned shift = 39 - 9 * level;
++            unsigned width = level == wifi_table_result.start_level ? 32 - shift : 9;
++            uint64_t *entry = &table[(address >> shift) & ((1u << width) - 1)];
++            if (!*entry) {
++                if (wifi_table_next >= WIFI_TABLE_BYTES / 0x1000) { err = ENOMEM; break; }
++                *entry = (wifi_tables_pa + 0x1000ull * wifi_table_next++) | 3;
++            }
++            uint64_t page = *entry & 0xfffffffff000ull;
++            if ((*entry & 3) != 3 || page < wifi_tables_pa || page - wifi_tables_pa >= WIFI_TABLE_BYTES) {
++                err = EIO; break;
++            }
++            table = (uint64_t *)(wifi_tables + page - wifi_tables_pa);
++        }
++        if (err) break;
++        uint64_t *leaf = &table[(address >> 12) & 511];
++        if (*leaf) { err = EBUSY; break; }
++        *leaf = pa | (3ull << 53) | 1u << 11 | 1u << 10 | 2u << 8 | 1u << 6 | 3;
++    }
++    clean_dcache64(wifi_tables_pa, WIFI_TABLE_BYTES, TRUE);
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (!err) {
++        *out = (PeachMhiDma){(void *)va, iova, bytes};
++        wifi_dma_next += rounded;
++    }
++    pandora_apps_smmu_unlock();
++    return err;
++}
++
++static int wifi_dma(void)
++{
++    wifi_step = "isolated WLAN DMA";
++    pandora_apps_smmu_lock();
++    int err = wifi_dma_locked();
++    pandora_apps_smmu_unlock();
++    return err;
++}
++
++static PeachMhiDma wifi_dma_part(size_t offset, size_t bytes)
++{
++    return (PeachMhiDma){(void *)(wifi_arena + offset), WIFI_IOVA + offset, bytes};
++}
++static int wifi_firmware_read(void *c, uint64_t o, void *p, size_t n)
++{ (void)c; return pandora_firmware_pread("peach/amss20.bin", o, p, n, NULL); }
++static int wifi_bar_read(void *c, uint32_t o, uint32_t *v)
++{ (void)c; WIFI_TRY(wifi_dma_health()); return wifi_rd(W_BAR, o, v); }
++static int wifi_bar_write(void *c, uint32_t o, uint32_t v)
++{ (void)c; WIFI_TRY(wifi_dma_health()); return wifi_wr(W_BAR, o, v); }
++static void wifi_dma_sync(void *c, const PeachMhiDma *dma, size_t bytes)
++{
++    (void)c;
++    (void)dma; (void)bytes; /* Shared DMA has only normal-NC CPU mappings. */
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++static PeachMhiIo wifi_mhi_io = {NULL, wifi_bar_read, wifi_bar_write, wifi_dma_sync,
++    wifi_now, wifi_sleep, 0x200000};
++static void wifi_barrier(void *c)
++{ (void)c; __asm__ volatile("dsb sy" ::: "memory"); }
++static int wifi_wlfw_file(void *c, const char *name, uint64_t o, void *p, size_t n, uint64_t *size)
++{ (void)c; return pandora_firmware_pread(name, o, p, n, size); }
++static void wifi_wlfw_log(void *c, const char *s, uint32_t a, uint32_t b)
++{ (void)c; printf("NEZHA WIFI: %s %#x %#x\n", s, a, b); }
++static const PeachWlfwOps wifi_wlfw_ops = {NULL, wifi_allocate_dma, wifi_wlfw_file,
++    wifi_wlfw_log, WIFI_IOVA, WIFI_DMA_LIMIT - WIFI_IOVA};
++
++static int
++wifi_stage_firmware(void)
++{
++    uint64_t bytes = 0;
++    wifi_step = "stage Peach firmware";
++    WIFI_TRY(pandora_firmware_pread("peach/amss20.bin", 0, NULL, 0, &bytes));
++    if (bytes <= PEACH_MHI_SEGMENT_BYTES) return EINVAL;
++    uint64_t amss = bytes - PEACH_MHI_SEGMENT_BYTES;
++    unsigned count = (unsigned)((amss + PEACH_MHI_SEGMENT_BYTES - 1) / PEACH_MHI_SEGMENT_BYTES);
++    if (count > PEACH_MHI_MAX_SEGMENTS || (count + 1ull) * PEACH_MHI_SEGMENT_BYTES > 0x800000) return EFBIG;
++    wifi_firmware.sbl = wifi_dma_part(0, PEACH_MHI_SEGMENT_BYTES);
++    for (unsigned i = 0; i < count; i++)
++        wifi_firmware.amss[i] = wifi_dma_part((i + 1) * PEACH_MHI_SEGMENT_BYTES, PEACH_MHI_SEGMENT_BYTES);
++    wifi_firmware.vectors = wifi_dma_part(0x800000, 0x1000);
++    int err = peach_mhi_firmware_stage(&wifi_firmware, wifi_firmware_read, NULL, bytes);
++    if (err) return EINVAL;
++    wifi_phase = 5;
++    return 0;
++}
++
++static int
++wifi_start(void)
++{
++    for (unsigned i = 0; i < W_NWIN; i++) WIFI_TRY(wifi_map(i));
++    WIFI_TRY(wifi_power());
++    WIFI_TRY(wifi_pcie_resources());
++    WIFI_TRY(wifi_pcie_link());
++    WIFI_TRY(wifi_dma());
++    WIFI_TRY(wifi_stage_firmware());
++    wifi_step = "BHI SBL download";
++    uint32_t command, session;
++    read_random(&session, sizeof(session));
++    session = (session & 0x3fffffffu) | 1;
++    WIFI_TRY(wifi_rd(W_CFG, 4, &command));
++    WIFI_TRY(wifi_wr(W_CFG, 4, (command & 0xffff) | 6));
++    int err = peach_mhi_download_sbl(&wifi_firmware, &wifi_mhi_io, session);
++    if (err) {
++        printf("NEZHA WIFI: BHI result %d, status %#x\n", err, wifi_firmware.last_status);
++        return EIO;
++    }
++    wifi_phase = 6;
++    wifi_step = "MHI READY/M0";
++    err = peach_mhi_host_start(&wifi_host, &wifi_mhi_io,
++        wifi_dma_part(0x810000, PEACH_MHI_HOST_BYTES), wifi_barrier);
++    if (err) return EIO;
++    WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 1, 10000));
++    wifi_phase = 7;
++    wifi_step = "BHIe AMSS download";
++    read_random(&session, sizeof(session));
++    session = (session & 0x3fffffffu) | 1;
++    err = peach_mhi_download_amss(&wifi_firmware, &wifi_mhi_io, session);
++    if (err) {
++        printf("NEZHA WIFI: BHIe result %d, status %#x\n", err, wifi_firmware.last_status);
++        return EIO;
++    }
++    WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 2, 10000));
++    wifi_step = "MHI IPCR channels";
++    if (peach_wlfw_init(&wifi_wlfw, &wifi_host, &wifi_wlfw_ops)) return EIO;
++    if (peach_mhi_host_open_ipcr(&wifi_host)) return EIO;
++    wifi_phase = 8;
++    wifi_step = "QRTR/WLFW bootstrap";
++    err = peach_wlfw_bootstrap(&wifi_wlfw);
++    if (err) {
++        printf("NEZHA WIFI: WLFW phase %u failed: %d\n", wifi_wlfw.phase, err);
++        return EIO;
++    }
++    wifi_phase = 9;
++    printf("NEZHA WIFI: FW_INIT_DONE received; CE/WMI/HTT not yet connected\n");
++    return ENOTSUP;
++}
++
++/* PERST assertion is the sole recovery write permitted after another MMIO
++ * fault. It uses only the already mapped, always-on TLMM GPIO102 window.
++ * Retain DMA and tables even if containment fails; never infer drain. */
++static void wifi_contain(void)
++{
++    if (wifi_windows[W_PERST].va) {
++        uint64_t value;
++        uintptr_t va = wifi_windows[W_PERST].va + 4;
++        if (!fuxi_gpu_access(va, &value, 0, 0)) {
++            value &= ~2ull;
++            unsigned failed = fuxi_gpu_access(va, &value, 1, 0);
++            uint64_t config = 0, check = 2;
++            failed |= fuxi_gpu_access(va - 4, &config, 0, 0);
++            failed |= fuxi_gpu_access(va, &check, 0, 0);
++            failed |= (config & 0x23c) != 0x200 || (check & 2) != 0;
++            printf("NEZHA WIFI: PERST %s; drain unproven, DMA retained\n",
++                failed ? "containment unconfirmed" : "GPIO assertion read back");
++        }
++    }
++}
++
++static void
++wifi_thread(void *unused, wait_result_t result)
++{
++    (void)unused; (void)result;
++    wifi_sleep(NULL, 20000000);
++    int err = wifi_start();
++    if (err) wifi_contain();
++    printf("NEZHA WIFI: phase %u stopped in %s: %d; no network interface published\n",
++        wifi_phase, wifi_step, err);
++    thread_terminate(current_thread());
++}
++
++void
++pandora_wifi_init(void)
++{
++    int on = 0;
++    thread_t thread;
++    (void)PE_parse_boot_argn("nezha_wifi", &on, sizeof(on));
++    if (on != 1) return;
++    DTEntry root;
++    const void *data;
++    unsigned size = 0;
++    if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++        SecureDTGetProperty(root, "compatible", &data, &size) != kSuccess) return;
++    bool nezha = false;
++    for (unsigned off = 0; off < size;) {
++        size_t n = strnlen((const char *)data + off, size - off);
++        if (n == size - off) return;
++        if (n == 12 && !memcmp((const char *)data + off, "xiaomi,nezha", 12)) nezha = true;
++        off += (unsigned)n + 1;
++    }
++    if (!nezha) return;
++    if (kernel_thread_start(wifi_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/NezhaPcieData.h
+@@ -0,0 +1,215 @@
++/* Generated from the captured Nezha live.dtb; do not edit tables. */
++#ifndef NEZHA_PCIE_DATA_H
++#define NEZHA_PCIE_DATA_H
++static const uint32_t wifi_phy_seq[][3] = {
++    {0x1440, 0x3, 0},
++    {0x30, 0x1b, 0},
++    {0x34, 0x14, 0},
++    {0x7c, 0x0, 0},
++    {0x80, 0x40, 0},
++    {0x84, 0x0, 0},
++    {0xb4, 0x4, 0},
++    {0xe0, 0x5, 0},
++    {0xe4, 0x0, 0},
++    {0xf4, 0x7, 0},
++    {0xf8, 0x1f, 0},
++    {0x58, 0x90, 0},
++    {0x118, 0x2, 0},
++    {0x11c, 0xd, 0},
++    {0x148, 0x53, 0},
++    {0x14c, 0x54, 0},
++    {0x2dc, 0xb, 0},
++    {0x2ec, 0x4, 0},
++    {0x2f0, 0x5, 0},
++    {0x2f4, 0x15, 0},
++    {0x370, 0x0, 0},
++    {0x378, 0x89, 0},
++    {0x3b4, 0x2d, 0},
++    {0x128, 0x20, 0},
++    {0x3d8, 0x1c, 0},
++    {0x3dc, 0x2f, 0},
++    {0x3e0, 0x84, 0},
++    {0x2b8, 0x1, 0},
++    {0x2bc, 0x5, 0},
++    {0x2c4, 0x0, 0},
++    {0x2c8, 0x0, 0},
++    {0x2b4, 0x0, 0},
++    {0x258, 0x40, 0},
++    {0x25c, 0x42, 0},
++    {0x284, 0x18, 0},
++    {0x298, 0x12, 0},
++    {0x2ac, 0x18, 0},
++    {0x418, 0xc2, 0},
++    {0x41c, 0xc2, 0},
++    {0x420, 0x18, 0},
++    {0x428, 0xf, 0},
++    {0x434, 0x62, 0},
++    {0x460, 0xe4, 0},
++    {0x464, 0x63, 0},
++    {0x468, 0xd8, 0},
++    {0x46c, 0x99, 0},
++    {0x470, 0x67, 0},
++    {0x484, 0xa4, 0},
++    {0x488, 0xa4, 0},
++    {0x48c, 0x28, 0},
++    {0x490, 0x9f, 0},
++    {0x494, 0x48, 0},
++    {0x498, 0x24, 0},
++    {0x51c, 0x1, 0},
++    {0x520, 0x0, 0},
++    {0x578, 0x0, 0},
++    {0x57c, 0x8, 0},
++    {0x580, 0x88, 0},
++    {0x31c, 0xff, 0},
++    {0x320, 0xff, 0},
++    {0x308, 0x30, 0},
++    {0x30c, 0x3, 0},
++    {0x398, 0x1f, 0},
++    {0x39c, 0x1f, 0},
++    {0x3a0, 0xd, 0},
++    {0x830, 0x1b, 0},
++    {0x834, 0x14, 0},
++    {0x87c, 0x0, 0},
++    {0x880, 0x40, 0},
++    {0x884, 0x0, 0},
++    {0x8b4, 0x4, 0},
++    {0x8e0, 0x5, 0},
++    {0x8e4, 0x0, 0},
++    {0x8f4, 0x7, 0},
++    {0x8f8, 0x1f, 0},
++    {0x858, 0x90, 0},
++    {0x918, 0x2, 0},
++    {0x91c, 0xd, 0},
++    {0x948, 0x53, 0},
++    {0x94c, 0x54, 0},
++    {0xadc, 0xb, 0},
++    {0xaec, 0x4, 0},
++    {0xaf0, 0x5, 0},
++    {0xaf4, 0x15, 0},
++    {0xb70, 0x0, 0},
++    {0xb78, 0x89, 0},
++    {0xbb4, 0x2d, 0},
++    {0x928, 0x20, 0},
++    {0xbd8, 0x1c, 0},
++    {0xbdc, 0x2f, 0},
++    {0xbe0, 0x84, 0},
++    {0xab8, 0x1, 0},
++    {0xabc, 0x5, 0},
++    {0xac4, 0x0, 0},
++    {0xac8, 0x0, 0},
++    {0xab4, 0x0, 0},
++    {0xa58, 0x40, 0},
++    {0xa5c, 0x42, 0},
++    {0xa84, 0x18, 0},
++    {0xa98, 0x12, 0},
++    {0xaac, 0x18, 0},
++    {0xc18, 0xc2, 0},
++    {0xc1c, 0xc2, 0},
++    {0xc20, 0x18, 0},
++    {0xc28, 0xf, 0},
++    {0xc34, 0x62, 0},
++    {0xc60, 0xe4, 0},
++    {0xc64, 0x63, 0},
++    {0xc68, 0xd8, 0},
++    {0xc6c, 0x99, 0},
++    {0xc70, 0x67, 0},
++    {0xc84, 0xa4, 0},
++    {0xc88, 0xa4, 0},
++    {0xc8c, 0x28, 0},
++    {0xc90, 0x9f, 0},
++    {0xc94, 0x48, 0},
++    {0xc98, 0x24, 0},
++    {0xd1c, 0x1, 0},
++    {0xd20, 0x0, 0},
++    {0xd78, 0x0, 0},
++    {0xd7c, 0x8, 0},
++    {0xd80, 0x88, 0},
++    {0xb1c, 0xff, 0},
++    {0xb20, 0xff, 0},
++    {0xb08, 0x30, 0},
++    {0xb0c, 0x3, 0},
++    {0xb98, 0x1f, 0},
++    {0xb9c, 0x1f, 0},
++    {0xba0, 0xd, 0},
++    {0x1000, 0x93, 0},
++    {0x1004, 0x1, 0},
++    {0x1010, 0x6, 0},
++    {0x1014, 0x16, 0},
++    {0x1018, 0x36, 0},
++    {0x101c, 0x4, 0},
++    {0x1020, 0xa, 0},
++    {0x1024, 0x1a, 0},
++    {0x1028, 0x34, 0},
++    {0x1030, 0x55, 0},
++    {0x1034, 0x55, 0},
++    {0x1038, 0x1, 0},
++    {0x103c, 0x1, 0},
++    {0x1060, 0xf8, 0},
++    {0x1064, 0x1, 0},
++    {0x1070, 0x6, 0},
++    {0x1074, 0x16, 0},
++    {0x1078, 0x36, 0},
++    {0x107c, 0xa, 0},
++    {0x1080, 0x4, 0},
++    {0x1084, 0xd, 0},
++    {0x1088, 0x41, 0},
++    {0x1090, 0xab, 0},
++    {0x1094, 0xaa, 0},
++    {0x1098, 0x1, 0},
++    {0x109c, 0x0, 0},
++    {0x10bc, 0xa, 0},
++    {0x10c0, 0x1, 0},
++    {0x10cc, 0x62, 0},
++    {0x10d0, 0x2, 0},
++    {0x10dc, 0x14, 0},
++    {0x10e0, 0x90, 0},
++    {0x10e4, 0x82, 0},
++    {0x10f4, 0xf, 0},
++    {0x1110, 0x8, 0},
++    {0x1120, 0x46, 0},
++    {0x1124, 0x4, 0},
++    {0x1140, 0x14, 0},
++    {0x1164, 0x34, 0},
++    {0x1170, 0xa0, 0},
++    {0x1174, 0x16, 0},
++    {0x1184, 0x88, 0},
++    {0x1188, 0x4, 0},
++    {0x1198, 0xf, 0},
++    {0x12b4, 0x2, 0},
++    {0x1570, 0x17, 0},
++    {0x1578, 0x2e, 0},
++    {0x1590, 0xcc, 0},
++    {0x15b8, 0x40, 0},
++    {0x15dc, 0x4, 0},
++    {0x15e0, 0x2, 0},
++    {0x1818, 0xc0, 0},
++    {0x15f8, 0x0, 0},
++    {0x15fc, 0x22, 0},
++    {0x180c, 0x1d, 0},
++    {0x181c, 0xc1, 0},
++    {0x1890, 0x0, 0},
++    {0x18a0, 0x16, 0},
++    {0x18f0, 0x27, 0},
++    {0x18f4, 0x27, 0},
++    {0x1908, 0x2, 0},
++    {0x195c, 0x2e, 0},
++    {0x197c, 0x3, 0},
++    {0x1984, 0x28, 0},
++    {0x198c, 0x0, 0},
++    {0x19ac, 0x2, 0},
++    {0x19c0, 0x2, 0},
++    {0x19d0, 0x1f, 0},
++    {0x1400, 0x0, 0},
++    {0x1444, 0x3, 0},
++};
++static const uint32_t wifi_sm_seq[] = {
++    0x1c018081, 0x70074002, 0x50028000, 0x28007003,
++    0x80804002, 0x70021c01, 0x18002802, 0x70005000,
++    0x10004000, 0x80814002, 0x18001c01, 0x1c018080,
++    0x1000,
++};
++static const uint32_t wifi_sm_branch[] = {
++    0x4, 0x1c, 0x24, 0x2c,
++    0x0, 0x0, 0x0,
++};
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/PeachMhiHost.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_MHI_HOST_H
++#define PEACH_MHI_HOST_H
++#include "PeachMhiFirmware.h"
++
++#define PEACH_MHI_HOST_BYTES 0x110000u
++#define PEACH_MHI_IPCR_MTU 8192u
++
++/* One worker owns host state, rings and receive callbacks. memory must be
++ * coherent little-endian DMA belonging to SID 0x1401's isolated domain.
++ * The caller masks PCI MSI/INTx while polling, holds endpoint power, and
++ * retains all storage until real endpoint containment, including on errors. */
++typedef struct {
++    PeachMhiDma memory;
++    const PeachMhiIo *io;
++    void (*barrier)(void *);
++    void (*receive)(void *, const void *, size_t);
++    void *receive_context;
++    uint32_t channel_db, event_db, bhi;
++    unsigned event_rp[2], event_wp[2];
++    unsigned tx_rp, tx_wp, rx_rp, rx_wp, cmd_wp;
++    uint64_t pending_cmd;
++    unsigned pending_channel, command_done, environment, state, ipcr_up, poisoned;
++} PeachMhiHost;
++
++/* After BHI SBL transfer: wait RESET clear/READY, publish actual contexts and
++ * event rings, enter M0, and hold DEVICE_WAKE. No network interface is made. */
++int peach_mhi_host_start(PeachMhiHost *, const PeachMhiIo *, PeachMhiDma,
++                         void (*barrier)(void *));
++/* Consume at most budget events; an empty ring returns immediately. The
++ * caller sleeps between polls. Invalid device pointers permanently poison
++ * this host. No packet or event pointer is trusted as a CPU address. */
++int peach_mhi_host_poll(PeachMhiHost *, unsigned budget);
++/* Called after firmware download reports success and BHI EE is AMSS. */
++int peach_mhi_host_open_ipcr(PeachMhiHost *);
++/* -6 is ring full: poll/sleep and retry the same packet without dropping it. */
++int peach_mhi_host_send(PeachMhiHost *, const void *, size_t);
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/PeachMhiHost.c
+@@ -0,0 +1,266 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Native Peach IPCR transport. MHI layouts and state transitions follow
++ * Qualcomm's drivers/bus/mhi/{common.h,host/{init,main,pm}.c}. Polling replaces
++ * IRQ scheduling only; firmware still produces real contexts/completions. */
++#include "PeachMhiHost.h"
++#include <string.h>
++
++enum { CHCTX = 0, EVCTX = 0x800, CMDCTX = 0x900, CMDRING = 0x1000,
++       CTRL_RING = 0x2000, DATA_RING = 0x3000, TX_RING = 0x4000,
++       RX_RING = 0x5000, RX_DATA = 0x10000, TX_DATA = 0x90000, CTX_BYTES = 44 };
++#define HOST_TRY(x) do { int e_ = (x); if (e_) { h->poisoned = 1; return e_; } } while (0)
++
++/* MHI contexts have u64 fields aligned to 4, with 44-byte stride. Native
++ * 32-bit accesses preserve that ABI without unaligned volatile u64 loads.
++ * All ring/context IOVAs are deliberately constrained below 4 GiB. */
++static uint32_t get32(PeachMhiHost *h, size_t off)
++{ return *(volatile uint32_t *)((unsigned char *)h->memory.bytes + off); }
++static void put32(PeachMhiHost *h, size_t off, uint32_t value)
++{ *(volatile uint32_t *)((unsigned char *)h->memory.bytes + off) = value; }
++static uint64_t get64(PeachMhiHost *h, size_t off)
++{ uint32_t low = get32(h, off), high = get32(h, off + 4); return low | (uint64_t)high << 32; }
++static void put64(PeachMhiHost *h, size_t off, uint64_t value)
++{ put32(h, off + 4, (uint32_t)(value >> 32)); put32(h, off, (uint32_t)value); }
++static uint64_t dma(PeachMhiHost *h, size_t off) { return h->memory.iova + off; }
++static int rd(PeachMhiHost *h, unsigned off, uint32_t *v)
++{ return h->io->read32(h->io->context, off, v) ? PeachMhiIoError : 0; }
++static int wr(PeachMhiHost *h, unsigned off, uint32_t v)
++{ return h->io->write32(h->io->context, off, v) ? PeachMhiIoError : 0; }
++static int db(PeachMhiHost *h, unsigned off, uint64_t value)
++{
++    h->barrier(h->io->context);
++    HOST_TRY(wr(h, off + 4, (uint32_t)(value >> 32)));
++    return wr(h, off, (uint32_t)value);
++}
++static int poll_reg(PeachMhiHost *h, unsigned off, uint32_t mask, uint32_t want)
++{
++    uint64_t end = h->io->now_us(h->io->context) + 10000000;
++    do {
++        uint32_t value;
++        HOST_TRY(rd(h, off, &value));
++        if (value != 0xffffffffu && (value & mask) == want) return 0;
++        h->io->sleep_us(h->io->context, 1000);
++    } while (h->io->now_us(h->io->context) < end);
++    return PeachMhiTimeout;
++}
++static int index_of(PeachMhiHost *h, uint64_t ptr, unsigned base, unsigned n, unsigned *index)
++{
++    uint64_t first = dma(h, base);
++    if (ptr < first || ptr - first >= n * 16 || ((ptr - first) & 15)) return PeachMhiDeviceError;
++    *index = (unsigned)((ptr - first) / 16);
++    return 0;
++}
++static void context_ring(PeachMhiHost *h, unsigned ctx, unsigned base, unsigned n)
++{
++    put64(h, ctx + 12, dma(h, base));
++    put64(h, ctx + 20, n * 16);
++    put64(h, ctx + 28, dma(h, base));
++    put64(h, ctx + 36, dma(h, base));
++}
++static void descriptor(PeachMhiHost *h, unsigned off, uint64_t address, unsigned len, unsigned flags)
++{ put64(h, off, address); put32(h, off + 8, len); put32(h, off + 12, flags); }
++
++int
++peach_mhi_host_start(PeachMhiHost *h, const PeachMhiIo *io, PeachMhiDma memory,
++                     void (*barrier)(void *))
++{
++    if (!h || !io || !io->read32 || !io->write32 || !io->sync ||
++        !io->now_us || !io->sleep_us || !barrier || !memory.bytes ||
++        ((uintptr_t)memory.bytes & 7) || (memory.iova & 0xfff) ||
++        memory.capacity < PEACH_MHI_HOST_BYTES || memory.iova >= 0x100000000ull ||
++        PEACH_MHI_HOST_BYTES > 0x100000000ull - memory.iova || io->bar_bytes < 0x1000)
++        return PeachMhiInvalid;
++    memset(h, 0, sizeof(*h));
++    h->memory = memory; h->io = io; h->barrier = barrier;
++    uint32_t bytes, bhi;
++    HOST_TRY(rd(h, 0, &bytes));
++    HOST_TRY(rd(h, 0x28, &bhi));
++    HOST_TRY(rd(h, 0x18, &h->channel_db));
++    HOST_TRY(rd(h, 0x20, &h->event_db));
++    if (bytes < 0xa8 || bytes > io->bar_bytes || (h->channel_db & 7) ||
++        (h->event_db & 7) || h->channel_db < 0xa8 || h->event_db < 0xa8 ||
++        h->channel_db > io->bar_bytes - 128 * 8 || h->event_db > io->bar_bytes - 2 * 8 ||
++        (bhi & 3) || bhi < 0xa8 || bhi > io->bar_bytes - 0x44) {
++        h->poisoned = 1; return PeachMhiInvalid;
++    }
++    h->bhi = bhi;
++    HOST_TRY(poll_reg(h, 0x38, 2, 0));
++    HOST_TRY(poll_reg(h, 0x48, 1, 1));
++    memset(memory.bytes, 0, PEACH_MHI_HOST_BYTES);
++    for (unsigned i = 0; i < 32; i++) {
++        put32(h, CHCTX + i * CTX_BYTES, 2u << 8); /* burst disabled */
++        if (i == 20 || i == 21) {
++            put32(h, CHCTX + i * CTX_BYTES + 4, i == 20 ? 1 : 2);
++            put32(h, CHCTX + i * CTX_BYTES + 8, 1);
++        }
++    }
++    context_ring(h, CMDCTX, CMDRING, 128);
++    for (unsigned e = 0; e < 2; e++) {
++        unsigned base = e ? DATA_RING : CTRL_RING, n = e ? 256 : 32;
++        unsigned ctx = EVCTX + e * CTX_BYTES;
++        put32(h, ctx + 4, 1); put32(h, ctx + 8, e + 1);
++        context_ring(h, ctx, base, n);
++        h->event_wp[e] = n - 1;
++        put64(h, ctx + 36, dma(h, base + (n - 1) * 16));
++    }
++    io->sync(io->context, &h->memory, PEACH_MHI_HOST_BYTES);
++    HOST_TRY(db(h, 0x58, dma(h, CHCTX)));
++    HOST_TRY(db(h, 0x60, dma(h, EVCTX)));
++    HOST_TRY(db(h, 0x68, dma(h, CMDCTX)));
++    HOST_TRY(db(h, 0x80, memory.iova));
++    HOST_TRY(db(h, 0x98, memory.iova));
++    HOST_TRY(db(h, 0x88, memory.iova + PEACH_MHI_HOST_BYTES - 1));
++    HOST_TRY(db(h, 0xa0, memory.iova + PEACH_MHI_HOST_BYTES - 1));
++    uint32_t cfg, control;
++    HOST_TRY(rd(h, 0x10, &cfg));
++    HOST_TRY(wr(h, 0x10, (cfg & 0x0000ffffu) | 2u << 16));
++    HOST_TRY(db(h, h->event_db, dma(h, CTRL_RING + 31 * 16)));
++    HOST_TRY(db(h, h->event_db + 8, dma(h, DATA_RING + 255 * 16)));
++    HOST_TRY(rd(h, 0x38, &control));
++    HOST_TRY(wr(h, 0x38, (control & ~0xff00u) | 2u << 8));
++    HOST_TRY(poll_reg(h, 0x48, 0xff00, 2u << 8));
++    HOST_TRY(db(h, h->channel_db + 127 * 8, 1)); /* hold DEVICE_WAKE */
++    h->state = 2;
++    return 0;
++}
++
++static int recycle_rx(PeachMhiHost *h)
++{
++    unsigned index = h->rx_wp;
++    descriptor(h, RX_RING + index * 16, dma(h, RX_DATA + index * PEACH_MHI_IPCR_MTU),
++        PEACH_MHI_IPCR_MTU, 2u << 16 | 1u << 9);
++    h->rx_wp = (index + 1) & 63;
++    put64(h, CHCTX + 21 * CTX_BYTES + 36, dma(h, RX_RING + h->rx_wp * 16));
++    return db(h, h->channel_db + 21 * 8, dma(h, RX_RING + h->rx_wp * 16));
++}
++
++static int process_event(PeachMhiHost *h, unsigned off)
++{
++    uint64_t pointer = get64(h, off);
++    uint32_t d0 = get32(h, off + 8), d1 = get32(h, off + 12);
++    unsigned type = (d1 >> 16) & 255, ch = d1 >> 24, code = d0 >> 24;
++    if (type == 0x20) {
++        h->state = d0 >> 24;
++        if (h->state == 0xff) return PeachMhiDeviceError;
++        if (h->state == 3) { /* M1 while wake is held: request M0. */
++            uint32_t ctrl;
++            HOST_TRY(rd(h, 0x38, &ctrl));
++            HOST_TRY(wr(h, 0x38, (ctrl & ~0xff00u) | 2u << 8));
++        }
++        return 0;
++    }
++    if (type == 0x40) {
++        h->environment = d0 >> 24;
++        if (h->environment == 3 || (h->ipcr_up && h->environment != 2))
++            return PeachMhiWrongEnvironment; /* RDDM/restart requires containment. */
++        return 0;
++    }
++    if (type == 0x21) {
++        unsigned index;
++        HOST_TRY(index_of(h, pointer, CMDRING, 128, &index));
++        if (!h->pending_cmd || pointer != h->pending_cmd || code != 1 ||
++            get32(h, CMDRING + index * 16 + 12) >> 24 != h->pending_channel)
++            return PeachMhiDeviceError;
++        h->command_done = 1;
++        return 0;
++    }
++    if (type != 0x22 || (ch != 20 && ch != 21)) return PeachMhiDeviceError;
++    if (code == 5 || code == 6) { /* OOB/doorbell mode request consumes no TRE. */
++        unsigned base = ch == 20 ? TX_RING : RX_RING, wp = ch == 20 ? h->tx_wp : h->rx_wp;
++        return db(h, h->channel_db + ch * 8, dma(h, base + wp * 16));
++    }
++    unsigned index, base = ch == 20 ? TX_RING : RX_RING;
++    HOST_TRY(index_of(h, pointer, base, 64, &index));
++    if (code != 2 || (d0 & 65535) > PEACH_MHI_IPCR_MTU) return PeachMhiDeviceError;
++    if (ch == 20) {
++        if (h->tx_rp == h->tx_wp || index != h->tx_rp) return PeachMhiDeviceError;
++        h->tx_rp = (index + 1) & 63;
++    } else {
++        if (index != h->rx_rp) return PeachMhiDeviceError;
++        if (h->receive) h->receive(h->receive_context,
++            (unsigned char *)h->memory.bytes + RX_DATA + index * PEACH_MHI_IPCR_MTU, d0 & 65535);
++        h->rx_rp = (index + 1) & 63;
++        HOST_TRY(recycle_rx(h));
++    }
++    return 0;
++}
++
++int
++peach_mhi_host_poll(PeachMhiHost *h, unsigned budget)
++{
++    if (!h || !h->io || h->poisoned || !budget || budget > 512) return PeachMhiInvalid;
++    uint32_t status;
++    HOST_TRY(rd(h, 0x48, &status));
++    if (status == 0xffffffffu || (status & 4)) { h->poisoned = 1; return PeachMhiDeviceError; }
++    for (unsigned e = 0; e < 2 && budget; e++) {
++        unsigned base = e ? DATA_RING : CTRL_RING, n = e ? 256 : 32;
++        unsigned ctx = EVCTX + e * CTX_BYTES, device_index, consumed = 0;
++        h->barrier(h->io->context);
++        HOST_TRY(index_of(h, get64(h, ctx + 28), base, n, &device_index));
++        while (h->event_rp[e] != device_index && budget) {
++            h->barrier(h->io->context);
++            HOST_TRY(process_event(h, base + h->event_rp[e] * 16));
++            h->event_rp[e] = (h->event_rp[e] + 1) % n;
++            h->event_wp[e] = (h->event_wp[e] + 1) % n;
++            consumed++; budget--;
++        }
++        if (consumed) {
++            uint64_t wp = dma(h, base + h->event_wp[e] * 16);
++            put64(h, ctx + 36, wp);
++            HOST_TRY(db(h, h->event_db + e * 8, wp));
++        }
++    }
++    return 0;
++}
++
++static int start_channel(PeachMhiHost *h, unsigned ch)
++{
++    unsigned ring = ch == 20 ? TX_RING : RX_RING, ctx = CHCTX + ch * CTX_BYTES;
++    context_ring(h, ctx, ring, 64);
++    put32(h, ctx, 2u << 8 | 1); /* enabled, burst disabled */
++    unsigned off = CMDRING + h->cmd_wp * 16;
++    descriptor(h, off, 0, 0, ch << 24 | 0x12u << 16);
++    h->pending_cmd = dma(h, off); h->pending_channel = ch; h->command_done = 0;
++    h->cmd_wp = (h->cmd_wp + 1) & 127;
++    put64(h, CMDCTX + 36, dma(h, CMDRING + h->cmd_wp * 16));
++    HOST_TRY(db(h, 0x70, dma(h, CMDRING + h->cmd_wp * 16)));
++    uint64_t end = h->io->now_us(h->io->context) + 10000000;
++    while (!h->command_done && h->io->now_us(h->io->context) < end) {
++        HOST_TRY(peach_mhi_host_poll(h, 32));
++        if (!h->command_done) h->io->sleep_us(h->io->context, 1000);
++    }
++    if (!h->command_done) { h->poisoned = 1; return PeachMhiTimeout; }
++    h->pending_cmd = 0;
++    return 0;
++}
++
++int
++peach_mhi_host_open_ipcr(PeachMhiHost *h)
++{
++    if (!h || !h->io || h->poisoned || h->ipcr_up) return PeachMhiInvalid;
++    uint32_t ee;
++    HOST_TRY(rd(h, h->bhi + 0x28, &ee));
++    if (ee != 2) return PeachMhiWrongEnvironment;
++    h->environment = ee;
++    HOST_TRY(start_channel(h, 20));
++    HOST_TRY(start_channel(h, 21));
++    for (unsigned i = 0; i < 63; i++) HOST_TRY(recycle_rx(h));
++    h->ipcr_up = 1;
++    return 0;
++}
++
++int
++peach_mhi_host_send(PeachMhiHost *h, const void *packet, size_t bytes)
++{
++    if (!h || !h->ipcr_up || h->poisoned || !packet || !bytes || bytes > PEACH_MHI_IPCR_MTU)
++        return PeachMhiInvalid;
++    unsigned next = (h->tx_wp + 1) & 63;
++    if (next == h->tx_rp) return -6;
++    unsigned offset = TX_DATA + h->tx_wp * PEACH_MHI_IPCR_MTU;
++    memcpy((unsigned char *)h->memory.bytes + offset, packet, bytes);
++    descriptor(h, TX_RING + h->tx_wp * 16, dma(h, offset), (unsigned)bytes, 2u << 16 | 1u << 9);
++    h->tx_wp = next;
++    put64(h, CHCTX + 20 * CTX_BYTES + 36, dma(h, TX_RING + next * 16));
++    HOST_TRY(db(h, h->channel_db + 20 * 8, dma(h, TX_RING + next * 16)));
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachWlfw.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_WLFW_H
++#define PEACH_WLFW_H
++#include "PeachMhiHost.h"
++
++enum { PeachWlfwProtocol = -10, PeachWlfwRejected = -11,
++       PeachWlfwStorage = -12, PeachWlfwUnsupported = -13 };
++#define PEACH_WLFW_SEGMENTS 52u
++
++typedef struct {
++    void *context;
++    /* Return real, zeroed coherent DMA in this endpoint's domain. All storage
++     * is retained, even if a later allocation/transaction fails. */
++    int (*allocate)(void *, size_t, PeachMhiDma *);
++    int (*file_read)(void *, const char *, uint64_t, void *, size_t, uint64_t *);
++    void (*log)(void *, const char *, uint32_t, uint32_t);
++    uint64_t iova_base, iova_bytes;
++} PeachWlfwOps;
++
++typedef struct {
++    uint32_t size, type;
++    PeachMhiDma dma;
++} PeachWlfwMemory;
++
++/* One worker, one outstanding QMI transaction. Receive callbacks never wait,
++ * allocate, read UFS, or recursively poll MHI. Control replies have a bounded
++ * queue; overflow is an error, never a silent lost flow-control message. */
++typedef struct {
++    PeachMhiHost *host;
++    PeachWlfwOps ops;
++    uint32_t peer, server_node, server_port, local_node, local_port;
++    uint16_t transaction, awaiting, message, result, remote_error;
++    unsigned hello, hello_sent, server, flow_pending, response_ready, response_bytes;
++    unsigned control_rp, control_wp, control_count;
++    unsigned memory_requested, memory_responded, memory_count, memory_ready, firmware_ready;
++    unsigned phase;
++    uint32_t chip_id, board_id, soc_id;
++    int error;
++    unsigned char controls[64][52];
++    unsigned char packet[PEACH_MHI_IPCR_MTU];
++    unsigned char response[2304];
++    PeachWlfwMemory memory[PEACH_WLFW_SEGMENTS];
++} PeachWlfw;
++
++/* Install before IPCR is opened so an early HELLO cannot be lost. */
++int peach_wlfw_init(PeachWlfw *, PeachMhiHost *, const PeachWlfwOps *);
++int peach_wlfw_poll(PeachWlfw *);
++/* Real service discovery, host memory, BDF/regdb and PHY/AUX download. A zero
++ * result means FW_INIT_DONE was received, not that a Wi-Fi NIC exists. CE,
++ * HTC/WMI/HTT and network integration belong to the subsequent data path. */
++int peach_wlfw_bootstrap(PeachWlfw *);
++#endif
+--- /dev/null
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -0,0 +1,395 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* QRTR and WLFW wire ABI from net/qrtr and Qualcomm's matching
++ * platform/cnss_utils/wlan_firmware_service_v01.{c,h}, cnss2/{qmi,main}.c.
++ * No Linux sockets, module ABI, fake replies or unowned DMA addresses. */
++#include "PeachWlfw.h"
++#include <string.h>
++
++#define CTRL 0xfffffffeu
++#define WTRY(expr) do { int e_ = (expr); if (e_) return e_; } while (0)
++static uint16_t u16(const unsigned char *p) { return p[0] | (uint16_t)p[1] << 8; }
++static uint32_t u32(const unsigned char *p)
++{ return u16(p) | (uint32_t)u16(p + 2) << 16; }
++static uint64_t u64(const unsigned char *p) { return u32(p) | (uint64_t)u32(p + 4) << 32; }
++static void p16(unsigned char *p, unsigned v) { p[0] = v; p[1] = v >> 8; }
++static void p32(unsigned char *p, uint32_t v) { p16(p, v); p16(p + 2, v >> 16); }
++static void p64(unsigned char *p, uint64_t v) { p32(p, (uint32_t)v); p32(p + 4, (uint32_t)(v >> 32)); }
++static uint64_t now(PeachWlfw *w) { return w->host->io->now_us(w->host->io->context); }
++static void pause_poll(PeachWlfw *w) { w->host->io->sleep_us(w->host->io->context, 1000); }
++static void report(PeachWlfw *w, const char *s, uint32_t a, uint32_t b)
++{ if (w->ops.log) w->ops.log(w->ops.context, s, a, b); }
++
++static void header(unsigned char *p, unsigned type, uint32_t sn, uint32_t sp,
++                   uint32_t dn, uint32_t dp, unsigned size, unsigned confirm)
++{
++    p32(p, 1); p32(p + 4, type); p32(p + 8, sn); p32(p + 12, sp);
++    p32(p + 16, confirm); p32(p + 20, size); p32(p + 24, dn); p32(p + 28, dp);
++}
++
++static void control(PeachWlfw *w, unsigned type, uint32_t sn, uint32_t sp,
++                    uint32_t dn, uint32_t dp)
++{
++    if (w->error) return;
++    if (type == 2 && w->hello_sent) return;
++    if (w->control_count == 64) { w->error = PeachWlfwStorage; return; }
++    unsigned char *p = w->controls[w->control_wp];
++    memset(p, 0, 52);
++    header(p, type, sn, sp, dn, dp, 20, 0);
++    p32(p + 32, type);
++    if (type == 7) { p32(p + 36, sn); p32(p + 40, sp); }
++    w->control_wp = (w->control_wp + 1) & 63;
++    w->control_count++;
++    if (type == 2) w->hello_sent = 1;
++}
++
++/* Validate the complete TLV stream, including unknown extensions, before
++ * interpreting it. Duplicate requested fields cannot override earlier data. */
++static int tlvs_valid(const unsigned char *p, size_t n)
++{
++    while (n) {
++        if (n < 3 || u16(p + 1) > n - 3) return 0;
++        size_t step = 3 + u16(p + 1);
++        p += step; n -= step;
++    }
++    return 1;
++}
++static const unsigned char *field(PeachWlfw *w, const unsigned char *p, size_t n,
++                                  unsigned type, size_t *size)
++{
++    const unsigned char *found = NULL;
++    *size = 0;
++    while (n) {
++        size_t len = u16(p + 1), step = len + 3;
++        if (p[0] == type) {
++            if (found) { w->error = PeachWlfwProtocol; return NULL; }
++            found = p + 3; *size = len;
++        }
++        p += step; n -= step;
++    }
++    return found;
++}
++
++static void memory_request(PeachWlfw *w, const unsigned char *p, size_t n)
++{
++    size_t len;
++    const unsigned char *v = field(w, p, n, 1, &len);
++    if (w->error) return;
++    if (!v || !len || !v[0] || v[0] > PEACH_WLFW_SEGMENTS || w->memory_requested) {
++        w->error = PeachWlfwProtocol; return;
++    }
++    unsigned count = *v++; len--;
++    for (unsigned i = 0; i < count; i++) {
++        if (len < 9) { w->error = PeachWlfwProtocol; return; }
++        uint32_t bytes = u32(v), type = u32(v + 4);
++        unsigned cfg = v[8];
++        v += 9; len -= 9;
++        /* MSA/LPASS and pageable/MLO memory need additional ownership or
++         * protocols. Do not advertise those capabilities or invent support. */
++        if (!bytes || type < 1 || type > 12 || type == 6 || type == 8 ||
++            type == 9 || type == 11 || cfg > 2 || cfg * 13 > len) {
++            w->error = PeachWlfwUnsupported; return;
++        }
++        for (unsigned j = 0; j < cfg; j++, v += 13, len -= 13) {
++            uint64_t offset = u64(v);
++            uint32_t size = u32(v + 8);
++            if (v[12] || offset > bytes || size > bytes - offset) {
++                w->error = PeachWlfwUnsupported; return;
++            }
++        }
++        w->memory[i].size = bytes; w->memory[i].type = type;
++    }
++    if (len) { w->error = PeachWlfwProtocol; return; }
++    w->memory_count = count; w->memory_requested = 1;
++}
++
++static void qmi_receive(PeachWlfw *w, const unsigned char *p, size_t n)
++{
++    if (n < 7 || u16(p + 5) != n - 7 || !tlvs_valid(p + 7, n - 7)) {
++        w->error = PeachWlfwProtocol; return;
++    }
++    unsigned flags = p[0], txn = u16(p + 1), message = u16(p + 3);
++    const unsigned char *data = p + 7;
++    size_t bytes = n - 7;
++    if (flags == 2) { /* QMI_RESPONSE */
++        if (!w->awaiting || txn != w->awaiting || message != w->message) return;
++        size_t len;
++        const unsigned char *result = field(w, data, bytes, 2, &len);
++        if (w->error) return;
++        if (!result || len != 4 || bytes > sizeof(w->response) || w->response_ready) {
++            w->error = PeachWlfwProtocol; return;
++        }
++        w->result = u16(result); w->remote_error = u16(result + 2);
++        memcpy(w->response, data, bytes);
++        w->response_bytes = (unsigned)bytes; w->response_ready = 1;
++    } else if (flags == 4) { /* QMI_INDICATION */
++        switch (message) {
++        case 0x35: memory_request(w, data, bytes); break;
++        case 0x37: w->memory_ready = 1; break;
++        case 0x38: w->firmware_ready = 1; break;
++        case 0x5c: w->error = PeachMhiWrongEnvironment; break;
++        default: break;
++        }
++    } else { w->error = PeachWlfwProtocol; }
++}
++
++static void receive(void *context, const void *packet, size_t bytes)
++{
++    PeachWlfw *w = context;
++    const unsigned char *p = packet;
++    unsigned type, confirm, hdr, size;
++    uint32_t sn, sp, dn, dp;
++    if (w->error) return;
++    if (bytes < 16 || (bytes & 3)) { w->error = PeachWlfwProtocol; return; }
++    if (p[0] == 1 && bytes >= 32 && u32(p) == 1) {
++        hdr = 32; type = u32(p + 4); sn = u32(p + 8); sp = u32(p + 12);
++        confirm = !!u32(p + 16); size = u32(p + 20); dn = u32(p + 24); dp = u32(p + 28);
++    } else if (p[0] == 3) { /* Linux's QRTR_PROTO_VER_2 has wire version 3. */
++        hdr = 16u + p[3]; type = p[1]; confirm = p[2] & 1; size = u32(p + 4);
++        sn = u16(p + 8); sp = u16(p + 10); dn = u16(p + 12); dp = u16(p + 14);
++        if (sp == 0xfffe) sp = CTRL;
++        if (dp == 0xfffe) dp = CTRL;
++    } else { w->error = PeachWlfwProtocol; return; }
++    if (dp == 0xffff) dp = CTRL;
++    if (hdr > bytes || !size || size > bytes - hdr || ((size + 3u) & ~3u) != bytes - hdr ||
++        sn == w->local_node || sn == 0xffffffffu) { w->error = PeachWlfwProtocol; return; }
++    p += hdr;
++    if (type == 1) { /* QRTR_TYPE_DATA */
++        if (dn != w->local_node || dp != w->local_port) return;
++        /* The firmware's watermark must be acknowledged after actual delivery.
++         * Queue it; the RX callback must not wait for its own MHI completion. */
++        if (w->server && sn == w->server_node && sp == w->server_port) qmi_receive(w, p, size);
++        if (!w->error && confirm) control(w, 7, dn, dp, sn, sp);
++        return;
++    }
++    if (size < 20 || u32(p) != type) { w->error = PeachWlfwProtocol; return; }
++    if (type == 7) {
++        if (dn == w->local_node && u32(p + 4) == w->local_node &&
++            u32(p + 8) == w->local_port && sn == w->server_node && sp == w->server_port)
++            w->flow_pending = 0;
++        return;
++    }
++    if (dp != CTRL) { w->error = PeachWlfwProtocol; return; }
++    if (type == 2) { /* HELLO */
++        if (!w->hello) {
++            w->peer = sn; w->hello = 1;
++            control(w, 2, w->local_node, CTRL, sn, CTRL);
++            report(w, "QRTR HELLO", sn, 0);
++        } else if (sn != w->peer) w->error = PeachWlfwProtocol;
++    } else if (type == 4) { /* NEW_SERVER: version in instance's low byte. */
++        uint32_t service = u32(p + 4), instance = u32(p + 8), node = u32(p + 12), port = u32(p + 16);
++        if (service == 0x45 && instance == 0x101) {
++            if (!port || port >= CTRL || node == w->local_node || node == 0xffffffffu ||
++                (w->server && (node != w->server_node || port != w->server_port))) {
++                w->error = PeachWlfwProtocol; return;
++            }
++            w->server_node = node; w->server_port = port; w->server = 1;
++            report(w, "WLFW service", node, port);
++        }
++    } else if ((type == 3 && sn == w->peer) ||
++               (type == 5 && u32(p + 12) == w->server_node && u32(p + 16) == w->server_port)) {
++        w->error = PeachMhiWrongEnvironment;
++    }
++}
++
++int peach_wlfw_init(PeachWlfw *w, PeachMhiHost *host, const PeachWlfwOps *ops)
++{
++    if (!w || !host || !host->io || !ops || !ops->allocate || !ops->file_read ||
++        !ops->iova_bytes || ops->iova_base >= 0x100000000ull ||
++        ops->iova_bytes > 0x100000000ull - ops->iova_base) return PeachMhiInvalid;
++    memset(w, 0, sizeof(*w));
++    w->host = host; w->ops = *ops; w->local_node = 1; w->local_port = 0x4000;
++    host->receive = receive; host->receive_context = w;
++    return 0;
++}
++
++static int flush_controls(PeachWlfw *w)
++{
++    while (w->control_count) {
++        int err = peach_mhi_host_send(w->host, w->controls[w->control_rp], 52);
++        if (err == -6) return 0;
++        if (err) return err;
++        w->control_rp = (w->control_rp + 1) & 63; w->control_count--;
++    }
++    return 0;
++}
++int peach_wlfw_poll(PeachWlfw *w)
++{
++    if (!w || !w->host) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    WTRY(flush_controls(w));
++    WTRY(peach_mhi_host_poll(w->host, 32));
++    if (w->error) return w->error;
++    return flush_controls(w);
++}
++
++/* Payload is built in packet+39. All builders below have fixed schema bounds
++ * less than the 8192-byte IPCR MTU; no kernel stack packet arrays are used. */
++static size_t scalar(PeachWlfw *w, size_t n, unsigned type, uint64_t value, unsigned width)
++{
++    unsigned char *p = w->packet + 39 + n;
++    p[0] = type; p16(p + 1, width);
++    for (unsigned i = 0; i < width; i++) p[3 + i] = (unsigned char)(value >> (8 * i));
++    return n + 3 + width;
++}
++static int request(PeachWlfw *w, unsigned message, size_t bytes)
++{
++    if (w->awaiting || !w->server || bytes > sizeof(w->packet) - 42) return PeachMhiInvalid;
++    uint64_t end = now(w) + 10000000;
++    while (w->flow_pending >= 16 || w->control_count) {
++        WTRY(peach_wlfw_poll(w));
++        if (now(w) >= end) return PeachMhiTimeout;
++        if (w->flow_pending >= 16 || w->control_count) pause_poll(w);
++    }
++    if (!++w->transaction) ++w->transaction;
++    w->awaiting = w->transaction; w->message = (uint16_t)message; w->response_ready = 0;
++    header(w->packet, 1, w->local_node, w->local_port, w->server_node, w->server_port,
++        (unsigned)bytes + 7, w->flow_pending >= 7);
++    w->packet[32] = 0; /* QMI_REQUEST */
++    p16(w->packet + 33, w->awaiting); p16(w->packet + 35, message); p16(w->packet + 37, (unsigned)bytes);
++    size_t length = (39 + bytes + 3) & ~(size_t)3;
++    memset(w->packet + 39 + bytes, 0, length - 39 - bytes);
++    int err;
++    while ((err = peach_mhi_host_send(w->host, w->packet, length)) == -6) {
++        WTRY(peach_wlfw_poll(w));
++        if (now(w) >= end) return PeachMhiTimeout;
++        pause_poll(w);
++    }
++    if (err) return err;
++    w->flow_pending++;
++    while (!w->response_ready) {
++        WTRY(peach_wlfw_poll(w));
++        if (now(w) >= end) { report(w, "QMI timeout", message, w->awaiting); return PeachMhiTimeout; }
++        if (!w->response_ready) pause_poll(w);
++    }
++    w->awaiting = 0;
++    if (w->result) { report(w, "QMI rejected", message, w->remote_error); return PeachWlfwRejected; }
++    return 0;
++}
++static int wait_flag(PeachWlfw *w, const unsigned *flag)
++{
++    uint64_t end = now(w) + 30000000;
++    while (!*flag) {
++        WTRY(peach_wlfw_poll(w));
++        if (now(w) >= end) return PeachMhiTimeout;
++        if (!*flag) pause_poll(w);
++    }
++    return 0;
++}
++
++static int respond_memory(PeachWlfw *w)
++{
++    unsigned char *p = w->packet + 39;
++    p[0] = 1; p16(p + 1, 1 + w->memory_count * 17); p[3] = w->memory_count;
++    for (unsigned i = 0; i < w->memory_count; i++) {
++        PeachWlfwMemory *m = &w->memory[i];
++        if (w->ops.allocate(w->ops.context, m->size, &m->dma)) return PeachWlfwStorage;
++        if (!m->dma.bytes || m->dma.capacity < m->size || m->dma.iova < w->ops.iova_base ||
++            m->dma.iova - w->ops.iova_base >= w->ops.iova_bytes ||
++            m->size > w->ops.iova_bytes - (m->dma.iova - w->ops.iova_base)) return PeachWlfwStorage;
++        unsigned char *v = p + 4 + i * 17;
++        p64(v, m->dma.iova); p32(v + 8, m->size); p32(v + 12, m->type); v[16] = 0;
++        report(w, "firmware memory", m->type, m->size);
++    }
++    WTRY(request(w, 0x36, 4 + w->memory_count * 17));
++    w->memory_responded = 1;
++    return 0;
++}
++
++static int download_bdf(PeachWlfw *w, const char *name, unsigned type)
++{
++    uint64_t total;
++    if (w->ops.file_read(w->ops.context, name, 0, NULL, 0, &total) || !total || total > 0x200000)
++        return PeachWlfwStorage;
++    for (uint64_t off = 0, segment = 0; off < total; segment++) {
++        unsigned bytes = (unsigned)(total - off > 6144 ? 6144 : total - off);
++        size_t n = scalar(w, 0, 1, 1, 1);
++        n = scalar(w, n, 0x10, w->board_id, 4);
++        n = scalar(w, n, 0x11, total - off, 4); /* CNSS sends remaining bytes. */
++        n = scalar(w, n, 0x12, segment, 4);
++        unsigned char *p = w->packet + 39 + n;
++        p[0] = 0x13; p16(p + 1, bytes + 2); p16(p + 3, bytes);
++        if (w->ops.file_read(w->ops.context, name, off, p + 5, bytes, NULL)) return PeachWlfwStorage;
++        n += 5 + bytes;
++        n = scalar(w, n, 0x14, off + bytes == total, 1);
++        n = scalar(w, n, 0x15, type, 1);
++        WTRY(request(w, 0x25, n));
++        size_t len;
++        const unsigned char *flags = field(w, w->response, w->response_bytes, 0x10, &len);
++        if (w->error) return w->error;
++        if (flags) {
++            if (len != 8) return PeachWlfwProtocol;
++            if (u64(flags) & 6) return PeachWlfwUnsupported; /* radio off or extra CBC file required. */
++        }
++        off += bytes;
++    }
++    report(w, "board file downloaded", type, (uint32_t)total);
++    return 0;
++}
++
++static int download_dma_file(PeachWlfw *w, const char *name, unsigned message)
++{
++    uint64_t total;
++    PeachMhiDma dma = {0};
++    if (w->ops.file_read(w->ops.context, name, 0, NULL, 0, &total) || !total || total > 0x200000 ||
++        w->ops.allocate(w->ops.context, (size_t)total, &dma) || !dma.bytes || dma.capacity < total ||
++        dma.iova < w->ops.iova_base || dma.iova - w->ops.iova_base >= w->ops.iova_bytes ||
++        total > w->ops.iova_bytes - (dma.iova - w->ops.iova_base)) return PeachWlfwStorage;
++    if (w->ops.file_read(w->ops.context, name, 0, dma.bytes, (size_t)total, NULL)) return PeachWlfwStorage;
++    w->host->barrier(w->host->io->context);
++    size_t n = scalar(w, 0, 1, dma.iova, 8);
++    n = scalar(w, n, 2, total, 4);
++    WTRY(request(w, message, n));
++    report(w, "microcode downloaded", message, (uint32_t)total);
++    return 0;
++}
++
++int peach_wlfw_bootstrap(PeachWlfw *w)
++{
++    if (!w || !w->host || !w->host->ipcr_up || w->phase) return PeachMhiInvalid;
++    w->phase = 1;
++    control(w, 2, w->local_node, CTRL, 0xffffffffu, CTRL);
++    WTRY(wait_flag(w, &w->hello));
++    WTRY(wait_flag(w, &w->server));
++    size_t n = scalar(w, 0, 0x15, 0x4b4e454c, 4); /* WLFW_CLIENT_ID ABI. */
++    n = scalar(w, n, 0x16, 1, 1); n = scalar(w, n, 0x17, 1, 1);
++    n = scalar(w, n, 0x18, 1, 1); n = scalar(w, n, 0x24, 1, 1);
++    WTRY(request(w, 0x20, n));
++    w->phase = 2;
++    n = scalar(w, 0, 0x10, 1, 4);
++    n = scalar(w, n, 0x14, 1, 1); /* BDF */
++    n = scalar(w, n, 0x16, 1, 1); /* actual PHY microcode via M3_INFO */
++    n = scalar(w, n, 0x17, 0, 1); n = scalar(w, n, 0x1a, 0, 1); /* no cached calibration */
++    n = scalar(w, n, 0x21, 0, 1); n = scalar(w, n, 0x33, 0, 1); /* no MLO/dynamic reallocation */
++    unsigned char *p = w->packet + 39 + n;
++    p[0] = 0x1f; p16(p + 1, 48); memset(p + 3, 0, 48);
++    p64(p + 3, w->ops.iova_base); p64(p + 11, w->ops.iova_bytes); n += 51;
++    WTRY(request(w, 0x34, n));
++    WTRY(wait_flag(w, &w->memory_requested));
++    w->phase = 3;
++    WTRY(respond_memory(w));
++    WTRY(wait_flag(w, &w->memory_ready));
++    w->phase = 4;
++    WTRY(request(w, 0x24, 0));
++    size_t len;
++    p = (unsigned char *)field(w, w->response, w->response_bytes, 0x10, &len);
++    if (!p || len != 8 || w->error) return PeachWlfwProtocol;
++    w->chip_id = u32(p);
++    p = (unsigned char *)field(w, w->response, w->response_bytes, 0x11, &len);
++    if (!p || len != 4 || w->error) return PeachWlfwProtocol;
++    w->board_id = u32(p);
++    p = (unsigned char *)field(w, w->response, w->response_bytes, 0x12, &len);
++    if (!p || len != 4 || w->error) return PeachWlfwProtocol;
++    w->soc_id = u32(p);
++    report(w, "WLFW chip/board", w->chip_id, w->board_id);
++    /* These are this phone's captured Android-selected files. Do not select
++     * an unrelated board file from an older Snapdragon port. */
++    WTRY(download_bdf(w, "peach/regdb_xiaomi.bin", 4));
++    WTRY(download_bdf(w, "peach/bd_p1.elf", 1));
++    w->phase = 5;
++    WTRY(download_dma_file(w, "peach/phy_ucode20.elf", 0x3c));
++    WTRY(download_dma_file(w, "peach/aux_ucode20.elf", 0x5a));
++    WTRY(wait_flag(w, &w->firmware_ready));
++    w->phase = 6;
++    report(w, "WLFW FW_INIT_DONE", w->soc_id, w->memory_count);
++    return 0;
++}

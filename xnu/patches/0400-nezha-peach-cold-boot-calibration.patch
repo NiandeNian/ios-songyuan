@@ -1,0 +1,190 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.h b/bsd/dev/qcom/PeachWlfw.h
+--- a/bsd/dev/qcom/PeachWlfw.h
++++ b/bsd/dev/qcom/PeachWlfw.h
+@@ -33,7 +33,8 @@
+     unsigned hello, hello_sent, server, flow_pending, response_ready, response_bytes;
+     unsigned control_rp, control_wp, control_count;
+     unsigned memory_requested, memory_responded, memory_count, memory_ready, firmware_ready;
+-    unsigned phase;
++    unsigned phase, calibration_active, calibration_seen, calibration_done;
++    PeachMhiDma calibration; /* Retained CAL region across the one firmware restart. */
+     uint32_t chip_id, board_id, soc_id;
+     int error;
+     unsigned char controls[64][52];
+@@ -49,6 +50,9 @@
+  * result means FW_INIT_DONE was received, not that a Wi-Fi NIC exists. CE,
+  * HTC/WMI/HTT and network integration belong to the subsequent data path. */
+ int peach_wlfw_bootstrap(PeachWlfw *);
++/* Before WLAN_CFG: wait for real CAL_DONE, then OFF. The caller resets the
++ * endpoint and boots mission firmware with this same retained CAL region. */
++int peach_wlfw_calibrate(PeachWlfw *);
+ /* Call with CE DMA prepared, before enabling the host-owned CE rings. Does
+  * not advertise MSI, shadow-register acceleration, MLO or a working NIC. */
+ int peach_wlfw_wlan_enable(PeachWlfw *, const unsigned char mac[6]);
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -134,6 +134,17 @@
+         case 0x35: memory_request(w, data, bytes); break;
+         case 0x37: w->memory_ready = 1; break;
+         case 0x38: w->firmware_ready = 1; break;
++        case 0x3e: { /* CAL_DONE is an indication, never inferred from mode ACK. */
++            size_t len;
++            const unsigned char *size = field(w, data, bytes, 0x10, &len);
++            if (w->error || !w->calibration_active || w->calibration_seen ||
++                (size && (len != 8 || u64(size) > w->calibration.capacity))) {
++                w->error = PeachWlfwProtocol; return;
++            }
++            w->calibration_seen = 1;
++            report(w, "WLFW CAL_DONE bytes", size ? (uint32_t)u64(size) : 0, 0);
++            break;
++        }
+         case 0x5c: w->error = PeachMhiWrongEnvironment; break;
+         default: break;
+         }
+@@ -293,10 +304,13 @@
+     p[0] = 1; p16(p + 1, 1 + w->memory_count * 17); p[3] = w->memory_count;
+     for (unsigned i = 0; i < w->memory_count; i++) {
+         PeachWlfwMemory *m = &w->memory[i];
+-        if (w->ops.allocate(w->ops.context, m->size, &m->dma)) return PeachWlfwStorage;
++        if (m->type == 4 && w->calibration.bytes) {
++            m->dma = w->calibration; /* Mission firmware consumes real calibration output. */
++        } else if (w->ops.allocate(w->ops.context, m->size, &m->dma)) return PeachWlfwStorage;
+         if (!m->dma.bytes || m->dma.capacity < m->size || m->dma.iova < w->ops.iova_base ||
+             m->dma.iova - w->ops.iova_base >= w->ops.iova_bytes ||
+             m->size > w->ops.iova_bytes - (m->dma.iova - w->ops.iova_base)) return PeachWlfwStorage;
++        if (m->type == 4) w->calibration = m->dma;
+         unsigned char *v = p + 4 + i * 17;
+         p64(v, m->dma.iova); p32(v + 8, m->size); p32(v + 12, m->type); v[16] = 0;
+         report(w, "firmware memory", m->type, m->size);
+@@ -396,12 +410,14 @@
+     size_t n = scalar(w, 0, 0x15, 0x4b4e454c, 4); /* WLFW_CLIENT_ID ABI. */
+     n = scalar(w, n, 0x16, 1, 1); n = scalar(w, n, 0x17, 1, 1);
+     n = scalar(w, n, 0x18, 1, 1); n = scalar(w, n, 0x24, 1, 1);
++    n = scalar(w, n, 0x1b, 1, 1); /* CAL_DONE */
+     WTRY(request(w, 0x20, n));
+     w->phase = 2;
+     n = scalar(w, 0, 0x10, 1, 4);
+     n = scalar(w, n, 0x14, 1, 1); /* BDF */
+     n = scalar(w, n, 0x16, 1, 1); /* actual PHY microcode via M3_INFO */
+-    n = scalar(w, n, 0x17, 0, 1); n = scalar(w, n, 0x1a, 0, 1); /* no cached calibration */
++    n = scalar(w, n, 0x17, 0, 1); /* no cached M3 */
++    n = scalar(w, n, 0x1a, w->calibration_done, 1);
+     n = scalar(w, n, 0x21, 0, 1); n = scalar(w, n, 0x33, 0, 1); /* no MLO/dynamic reallocation */
+     /* CNSS and ath12k announce AUX_UC_SUPPORT before loading AUX microcode. */
+     n = scalar(w, n, 0x27, 1u << 6, 8);
+@@ -445,6 +461,29 @@
+     return 0;
+ }
+ 
++/* CNSS cold-boot sequence, also recorded in Armada patch 1151. The
++ * endpoint has not seen CE/WLAN_CFG yet. No calibration data is fabricated
++ * or written to persistent storage. */
++int peach_wlfw_calibrate(PeachWlfw *w)
++{
++    if (!w || w->phase != 6 || !w->firmware_ready || w->calibration_done ||
++        !w->calibration.bytes || w->calibration_active) return PeachMhiInvalid;
++    uint64_t start = now(w);
++    w->calibration_active = 1;
++    size_t n = scalar(w, 0, 1, 7, 4); /* CALIBRATION */
++    n = scalar(w, n, 0x10, 0, 1);
++    WTRY(request(w, 0x22, n));
++    WTRY(wait_flag(w, &w->calibration_seen));
++    w->host->barrier(w->host->io->context);
++    report(w, "WLFW cold calibration completed ms/IOVA", (uint32_t)((now(w) - start) / 1000),
++        (uint32_t)w->calibration.iova);
++    n = scalar(w, 0, 1, 4, 4); /* OFF before endpoint reset */
++    n = scalar(w, n, 0x10, 0, 1);
++    WTRY(request(w, 0x22, n));
++    w->calibration_done = 1;
++    return 0;
++}
++
+ int peach_wlfw_wlan_enable(PeachWlfw *w, const unsigned char mac[6])
+ {
+     if (!w || w->phase != 6 || !w->firmware_ready) return PeachMhiInvalid;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1026,13 +1026,11 @@
+ }
+ 
+ static int
+-wifi_start(void)
+-{
+-    for (unsigned i = 0; i < W_NWIN; i++) WIFI_TRY(wifi_map(i));
+-    WIFI_TRY(wifi_power());
+-    WIFI_TRY(wifi_pcie_resources());
+-    WIFI_TRY(wifi_pcie_link());
+-    WIFI_TRY(wifi_dma());
++wifi_boot_firmware(PeachMhiDma calibration)
++{
++    /* Only entered after initial hardware reset, or after CAL_DONE + OFF
++     * and a second checked PERST/WLAN_EN/PCIe reset. Keep every DMA mapping. */
++    wifi_firmware.phase = 0;
+     WIFI_TRY(wifi_stage_firmware());
+     wifi_step = "configure polled MSI delivery";
+     WIFI_TRY(wifi_enable_poll_msi());
+@@ -1054,7 +1052,7 @@
+     if (err) return EIO;
+     WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 1, 10000));
+     wifi_step = "prearm firmware crash reason";
+-    WIFI_TRY(wifi_allocate_dma(NULL, 0x601000, &wifi_rddm));
++    if (!wifi_rddm.bytes) WIFI_TRY(wifi_allocate_dma(NULL, 0x601000, &wifi_rddm));
+     PeachMhiDma dump = {wifi_rddm.bytes, wifi_rddm.iova, 0x600000};
+     PeachMhiDma vectors = {(unsigned char *)wifi_rddm.bytes + 0x600000,
+         wifi_rddm.iova + 0x600000, 0x1000};
+@@ -1077,6 +1075,8 @@
+     WIFI_TRY(wifi_poll(W_BAR, wifi_firmware.bhi + 0x28, 0xffffffffu, 2, 10000));
+     wifi_step = "MHI IPCR channels";
+     if (peach_wlfw_init(&wifi_wlfw, &wifi_host, &wifi_wlfw_ops)) return EIO;
++    wifi_wlfw.calibration = calibration;
++    wifi_wlfw.calibration_done = calibration.bytes != NULL;
+     err = peach_mhi_host_open_ipcr(&wifi_host);
+     if (err) {
+         printf("NEZHA WIFI: MHI IPCR open failed: %d\n", err);
+@@ -1090,6 +1090,44 @@
+         return EIO;
+     }
+     wifi_phase = 9;
++    return 0;
++}
++
++static int
++wifi_start(void)
++{
++    for (unsigned i = 0; i < W_NWIN; i++) WIFI_TRY(wifi_map(i));
++    WIFI_TRY(wifi_power());
++    WIFI_TRY(wifi_pcie_resources());
++    WIFI_TRY(wifi_pcie_link());
++    WIFI_TRY(wifi_dma());
++    WIFI_TRY(wifi_boot_firmware((PeachMhiDma){0}));
++    wifi_step = "cold boot calibration";
++    int err = peach_wlfw_calibrate(&wifi_wlfw);
++    if (err) {
++        printf("NEZHA WIFI: calibration failed %d, QMI %#x remote %u\n", err,
++            wifi_wlfw.message, wifi_wlfw.remote_error);
++        return EIO;
++    }
++    PeachMhiDma calibration = wifi_wlfw.calibration;
++    /* CNSS restarts firmware after calibration; it retains CAL memory.
++     * Disable bus mastering and verify PERST before reusing MHI contexts. */
++    uint32_t command, check;
++    WIFI_TRY(wifi_rd(W_CFG, 4, &command));
++    WIFI_TRY(wifi_wr(W_CFG, 4, command & 0xfffbu));
++    WIFI_TRY(wifi_rd(W_CFG, 4, &check));
++    if (check & 4) return EBUSY;
++    WIFI_TRY(wifi_pin(W_PERST, 0, 0, 1, 0, 0));
++    WIFI_TRY(wifi_rd(W_PERST, 4, &check));
++    if (check & 2) return EBUSY;
++    wifi_sleep(NULL, 100000);
++    WIFI_TRY(wifi_power());
++    WIFI_TRY(wifi_pcie_resources());
++    WIFI_TRY(wifi_pcie_link());
++    WIFI_TRY(wifi_dma_health());
++    wifi_target_window = 0xffffffffu;
++    printf("NEZHA WIFI: endpoint reset after calibration; CAL DMA retained\n");
++    WIFI_TRY(wifi_boot_firmware(calibration));
+     wifi_step = "prepare CE DMA";
+     PeachMhiDma ce_dma;
+     WIFI_TRY(wifi_allocate_dma(NULL, PEACH_CE_DMA_BYTES, &ce_dma));

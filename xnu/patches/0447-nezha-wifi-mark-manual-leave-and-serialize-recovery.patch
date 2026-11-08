@@ -1,0 +1,114 @@
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -138,9 +138,11 @@
+         state == PeachNetOnline || state == PeachNetFailed ||
+         (state == PeachNetRecovering && error && net_request.action != PeachControlLeave))
+         net_leave_pending = 0;
+-    unsigned scan_done = (net_scan_pending || net_snapshot.state == PeachNetRecovering) &&
++    unsigned scan_done = (net_scan_pending &&
+         (state == PeachNetReady || state == PeachNetOnline || state == PeachNetAssociating ||
+-         state == PeachNetFailed || state == PeachNetRecovering);
++         state == PeachNetFailed || state == PeachNetRecovering)) ||
++        (net_snapshot.state == PeachNetRecovering && w && w->scan_finished && !w->scan_active &&
++         (state == PeachNetReady || state == PeachNetOnline || state == PeachNetAssociating));
+     if (scan_done) net_scan_pending = 0;
+     unsigned join_done = net_join_pending &&
+         (state == PeachNetOnline || state == PeachNetReady || state == PeachNetFailed || state == PeachNetRecovering);
+@@ -290,7 +292,7 @@
+     extern int peach_wlan_publish(const char *, const unsigned char *);
+     return peach_wlan_publish(net_snapshot.interface_name, mac);
+ }
+-void peach_net_link(unsigned up)
++static void set_link(unsigned up, unsigned voluntary)
+ {
+     lck_mtx_lock(&net_lock);
+     unsigned changed = net_online != !!up; net_online = !!up;
+@@ -314,8 +316,10 @@
+     }
+     if (!net_interface || !changed) return;
+     ifnet_set_flags(net_interface, up ? IFF_RUNNING : 0, IFF_RUNNING);
+-    link_event(up); peach_apple80211_link(up, rssi);
+-}
++    link_event(up); peach_apple80211_link(up ? 1 : voluntary ? 0 : 2, rssi);
++}
++void peach_net_link(unsigned up) { set_link(up, 0); }
++void peach_net_leave(void) { set_link(0, 1); }
+ /* Bounded metadata only: enough to distinguish DHCP/ARP/DNS data flow.
+  * Runs on the protocol worker, without packet payloads or key material. */
+ static void trace_frame(unsigned incoming, const unsigned char *p, size_t bytes)
+@@ -389,10 +393,11 @@
+ }
+ void peach_net_recovering(int error)
+ {
+-    peach_net_status(NULL, PeachNetRecovering, error);
+     lck_mtx_lock(&net_lock);
+     volatile unsigned char *secret = (void *)&net_request;
+     for (size_t i = 0; i < sizeof(net_request); i++) secret[i] = 0;
+     net_leave_pending = 0;
+-    lck_mtx_unlock(&net_lock);
+-}
++    net_snapshot.state = PeachNetRecovering;
++    lck_mtx_unlock(&net_lock);
++    peach_net_status(NULL, PeachNetRecovering, error);
++}
+diff --git a/bsd/dev/qcom/PeachNet.h b/bsd/dev/qcom/PeachNet.h
+--- a/bsd/dev/qcom/PeachNet.h
++++ b/bsd/dev/qcom/PeachNet.h
+@@ -25,6 +25,7 @@
+ unsigned peach_net_channels(PeachWmiScanChannel *, unsigned capacity);
+ int peach_net_attach(const unsigned char mac[6]);
+ void peach_net_link(unsigned up);
++void peach_net_leave(void);
+ int peach_net_transmit(PeachTx *);
+ void peach_net_receive(const void *, size_t);
+ void peach_net_stop(int error);
+diff --git a/bsd/dev/qcom/PeachApple80211.c b/bsd/dev/qcom/PeachApple80211.c
+--- a/bsd/dev/qcom/PeachApple80211.c
++++ b/bsd/dev/qcom/PeachApple80211.c
+@@ -322,8 +322,9 @@
+     }
+     post(code, NULL, 0);
+ }
+-void peach_apple80211_link(unsigned up, int rssi)
+-{
+-    AppleLink link = { .down = !up, .rssi = up ? rssi : 0, .involuntary = !up, .reason = up ? 0 : 4 };
++void peach_apple80211_link(unsigned status, int rssi)
++{
++    AppleLink link = { .down = status != 1, .rssi = status == 1 ? rssi : 0,
++        .involuntary = status > 1, .reason = status > 1 ? 4 : 0 };
+     post(2, NULL, 0); post(3, NULL, 0); post(4, &link, sizeof(link));
+ }
+diff --git a/bsd/dev/qcom/PeachApple80211.h b/bsd/dev/qcom/PeachApple80211.h
+--- a/bsd/dev/qcom/PeachApple80211.h
++++ b/bsd/dev/qcom/PeachApple80211.h
+@@ -5,5 +5,5 @@
+ enum { PeachAppleScanDone = 10, PeachAppleJoinDone = 9 };
+ int peach_apple80211_ioctl(u_long, void *);
+ void peach_apple80211_event(unsigned);
+-void peach_apple80211_link(unsigned up, int rssi);
++void peach_apple80211_link(unsigned status, int rssi); /* 0 manual down, 1 up, 2 lost */
+ #endif
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1368,7 +1368,7 @@
+             ++wifi_recoveries, WIFI_RECOVERIES, wifi_rx.received, wifi_rx.discarded,
+             wifi_tx.submitted, wifi_tx.acked, wifi_tx.dropped);
+         wifi_net_state = PeachNetReady;
+-        peach_net_link(0); peach_rsn_clear(&wifi_rsn);
++        peach_net_leave(); peach_rsn_clear(&wifi_rsn);
+         unsigned char mac[6]; memcpy(mac, wifi_wmi.mac, sizeof(mac));
+         err = wifi_restart_mission(wifi_wlfw.calibration);
+         if (!err && memcmp(mac, wifi_wmi.mac, sizeof(mac))) err = EIO;
+@@ -1439,8 +1439,8 @@
+     if (wifi_htc.error || wifi_ce.error || wifi_wmi.error || wifi_htt.error ||
+         wifi_rx.error || wifi_tx.error || wifi_wlfw.error || wifi_host.poisoned ||
+         wifi_dma_health()) return error;
+-    printf("NEZHA WIFI: connection failed %d, on-air status %u; checking pre-key retirement\n",
+-        error, wifi_station.on_air_status);
++    printf("NEZHA WIFI: connection failed %d, on-air status %u station/RSN/action %u/%u/%u; checking pre-key retirement\n",
++        error, wifi_station.on_air_status, wifi_station.phase, wifi_rsn.phase, wifi_rsn.tx_action);
+     peach_rsn_clear(&wifi_rsn);
+     int err = peach_station_recover_unkeyed(&wifi_station);
+     if (err) {

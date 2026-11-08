@@ -1,0 +1,188 @@
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -85,6 +85,9 @@
+     unsigned vdev_start_sent, vdev_started, vdev_request, vdev_frequency, vdev_reg_generation;
+     unsigned vdev_stop_sent, vdev_stopped, vdev_up_sent;
+     unsigned char vdev_bssid[6];
++    PeachMhiDma mgmt_rx_dma;
++    unsigned mgmt_rx_started, mgmt_rx_read, mgmt_rx_write;
++    uint64_t mgmt_rx_received, mgmt_rx_discarded;
+     PeachMhiDma mgmt_dma;
+     unsigned mgmt_in_flight, mgmt_done, mgmt_id, mgmt_status;
+     unsigned mgmt_head, mgmt_count, mgmt_dropped;
+@@ -103,6 +106,10 @@
+ /* Capabilities must be known before preparing host REO rings for INIT. */
+ int peach_wmi_wait_services(PeachWmi *);
+ int peach_wmi_bootstrap(PeachWmi *);
++/* Native Peach management RX: retained coherent HOST4 ring, polled remote
++ * tail; each buffer contains its 4B length prefix and an ordinary WMI event. */
++int peach_wmi_start_management(PeachWmi *, PeachHtt *);
++int peach_wmi_poll_management(PeachWmi *);
+ /* Optional bring-up diagnostic; the real asynchronous reply is logged. */
+ int peach_wmi_request_radio_stats(PeachWmi *);
+ /* One STA vdev, firmware-supplied regulatory rules, passive 2.4/5GHz scan.
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -26,6 +26,8 @@
+        TAG_KEY = 96, TAG_KEY_DONE = 42,
+        TAG_FW_READY = 1321, TAG_MODE = 1322, TAG_MODE_RESPONSE = 1323,
+        RESOURCE_WORDS = 88, VDEVS = 1, PEERS = 8 };
++enum { MGMT_RX_ENTRIES = 128, MGMT_RX_BYTES = 3520, MGMT_RX_BUFFERS = 1152,
++       MGMT_RX_STORAGE = MGMT_RX_BUFFERS + MGMT_RX_ENTRIES * MGMT_RX_BYTES };
+ static const uint32_t host_abi[6] = {0x01000000, 1822, 0x5f414351, 0x4c4d, 0, 0};
+ #define WTRY(w, expr) do { int err_ = (expr); if (err_) { (w)->error = err_; return err_; } } while (0)
+ static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+@@ -532,6 +534,14 @@
+             bytes > w->ops.iova_bytes - (m->dma.iova - w->ops.iova_base)) return bad(w);
+         report(w, "WMI host memory id/bytes", m->id, (uint32_t)bytes);
+     }
++    if (service(w, 420)) {
++        WTRY(w, w->ops.allocate(w->ops.context, MGMT_RX_STORAGE, &w->mgmt_rx_dma));
++        PeachMhiDma d = w->mgmt_rx_dma;
++        if (!d.bytes || d.capacity < MGMT_RX_STORAGE || (d.iova & 63) ||
++            d.iova < w->ops.iova_base || d.iova - w->ops.iova_base >= w->ops.iova_bytes ||
++            MGMT_RX_STORAGE > w->ops.iova_bytes - (d.iova - w->ops.iova_base)) return bad(w);
++        memset(d.bytes, 0, MGMT_RX_STORAGE);
++    }
+     w->ops.barrier(w->ops.context);
+     return 0;
+ }
+@@ -555,6 +565,7 @@
+     R(29, 256); R(30, w->max_fragments > 10 ? 10 : w->max_fragments);
+     R(44, 1u << 30); /* explicitly disable IPA */
+     R(54, 1); R(63, 1); R(81, 1); /* pdev IDs, single STA/active vdev */
++    if (w->mgmt_rx_dma.bytes) R(68, 1u << 21); /* real MGMT_SRNG, native flags2 */
+     if (service(w, 143)) R(57, 0x22); /* allow V2 map/unmap; legacy still legal */
+ #undef R
+     p += RESOURCE_WORDS * 4;
+@@ -601,6 +612,85 @@
+     }
+     report(w, "WMI TX/RX antenna masks submitted", w->radio.tx_chains, w->radio.rx_chains);
+     w->phase = 2;
++    return 0;
++}
++/* qcacld wlan_mgmt_rx_srng: HOST4 is a SW-to-SW source ring. The
++ * hardware completion is the coherent remote tail, not the reap notification.
++ * Keep 127 buffers posted; recycle only after validated tail advancement. */
++int peach_wmi_start_management(PeachWmi *w, PeachHtt *h)
++{
++    if (!w || !w->ready || !h || w->mgmt_rx_started) return PeachMhiInvalid;
++    if (!w->mgmt_rx_dma.bytes) return 0;
++    PeachMhiDma d = w->mgmt_rx_dma;
++    unsigned char *p = d.bytes;
++    uint32_t *ring = d.bytes;
++    for (unsigned i = 0; i < MGMT_RX_ENTRIES - 1; i++) {
++        uint64_t address = d.iova + MGMT_RX_BUFFERS + i * MGMT_RX_BYTES;
++        ring[i * 2] = (uint32_t)address;
++        ring[i * 2 + 1] = (uint32_t)(address >> 32) | i << 12; /* RBM=0 */
++    }
++    PeachHttRing request = {
++        {p, d.iova, 1024}, {p + 1024, d.iova + 1024, 4},
++        {p + 1088, d.iova + 1088, 4}, 0, 15, PeachHttSwToSw, MGMT_RX_ENTRIES, 2
++    };
++    w->ops.barrier(w->ops.context);
++    WTRY(w, peach_htt_setup_ring(h, &request));
++    memset(w->command, 0, 20);
++    tlv(w->command + 4, 82, 12);
++    p32(w->command + 12, 0xf6); /* MGMT_SRNG_REAP_EVENT_THRESHOLD, SOC pdev=0 */
++    p32(w->command + 16, 1);
++    WTRY(w, send_command(w, 0x4003, 20));
++    w->mgmt_rx_write = MGMT_RX_ENTRIES - 1;
++    w->mgmt_rx_started = 1;
++    w->ops.barrier(w->ops.context);
++    *(volatile uint32_t *)(p + 1024) = w->mgmt_rx_write * 2;
++    w->ops.barrier(w->ops.context);
++    report(w, "WMI management refill posted entries/bytes", w->mgmt_rx_write, MGMT_RX_BYTES);
++    return 0;
++}
++int peach_wmi_poll_management(PeachWmi *w)
++{
++    if (!w) return PeachMhiInvalid;
++    if (w->error) return w->error;
++    if (!w->mgmt_rx_started) return 0;
++    unsigned char *p = w->mgmt_rx_dma.bytes;
++    uint32_t *ring = w->mgmt_rx_dma.bytes;
++    w->ops.barrier(w->ops.context);
++    uint32_t tail = *(volatile uint32_t *)(p + 1088);
++    if (tail >= MGMT_RX_ENTRIES * 2 || (tail & 1)) return bad(w);
++    unsigned target = tail / 2;
++    unsigned consumed = (target + MGMT_RX_ENTRIES - w->mgmt_rx_read) % MGMT_RX_ENTRIES;
++    unsigned owned = (w->mgmt_rx_write + MGMT_RX_ENTRIES - w->mgmt_rx_read) % MGMT_RX_ENTRIES;
++    if (consumed > owned) return bad(w);
++    for (unsigned i = 0; i < consumed; i++) {
++        unsigned slot = w->mgmt_rx_read, cookie = ring[slot * 2 + 1] >> 12;
++        uint32_t info = ring[slot * 2 + 1];
++        uint64_t address = ring[slot * 2] | (uint64_t)(info & 255) << 32;
++        if (cookie >= MGMT_RX_ENTRIES || ((info >> 8) & 15) ||
++            address != w->mgmt_rx_dma.iova + MGMT_RX_BUFFERS + cookie * MGMT_RX_BYTES)
++            return bad(w);
++        unsigned char *buffer = p + MGMT_RX_BUFFERS + cookie * MGMT_RX_BYTES;
++        w->ops.barrier(w->ops.context);
++        unsigned bytes = u16(buffer);
++        if (bytes >= 12 && bytes <= MGMT_RX_BYTES && !u16(buffer + 2)) {
++            if (w->mgmt_rx_received < 3)
++                report(w, "WMI management DMA event/bytes", u32(buffer + 4), bytes - 4);
++            w->mgmt_rx_received++;
++            peach_wmi_receive(w, buffer + 4, bytes - 4);
++            if (w->error) return w->error;
++        } else w->mgmt_rx_discarded++;
++        memset(buffer, 0, MGMT_RX_BYTES);
++        unsigned next = w->mgmt_rx_write;
++        ring[next * 2] = (uint32_t)address;
++        ring[next * 2 + 1] = (uint32_t)(address >> 32) | cookie << 12;
++        w->mgmt_rx_read = (slot + 1) % MGMT_RX_ENTRIES;
++        w->mgmt_rx_write = (next + 1) % MGMT_RX_ENTRIES;
++    }
++    if (consumed) {
++        w->ops.barrier(w->ops.context);
++        *(volatile uint32_t *)(p + 1024) = w->mgmt_rx_write * 2;
++        w->ops.barrier(w->ops.context);
++    }
+     return 0;
+ }
+ static int scan_channel(PeachWmi *w, unsigned frequency, unsigned band)
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -122,6 +122,8 @@
+         if (n != 4 || !h->confirmed || !h->setup_pending || !h->setup_sent ||
+             h->setup_done || ((word >> 8) & 255) != reply_pdev ||
+             ((word >> 16) & 255) != reply_id) {
++            if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
++                "HTT SRING_SETUP mismatched request/reply", h->setup_id, word);
+             h->error = PeachCeProtocol; return;
+         }
+         h->setup_status = word >> 24;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -815,6 +815,7 @@
+     int err = peach_wlfw_poll(&wifi_wlfw);
+     /* RX only queues EAPOL/copies data. WMI waits may reenter this progress
+      * callback; the RSN state machine runs solely in the outer worker. */
++    if (!err) err = peach_wmi_poll_management(&wifi_wmi);
+     if (!err) err = peach_rx_poll(&wifi_rx, wifi_packet_receive, NULL);
+     if (!err) err = peach_tx_poll(&wifi_tx);
+     return err ? err : peach_station_poll(&wifi_station);
+@@ -1189,6 +1190,8 @@
+     wifi_phase = 14;
+     wifi_step = "Peach UMAC/LMAC SRNG setup";
+     WIFI_TRY(wifi_setup_srng());
++    wifi_step = "management RX refill";
++    WIFI_TRY(peach_wmi_start_management(&wifi_wmi, &wifi_htt));
+     if (peach_station_init(&wifi_station, &wifi_wmi, &wifi_htt, &wifi_rx, &wifi_tx)) return EIO;
+     wifi_phase = 15;
+     wifi_step = "regulatory rules and passive scan";
+@@ -1207,6 +1210,10 @@
+             *(volatile uint32_t *)wifi_srng[PeachSrngRxBuffer].head.bytes,
+             *(volatile uint32_t *)wifi_srng[PeachSrngRxBuffer].tail.bytes,
+             wifi_rx.in_flight, wifi_rx.received, wifi_rx.discarded, wifi_rx.released);
++        printf("NEZHA WIFI: management RX received %llu discarded %llu tail %#x\n",
++            wifi_wmi.mgmt_rx_received, wifi_wmi.mgmt_rx_discarded,
++            wifi_wmi.mgmt_rx_dma.bytes ? *(volatile uint32_t *)
++                ((unsigned char *)wifi_wmi.mgmt_rx_dma.bytes + 1088) : 0);
+         WIFI_TRY(peach_wmi_request_radio_stats(&wifi_wmi));
+     }
+     if (err == PeachWmiScanFailed) {

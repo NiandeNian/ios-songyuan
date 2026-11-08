@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -239,7 +239,7 @@
+     printf("NEZHA WIFI: CESTA enabled %#x config %#x\n", enabled, cfg);
+     unsigned resources = (cfg >> 6) & 15, nodes = (cfg >> 26) & 31;
+     unsigned states = cfg & 15, channels = (cfg >> 4) & 3;
+-    if (!enabled || enabled == 0xffffffffu || channels != 2 || states != 2 ||
++    if (!enabled || enabled == 0xffffffffu || channels != 2 || states < 2 || states > 5 ||
+         resources < 1 || resources > 2 || nodes > 16 || perf > 5 ||
+         (nodes && 0xb0 + (nodes - 1) * 0x2c + 0x14 + states * 4 > 0x370)) return ENOTSUP;
+     WIFI_TRY(wifi_rd(W_CRM, 0x374, &update));
+@@ -253,7 +253,7 @@
+             uint32_t value;
+             size_t off = base + r * 0x2c + s * 4;
+             WIFI_TRY(wifi_rd(W_CRM, off + old * 0x14, &value));
+-            if (!type && !r) value = perf;
++            if (!type && !r && s < 2) value = perf;
+             WIFI_TRY(wifi_wr(W_CRM, off + target * 0x14, value));
+         }
+     }

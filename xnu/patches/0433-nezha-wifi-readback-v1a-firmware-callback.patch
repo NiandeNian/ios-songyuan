@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -801,6 +801,24 @@
+     wifi_barrier(NULL);
+     return 0;
+ }
++static int wifi_peer_metadata_snapshot(const char *stage)
++{
++    int capture = 0;
++    (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
++    if (capture != 1) return 0;
++    /* Read-only probe for this phone's amss20 (SHA256 8d0ac09be5489393...).
++     * The PC=0 call at 0x019b3dc8 loads this entry. INIT word68 bits5:4
++     * reach 0x019bd770 via 0x0192949c; V1A writes 0x01e2be08 here.
++     * A READY event or a host-selected version alone does not prove that. */
++    uint32_t getter;
++    WIFI_TRY(wifi_target_read(NULL, 0x015598b4, &getter));
++    printf("NEZHA WIFI: peer-metadata ML getter %s [0x015598b4]=%#x\n", stage, getter);
++    if (wifi_wmi.ready)
++        printf("NEZHA WIFI: V1A callback readback selected %u expected 0x01e2be08 match %u\n",
++            wifi_wmi.peer_metadata_version,
++            wifi_wmi.peer_metadata_version == 2 && getter == 0x01e2be08);
++    return 0;
++}
+ static int wifi_packet_receive(void *c, const void *packet, size_t bytes, const PeachRxInfo *info)
+ {
+     (void)c;
+@@ -1206,6 +1224,7 @@
+     }
+     wifi_step = "host REO setup before WMI INIT";
+     WIFI_TRY(wifi_prepare_srng());
++    WIFI_TRY(wifi_peer_metadata_snapshot("before INIT"));
+     wifi_step = "WMI SERVICE_READY/INIT/READY";
+     err = peach_wmi_bootstrap(&wifi_wmi);
+     if (err) {
+@@ -1213,6 +1232,7 @@
+             wifi_wmi.last_event, wifi_wmi.last_tag);
+         return EIO;
+     }
++    WIFI_TRY(wifi_peer_metadata_snapshot("after READY"));
+     wifi_phase = 13;
+     wifi_step = "HTT version negotiation";
+     err = peach_htt_negotiate(&wifi_htt);
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -646,8 +646,10 @@
+ {
+     int err = peach_wmi_wait_services(w);
+     if (err) return err;
++    unsigned advertised = w->peer_metadata_version;
+     if (service(w, 365)) w->peer_metadata_version = 2;
+     if (!w->peer_metadata_version || w->peer_metadata_version > 2) return PeachMhiInvalid;
++    report(w, "WMI RX peer metadata advertised/selected", advertised, w->peer_metadata_version);
+     WTRY(w, allocate_memory(w));
+     w->phase = 1;
+     WTRY(w, send_command(w, 1, build_init(w)));

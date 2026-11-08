@@ -1,0 +1,122 @@
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -917,15 +917,18 @@
+ 	if (!sc.ready) {
+ 		return true;
+ 	}
+-	uint64_t now = mach_absolute_time(), span, slice;
++	uint64_t now = mach_absolute_time(), span, slice, poll;
+ 	nanoseconds_to_absolutetime(limit_ns, &span);
+ 	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &slice);
++	nanoseconds_to_absolutetime(250 * NSEC_PER_USEC, &poll);
+ 	const uint64_t end = now + span;
+ 	bool taken = sc_taken(want);
+ 	while (!taken && (now = mach_absolute_time()) < end) {
+ 		if (!__atomic_load_n(&sc_irq_on, __ATOMIC_ACQUIRE)) {
+ 			sc_wait_polled++;
+-			delay(250);
++			/* Preserve the polling cadence without occupying a CPU for a whole frame. */
++			(void)assert_wait_deadline((event_t)&sc_frame_chan, THREAD_UNINT, MIN(end, now + poll));
++			(void)thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+ 			(void)assert_wait_deadline((event_t)&sc_frame_chan, THREAD_UNINT, MIN(end, now + slice));
+ 			dpu_wr(SC_INTR2_CLEAR, SC_CTL0_START);
+--- a/bsd/dev/pandora_cpu.c
++++ b/bsd/dev/pandora_cpu.c
+@@ -856,6 +856,8 @@
+ 	int on = 0;
+ 	(void)PE_parse_boot_argn("pandora_cpu", &on, sizeof(on));
+ 	if (on <= 0) {
++		/* Profiling does not need the unvalidated Nezha SCMI/retention paths. */
++		pandora_prof_start();
+ 		return;
+ 	}
+ 	if (kernel_thread_start(cpu_thread, NULL, &thread) == KERN_SUCCESS) {
+--- a/osfmk/arm/pandora_prof.c
++++ b/osfmk/arm/pandora_prof.c
+@@ -2,6 +2,7 @@
+  * PANDORA sampling profiler (patch 0222, call stacks 0223): where one process's threads are, about 1000 times a second,
+  * as Apple's kperf samples on its timers. Boot-arg pandora_prof=NAME (the process, e.g. backboardd; off without it),
+  * pandora_prof_hz (default 1000), pandora_prof_secs (report period, default 10).
++ * NAME:START:DURATION selects a bounded capture, in seconds after boot / seconds to sample.
+  *
+  * A kernel thread wakes at that rate and sends an interrupt (cpu_xcall) to each other CPU running a thread of the task.
+  * The handler, in that CPU's interrupt context, takes the interrupted state: the user PC when the thread ran user
+@@ -68,6 +69,7 @@
+ } *pprof_rings;
+ static task_t pprof_task;
+ static char pprof_name[PPROF_NAME + 1];
++static uint32_t pprof_at, pprof_duration;
+ static uint64_t pprof_dropped, pprof_sent, pprof_refused, pprof_stacks_dropped, pprof_stacks_taken, pprof_unlogged;
+ static int pprof_param = 1;              /* cpu_xcall wants a parameter */
+ 
+@@ -409,10 +411,22 @@
+ 	PE_parse_boot_argn("pandora_prof_hz", &hz, sizeof(hz));
+ 	PE_parse_boot_argn("pandora_prof_secs", &secs, sizeof(secs));
+ 	hz = hz < 10 ? 10 : (hz > 4000 ? 4000 : hz);
+-	const uint32_t period_us = 1000000 / hz, per_drain = hz / 4, per_report = hz * secs;
++	secs = secs < 1 ? 1 : (secs > 3600 ? 3600 : secs);
++	const uint32_t per_drain = hz / 4, per_report = hz * secs;
++	uint64_t period, start;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &period);
++	nanoseconds_to_absolutetime((uint64_t)pprof_at * NSEC_PER_SEC, &start);
++	if (mach_absolute_time() < start) {
++		(void)assert_wait_deadline((event_t)&pprof_at, THREAD_UNINT, start);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++	uint64_t next = mach_absolute_time(), tick;
++	const uint64_t ticks = (uint64_t)hz * pprof_duration;
+ 	printf("PANDORA PROF: sampling %s at %u Hz, reports every %u s\n", pprof_name, hz, secs);
+-	for (uint64_t tick = 1;; tick++) {
+-		delay(period_us);
++	for (tick = 1; !ticks || tick <= ticks; tick++) {
++		next = MAX(next + period, mach_absolute_time());
++		(void)assert_wait_deadline((event_t)&pprof_at, THREAD_UNINT, next);
++		(void)thread_block(THREAD_CONTINUE_NULL);
+ 		if (pprof_task == TASK_NULL || !pprof_task->active) {
+ 			if (tick % hz == 0) {
+ 				if (pprof_task != TASK_NULL) {
+@@ -445,6 +459,16 @@
+ 			pprof_report(secs);
+ 		}
+ 	}
++	if (ticks % per_report) {
++		pprof_drain();
++		if (pprof_task != TASK_NULL) {
++			pprof_images(pprof_task);
++		}
++		pprof_report((unsigned)(ticks % per_report + hz - 1) / hz);
++	}
++	printf("PANDORA PROF: bounded capture finished; no further sampling interrupts\n");
++	/* Retain the task/buffers until reboot: an already posted AST may still finish. */
++	thread_terminate_self();
+ }
+ 
+ /*
+@@ -626,9 +650,23 @@
+ pandora_prof_start(void)
+ {
+ 	pstacks_start();
+-	if (!PE_parse_boot_arg_str("pandora_prof", pprof_name, sizeof(pprof_name)) || pprof_name[0] == 0) {
+-		return;
+-	}
++	char config[64];
++	if (!PE_parse_boot_arg_str("pandora_prof", config, sizeof(config)) || config[0] == 0) {
++		return;
++	}
++	char *suffix = strchr(config, ':');
++	if (suffix) {
++		*suffix++ = 0;
++		uint32_t *values[] = { &pprof_at, &pprof_duration };
++		for (unsigned i = 0; i < 2; i++) {
++			while (*suffix >= '0' && *suffix <= '9') {
++				*values[i] = MIN(3600u, *values[i] * 10u + (uint32_t)(*suffix++ - '0'));
++			}
++			if (*suffix != ':') break;
++			suffix++;
++		}
++	}
++	strlcpy(pprof_name, config, sizeof(pprof_name));
+ 	pprof_rings = kalloc_data(PPROF_CPUS * sizeof(*pprof_rings), Z_WAITOK | Z_ZERO);
+ 	pprof_chains = kalloc_data(PPROF_CHAINS * sizeof(struct pprof_chain), Z_WAITOK | Z_ZERO);
+ 	pprof_stack_table = kalloc_data(PPROF_STACKS * sizeof(struct pprof_stack), Z_WAITOK | Z_ZERO);

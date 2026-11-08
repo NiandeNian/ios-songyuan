@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index efdec4c..fb9a36a 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,12 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#if defined(PANDORA)
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOKitKeys.h>
++#include <sys/proc.h>
++#endif
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -129,4 +135,70 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
+  * is what the iPhone userland (MobileGestalt) expects.
+  */
++#if defined(PANDORA)
++/*
++ * 0314: Apple's FairPlay driver by its class names, refusing every call. The real one
++ * (com.apple.driver.FairPlayIOKit) works with keys this SoC does not have; without any, fairplayd exits at
++ * start and the requests to its ports (locationd's FairPlay signer among them) wait for good. With this one
++ * fairplayd runs and answers them with its own errors. The first 64 calls are logged.
++ */
++class com_apple_driver_FairPlayIOKit : public IOService {
++	OSDeclareDefaultStructors(com_apple_driver_FairPlayIOKit);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(com_apple_driver_FairPlayIOKit, IOService);
++
++bool
++com_apple_driver_FairPlayIOKit::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "com_apple_driver_FairPlayIOKitUserClient");
++	registerService();
++	IOLog("PANDORA FAIRPLAY: driver registered (every call answers unsupported)\n");
++	return true;
++}
++
++class com_apple_driver_FairPlayIOKitUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(com_apple_driver_FairPlayIOKitUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(com_apple_driver_FairPlayIOKitUserClient, IOUserClient);
++
++IOReturn
++com_apple_driver_FairPlayIOKitUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++com_apple_driver_FairPlayIOKitUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	static uint32_t logged;
++	if (logged < 64) {
++		logged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("PANDORA FAIRPLAY: %s sel %u in %u/%u out %u/%u -> unsupported\n", name, selector,
++		    args->scalarInputCount, args->structureInputDescriptor != NULL ?
++		    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputDescriptor != NULL ?
++		    (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize);
++	}
++	args->scalarOutputCount = 0;
++	return kIOReturnUnsupported;
++}
++#endif /* PANDORA */
+ #endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9227aaf..1397785 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -65,6 +65,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = 'com_apple_driver_FairPlayIOKit';"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = FairPlayIOKit;"
++    "   },"
++    "   {"
+     "     'IOClass'         = PandoraAdrenoGpu;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = PandoraAdrenoGpu;"

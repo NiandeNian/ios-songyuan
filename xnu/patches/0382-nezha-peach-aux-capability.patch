@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/qcom/PeachWlfw.c b/bsd/dev/qcom/PeachWlfw.c
+--- a/bsd/dev/qcom/PeachWlfw.c
++++ b/bsd/dev/qcom/PeachWlfw.c
+@@ -403,6 +403,8 @@
+     n = scalar(w, n, 0x16, 1, 1); /* actual PHY microcode via M3_INFO */
+     n = scalar(w, n, 0x17, 0, 1); n = scalar(w, n, 0x1a, 0, 1); /* no cached calibration */
+     n = scalar(w, n, 0x21, 0, 1); n = scalar(w, n, 0x33, 0, 1); /* no MLO/dynamic reallocation */
++    /* CNSS and ath12k announce AUX_UC_SUPPORT before loading AUX microcode. */
++    n = scalar(w, n, 0x27, 1u << 6, 8);
+     unsigned char *p = w->packet + 39 + n;
+     p[0] = 0x1f; p16(p + 1, 48); memset(p + 3, 0, 48);
+     p64(p + 3, w->ops.iova_base); p64(p + 11, w->ops.iova_bytes); n += 51;

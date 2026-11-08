@@ -1,0 +1,35 @@
+Subject: [PATCH] crash stop: count fatal core signals, not extension-control SIGKILL
+
+Forced extension check-in timeouts and launch rejections still reach Crash
+Reporter, but do not count as new fatal program faults. Keep the per-boot
+threshold for genuine core-generating fatal signals.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1194,8 +1194,9 @@
+ 	return false;
+ }
+ /*
+- * sweetcrashstop=N (0274; default 3, 0 off): a program that crashed N times this boot (kern_exit.c, where Crash
+- * Reporter is told) is not started again until the next boot; launchd's next spawn fails here like a sweetnoexec
++ * sweetcrashstop=N (0274; default 3, 0 off): a program that exited from N fatal core-generating signals this boot
++ * (kern_exit.c) is not started again until the next boot. Forced extension-control SIGKILL and launch rejections
++ * still reach Crash Reporter but do not count as program faults. The next spawn fails here like a sweetnoexec
+  * one. Never stopped: the programs without which the phone is not usable (better they restart).
+  */
+ #define SWEET_CRASH_SLOTS 48
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1905,7 +1905,11 @@
+ 		if (p == current_proc()) {
+ 			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
+ 			extern void sweet_crash_count(const char *);      /* kern_exec.c, 0274 */
+-			sweet_crash_count(p->p_comm);
++			/* Reported SIGKILL includes extension check-in timeouts and rejected
++			 * launches; neither is another fatal program fault. */
++			if (hassigprop(WTERMSIG(rv), SA_CORE)) {
++				sweet_crash_count(p->p_comm);
++			}
+ 			sweet_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
+ 			    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
+ 			/* abort_with_payload messages (_objc_fatal, os_crash_fmt, ...) */

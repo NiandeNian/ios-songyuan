@@ -1,0 +1,35 @@
+diff --git a/iokit/Kernel/arm/PeachWLAN.cpp b/iokit/Kernel/arm/PeachWLAN.cpp
+--- a/iokit/Kernel/arm/PeachWLAN.cpp
++++ b/iokit/Kernel/arm/PeachWLAN.cpp
+@@ -12,6 +12,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <kern/thread.h>
+ #include <libkern/c++/OSData.h>
++#include <libkern/c++/OSKext.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+ 
+@@ -49,14 +50,22 @@
+  * service blocking InterfaceNamer without changing its busy accounting. */
+ static void network_quiet_diagnostic(void *, wait_result_t)
+ {
+-    IOSleep(30000);
+     IOService *root = IOService::getServiceRoot();
++    (void)root->waitQuiet(45000000000ULL);
+     IOLog("NEZHA WIFI: registry busy after network discovery %u\n", root->getBusyState());
++    OSKext *image4 = OSKext::lookupKextWithIdentifier("com.apple.security.AppleImage4");
++    IOLog("NEZHA WIFI: AppleImage4 present %u loaded %u started %u\n",
++        image4 != NULL, image4 && image4->isLoaded(), image4 && image4->isStarted());
++    OSSafeReleaseNULL(image4);
+     IORegistryIterator *iter = IORegistryIterator::iterateOver(root,
+         gIOServicePlane, kIORegistryIterateRecursively);
+     if (iter) {
+         IOService *service;
+         while ((service = OSDynamicCast(IOService, iter->getNextObject()))) {
++            IOService *provider = service->getProvider();
++            if (provider && !strcmp(provider->getName(), "defaults"))
++                IOLog("NEZHA WIFI: defaults child %s (%s) state %#x\n", service->getName(),
++                    service->getMetaClass()->getClassName(), (unsigned)service->getState());
+             if (service->getBusyState())
+                 IOLog("NEZHA WIFI: busy service %s (%s) count %u\n",
+                     service->getName(), service->getMetaClass()->getClassName(),

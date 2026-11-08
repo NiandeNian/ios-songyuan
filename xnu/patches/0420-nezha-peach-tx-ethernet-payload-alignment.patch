@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -87,7 +87,9 @@
+     if (t->owned[i]) return PeachCeFull;
+     PeachSrngOps *ops = &t->ring->ops;
+     TTRY(t, ops->health(ops->context));
+-    unsigned char *p = (unsigned char *)t->memory.bytes + i * PEACH_TX_BUFFER_BYTES;
++    /* Native skb data has NET_IP_ALIGN=2: after the 14-byte Ethernet
++     * header the IP/EAPOL payload is word-aligned for target processing. */
++    unsigned char *p = (unsigned char *)t->memory.bytes + i * PEACH_TX_BUFFER_BYTES + 2;
+     memcpy(p, packet, bytes);
+     size_t length = bytes < 60 ? 60 : bytes;
+     if (length > bytes) memset(p + bytes, 0, length - bytes);
+@@ -98,7 +100,7 @@
+     /* V1 metadata: vdev-based type 1, no optional HTT extension. */
+     uint32_t metadata = 1u | t->vdev << 2 | t->pdev << 10;
+     uint32_t entry[8] = {
+-        (uint32_t)(t->memory.iova + i * PEACH_TX_BUFFER_BYTES), TX_RBM << 8 | cookie << 12,
++        (uint32_t)(t->memory.iova + i * PEACH_TX_BUFFER_BYTES + 2), TX_RBM << 8 | cookie << 12,
+         /* Captured native M2/M4: semi-hard notify, voice TID override and
+          * critical-frame classifier; TO_FW is clear for these frames. */
+         control ? 3u << 8 : 0, metadata << 16, (uint32_t)length,

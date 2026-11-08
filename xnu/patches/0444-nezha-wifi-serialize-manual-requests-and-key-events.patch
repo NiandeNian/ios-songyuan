@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -29,7 +29,7 @@
+ static PeachNetInfo net_info_data;
+ static PeachWmiBss net_bss[PEACH_WMI_BSS_ENTRIES];
+ static PeachWmiScanChannel net_channels[PEACH_WMI_SCAN_CHANNELS];
+-static unsigned net_channel_count, net_join_pending, net_scan_pending;
++static unsigned net_channel_count, net_join_pending, net_scan_pending, net_leave_pending;
+ static PeachNetRequest net_request;
+ static mbuf_t net_queue[TX_QUEUE], net_pending;
+ static unsigned net_head, net_count, net_online;
+@@ -57,11 +57,20 @@
+             if (request->passphrase[i] < 32 || request->passphrase[i] > 126) return EINVAL;
+     }
+     lck_mtx_lock(&net_lock);
++    unsigned finishing_leave = opt == PeachControlJoin && net_leave_pending;
++    unsigned cancelling_join = opt == PeachControlLeave && net_join_pending;
++    unsigned during_scan = opt != PeachControlScan && net_scan_pending;
++    unsigned replace = (finishing_leave && net_request.action == PeachControlLeave) ||
++        (cancelling_join && net_request.action == PeachControlJoin);
+     int err = net_snapshot.state == PeachNetFailed ? ENXIO :
+-        (net_snapshot.state != PeachNetReady && net_snapshot.state != PeachNetOnline) ||
+-        net_request.action || net_scan_pending ? EBUSY : 0;
++        ((net_snapshot.state != PeachNetReady && net_snapshot.state != PeachNetOnline &&
++          !finishing_leave && !cancelling_join && !during_scan) ||
++         (net_request.action && !replace) || (net_scan_pending && !during_scan)) ? EBUSY : 0;
++    unsigned cancelled = 0;
+     if (!err) {
+         net_request = *request;
++        if (cancelling_join) { net_join_pending = 0; net_info_data.result = 2; cancelled = 1; }
++        if (opt == PeachControlLeave) net_leave_pending = 1;
+         if (opt == PeachControlJoin) { net_join_pending = 1; net_info_data.result = 0; }
+         unsigned associated_scan = opt == PeachControlScan && net_snapshot.state == PeachNetOnline;
+         if (opt == PeachControlScan) net_scan_pending = 1;
+@@ -70,6 +79,7 @@
+         net_snapshot.error = 0;
+     }
+     lck_mtx_unlock(&net_lock);
++    if (cancelled) peach_apple80211_event(PeachAppleJoinDone);
+     return err;
+ }
+ static errno_t control_set(kern_ctl_ref c, u_int32_t u, void *p, int opt, void *data, size_t len)
+@@ -118,8 +128,18 @@
+ void peach_net_status(const PeachWmi *w, unsigned state, int error)
+ {
+     lck_mtx_lock(&net_lock);
++    /* A new manual join may queue while leave resets the endpoint. Its
++     * request and completion must survive the old connection's teardown. */
++    if (state == PeachNetReady || state == PeachNetOnline) {
++        if (net_request.action == PeachControlJoin) state = PeachNetAssociating;
++        else if (net_request.action == PeachControlLeave) state = PeachNetRecovering;
++    }
++    if (state == PeachNetReady || state == PeachNetAssociating ||
++        state == PeachNetOnline || state == PeachNetFailed ||
++        (state == PeachNetRecovering && error && net_request.action != PeachControlLeave))
++        net_leave_pending = 0;
+     unsigned scan_done = (net_scan_pending || net_snapshot.state == PeachNetRecovering) &&
+-        (state == PeachNetReady || state == PeachNetOnline ||
++        (state == PeachNetReady || state == PeachNetOnline || state == PeachNetAssociating ||
+          state == PeachNetFailed || state == PeachNetRecovering);
+     if (scan_done) net_scan_pending = 0;
+     unsigned join_done = net_join_pending &&
+@@ -373,5 +393,6 @@
+     lck_mtx_lock(&net_lock);
+     volatile unsigned char *secret = (void *)&net_request;
+     for (size_t i = 0; i < sizeof(net_request); i++) secret[i] = 0;
+-    lck_mtx_unlock(&net_lock);
+-}
++    net_leave_pending = 0;
++    lck_mtx_unlock(&net_lock);
++}
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -99,6 +99,8 @@
+             if (s->security_generation[unicast] == 0xffffffffu) break;
+             s->security[unicast] = type; s->security_valid[unicast] = 1;
+             s->security_generation[unicast]++;
++            if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
++                "HTT security indication/generation", word, s->security_generation[unicast]);
+             return;
+         }
+         h->error = PeachCeProtocol; return;
+diff --git a/bsd/dev/qcom/PeachRsn.c b/bsd/dev/qcom/PeachRsn.c
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -302,6 +302,8 @@
+         if (changed && p->security_generation[i] == 0xffffffffu) return PeachCeProtocol;
+         r->expected_security[i] = p->security_generation[i] + changed;
+     }
++    if (s->wmi->htc->ops.log) s->wmi->htc->ops.log(s->wmi->htc->ops.context,
++        "RSN expected group/pair security generations", r->expected_security[0], r->expected_security[1]);
+     if (pair) RTRY(r, peach_wmi_install_ccmp(s->wmi, s->htt, 0, 0, r->ptk + 32, 0));
+     RTRY(r, peach_wmi_install_ccmp(s->wmi, s->htt, 1, r->group_index, r->gtk, r->group_rsc));
+     erase(r->gtk, sizeof(r->gtk));
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -861,6 +861,10 @@
+     /* AP rejection/deauthentication is connection state, not an HTC/CE
+      * failure. The outer worker owns recovery and reports it to iOS. */
+     if (!err) (void)peach_station_poll(&wifi_station);
++    /* Passive scans wait on this callback. Continue draining authorized
++     * BSD traffic while scanning instead of stalling DHCP/TCP until it ends. */
++    if (!err && !wifi_station.error && wifi_tx.authorized)
++        err = peach_net_transmit(&wifi_tx);
+     return err;
+ }
+ static int wifi_service_receive(void *c, unsigned service, const void *p, size_t n)
+@@ -1376,6 +1380,7 @@
+         printf("NEZHA WIFI: manual leave complete; scan ready\n");
+         goto clear_request;
+     }
++    peach_net_status(&wifi_wmi, PeachNetAssociating, 0);
+     PeachControlJoinData *j = &wifi_request.join;
+     unsigned selected = PEACH_WMI_BSS_ENTRIES;
+     for (unsigned i = 0; i < wifi_wmi.bss_count; i++) {

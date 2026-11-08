@@ -1,0 +1,272 @@
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -28,6 +28,7 @@
+ #include "qcom/PeachWmi.h"
+ #include "qcom/PeachSrng.h"
+ #include "qcom/PeachRx.h"
++#include "qcom/PeachTx.h"
+ #include "qcom/NezhaPcieData.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+@@ -76,11 +77,12 @@
+ static PeachWmi wifi_wmi;
+ static PeachSrng wifi_srng[PeachSrngKinds];
+ static PeachRx wifi_rx;
++static PeachTx wifi_tx;
+ static uint32_t wifi_target_window = 0xffffffffu;
+ static uint64_t wifi_context_offset, wifi_dma_next, wifi_check_at;
+ static uint32_t wifi_context_control;
+ static unsigned wifi_table_next, wifi_allocations;
+-#define WIFI_DMA_ALLOCATIONS (PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 5)
++#define WIFI_DMA_ALLOCATIONS (PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 6)
+ static vm_offset_t wifi_owned_dma[WIFI_DMA_ALLOCATIONS];
+ #define WIFI_IOVA 0x20000000ull
+ #define WIFI_DMA_BYTES 0x920000u
+@@ -731,7 +733,8 @@
+     int err = peach_wlfw_poll(&wifi_wlfw);
+     /* Until peer/security/NIC wiring exists, valid data has no consumer.
+      * Polling still reclaims known buffers; unknown ownership stops boot. */
+-    return err ? err : peach_rx_poll(&wifi_rx, NULL, NULL);
++    if (!err) err = peach_rx_poll(&wifi_rx, NULL, NULL);
++    return err ? err : peach_tx_poll(&wifi_tx);
+ }
+ static int wifi_service_receive(void *c, unsigned service, const void *p, size_t n)
+ {
+@@ -759,7 +762,7 @@
+ {
+     /* Retained ring pool plus link/queue/packet memory. Prepare REO before
+      * enabling rings; RX buffers are posted after the HTT layout command. */
+-    const unsigned entries[PeachSrngKinds] = {512, 128, 128, 512, 512, 128, 1024, 512};
++    const unsigned entries[PeachSrngKinds] = {512, 128, 128, 512, 512, 128, 1024, 512, 128};
+     size_t total = 0;
+     for (unsigned i = 0; i < PeachSrngKinds; i++) total += peach_srng_bytes(i, entries[i]);
+     PeachMhiDma memory;
+@@ -779,6 +782,14 @@
+             wifi_rx.last_register, wifi_rx.last_value);
+         return EIO;
+     }
++    PeachMhiDma tx_memory;
++    WIFI_TRY(wifi_allocate_dma(NULL, PEACH_TX_DMA_BYTES, &tx_memory));
++    int tx_err = peach_tx_prepare(&wifi_tx, wifi_srng, &wifi_htt, tx_memory,
++        wifi_wmi.radio.lmac, wifi_wmi.radio.pdev);
++    if (tx_err) {
++        printf("NEZHA WIFI: TX prepare failed %d\n", tx_err);
++        return EIO;
++    }
+     for (unsigned i = 0; i < PeachSrngRxBuffer; i++) {
+         int err = peach_srng_start_host(&wifi_srng[i]);
+         if (err) {
+@@ -789,6 +800,7 @@
+     }
+     if (peach_srng_start_host(&wifi_srng[PeachSrngIdleLink])) return EIO;
+     if (peach_srng_start_host(&wifi_srng[PeachSrngWbmRelease])) return EIO;
++    if (peach_srng_start_host(&wifi_srng[PeachSrngTxCompletion])) return EIO;
+     /* Vendor QCA_HOST2FW_RXBUF_RING path: HOST1_TO_FW is software ring 5
+      * in the single host-MAC slot 0. RXDMA destination uses target PDEV. */
+     int err = peach_srng_start_lmac(&wifi_srng[PeachSrngRxBuffer], &wifi_htt,
+@@ -927,7 +939,7 @@
+         return EIO;
+     }
+     wifi_phase = 16;
+-    printf("NEZHA WIFI: passive scan completed with %u BSS; TX/association/keys/NIC pending\n",
++    printf("NEZHA WIFI: passive scan completed with %u BSS; association/keys/NIC pending, TX unauthorized\n",
+         wifi_wmi.bss_count);
+     return ENOTSUP;
+ }
+--- a/bsd/dev/qcom/PeachSrng.c
++++ b/bsd/dev/qcom/PeachSrng.c
+@@ -19,6 +19,7 @@
+     {0, 0, 0, 8, 0, 1},                    /* FW-controlled RXDMA2SW */
+     {0x00a34d3c, 0x00a370b8, 120, 2, 1, 0}, /* WBM idle link */
+     {0x00a3437c, 0x00a37010, 121, 8, 1, 0}, /* SW2WBM release */
++    {0x00a34e80, 0x00a370d0, 129, 8, 0, 0}, /* WBM2SW1 TX completion */
+ };
+ #define STRY(r, expr) do { int err_ = (expr); if (err_) { (r)->error = err_; return err_; } } while (0)
+ static uint32_t u32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+--- a/bsd/dev/qcom/PeachSrng.h
++++ b/bsd/dev/qcom/PeachSrng.h
+@@ -7,6 +7,7 @@
+        PeachSrngWbmCompletion, PeachSrngRxBuffer, PeachSrngRxException,
+        PeachSrngIdleLink,
+        PeachSrngWbmRelease,
++       PeachSrngTxCompletion,
+        PeachSrngKinds, PeachSrngEmpty = -21 };
+ typedef struct {
+     void *context;
+--- /dev/null
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -0,0 +1,130 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Peach v2 tcl_data_cmd/wbm2sw_completion_ring_tx, hal_be_tx.h and
++ * dp_be_tx.c. One nonfragmented Ethernet queue, no checksum/TSO offload. */
++#include "PeachTx.h"
++#if defined(KERNEL)
++#include <libkern/libkern.h>
++#else
++#include <string.h>
++#endif
++#define TX_RBM 6u /* HAL_BE_WBM_SW0_BM_ID + WBM2SW1 */
++#define TTRY(t, expr) do { int err_ = (expr); if (err_) { (t)->error = err_; return err_; } } while (0)
++static int invalid(PeachTx *t) { return t->error = PeachCeProtocol; }
++static uint64_t now(PeachTx *t) { return t->htt->htc->ops.now_us(t->htt->htc->ops.context); }
++int peach_tx_prepare(PeachTx *t, PeachSrng rings[PeachSrngKinds], PeachHtt *h,
++                     PeachMhiDma memory, unsigned lmac, unsigned pdev)
++{
++    if (!t || !rings || !h || !h->confirmed || h->metadata_version != 1 ||
++        lmac > 3 || pdev > 3 || !memory.bytes || !memory.iova ||
++        ((uintptr_t)memory.bytes & 127) || (memory.iova & 127) ||
++        memory.capacity < PEACH_TX_DMA_BYTES || memory.iova >= 0x100000000ull ||
++        PEACH_TX_DMA_BYTES > 0x100000000ull - memory.iova) return PeachMhiInvalid;
++    for (unsigned i = 0; i < PeachSrngKinds; i++) {
++        if (!rings[i].prepared || rings[i].started || rings[i].error) return PeachMhiInvalid;
++        PeachMhiDma d = rings[i].memory;
++        if (d.iova < memory.iova + PEACH_TX_DMA_BYTES && memory.iova < d.iova + d.capacity)
++            return PeachMhiInvalid;
++    }
++    memset(t, 0, sizeof(*t));
++    t->ring = &rings[PeachSrngTclTx]; t->completion = &rings[PeachSrngTxCompletion];
++    t->htt = h; t->memory = memory; t->lmac = lmac; t->pdev = pdev;
++    PeachSrngOps *ops = &t->ring->ops;
++    TTRY(t, ops->health(ops->context));
++    memset(memory.bytes, 0, PEACH_TX_DMA_BYTES); ops->barrier(ops->context);
++    /* Bank 0 is host-owned; Peach has eight banks, last reserved for FW.
++     * hal_be_generic_api.h's Peach layout uses DSCP table bits at 17, not
++     * newer MCAST_PACKET_CTRL bits. STA uses the real BSS AST index.
++     * Non-raw encryption is taken from the peer, not this bank. */
++    uint32_t config = 2u << 1 | 1u << 9 | lmac << 15, check;
++    TTRY(t, ops->write32(ops->context, 0x00a4408c, config));
++    TTRY(t, ops->read32(ops->context, 0x00a4408c, &check));
++    if (check != config) return invalid(t);
++    t->prepared = 1;
++    return 0;
++}
++int peach_tx_bind(PeachTx *t, unsigned vdev, unsigned peer, unsigned ast, unsigned hash)
++{
++    if (!t || !t->prepared || t->authorized || t->in_flight || vdev > 255 ||
++        peer >= 65535 || ast >= 65535 || hash > 65535) return PeachMhiInvalid;
++    if (t->error) return t->error;
++    t->vdev = vdev; t->peer = peer; t->ast = ast; t->hash = hash; t->bound = 1;
++    return 0;
++}
++int peach_tx_authorize(PeachTx *t, unsigned enabled)
++{
++    if (!t || !t->prepared || enabled > 1 || (enabled && !t->bound)) return PeachMhiInvalid;
++    if (t->error) return t->error;
++    t->authorized = enabled;
++    return 0;
++}
++int peach_tx_send(PeachTx *t, const void *packet, size_t bytes, unsigned tid)
++{
++    if (!t || !t->prepared || !t->bound || !t->authorized || !packet ||
++        bytes < 14 || bytes > 1518 || tid > 15 ||
++        !t->ring->started || !t->completion->started) return PeachMhiInvalid;
++    if (t->error) return t->error;
++    if (t->ring->error || t->completion->error)
++        return t->error = t->ring->error ? t->ring->error : t->completion->error;
++    unsigned i = t->next;
++    for (unsigned n = 0; n < PEACH_TX_BUFFERS && t->owned[i]; n++)
++        i = (i + 1) % PEACH_TX_BUFFERS;
++    if (t->owned[i]) return PeachCeFull;
++    PeachSrngOps *ops = &t->ring->ops;
++    TTRY(t, ops->health(ops->context));
++    unsigned char *p = (unsigned char *)t->memory.bytes + i * PEACH_TX_BUFFER_BYTES;
++    memcpy(p, packet, bytes);
++    size_t length = bytes < 60 ? 60 : bytes;
++    if (length > bytes) memset(p + bytes, 0, length - bytes);
++    unsigned previous = t->cookies[i], generation = (previous >> 6) + 1;
++    if (generation > 16383) generation = 1;
++    unsigned cookie = generation << 6 | i;
++    t->cookies[i] = cookie;
++    /* V1 metadata: vdev-based type 1, no optional HTT extension. */
++    uint32_t metadata = 1u | t->vdev << 2 | t->pdev << 10;
++    uint32_t entry[8] = {
++        (uint32_t)(t->memory.iova + i * PEACH_TX_BUFFER_BYTES), TX_RBM << 8 | cookie << 12,
++        0, metadata << 16, (uint32_t)length,
++        1u | tid << 4 | t->lmac << 9 | t->vdev << 24,
++        t->ast | (t->hash & 15) << 20, 0};
++    t->owned[i] = 1; t->in_flight++; t->submitted_at[i] = now(t);
++    int err = peach_srng_push(t->ring, entry, sizeof(entry));
++    if (err == PeachCeFull) {
++        t->owned[i] = 0; t->in_flight--; t->cookies[i] = previous; return err;
++    }
++    if (err) return t->error = err; /* ownership is ambiguous: retain buffer */
++    t->next = (i + 1) % PEACH_TX_BUFFERS; t->submitted++;
++    return 0;
++}
++int peach_tx_poll(PeachTx *t)
++{
++    if (!t || !t->prepared || !t->completion->started) return 0;
++    if (t->error) return t->error;
++    for (unsigned budget = 0; budget < 64; budget++) {
++        uint32_t d[8];
++        int err = peach_srng_pop(t->completion, d, sizeof(d));
++        if (err == PeachSrngEmpty) break;
++        if (err) return t->error = err;
++        memcpy(t->last_descriptor, d, sizeof(d));
++        t->last_status = d[2];
++        /* No virtual-address conversion. TQM and FW completions have
++         * different formats: do not reinterpret FW exception metadata. */
++        if ((d[2] & 7) != 0 || ((d[2] >> 6) & 7) != 0 ||
++            ((d[2] >> 9) & 15) != TX_RBM || (d[2] & 0xc0000000u)) return invalid(t);
++        unsigned cookie = (d[2] >> 18) & 4095 | ((d[7] >> 20) & 255) << 12;
++        unsigned i = cookie & (PEACH_TX_BUFFERS - 1);
++        if (!t->bound || !t->owned[i] || cookie != t->cookies[i] ||
++            (d[7] & 65535) != t->peer) return invalid(t);
++        /* A source TP advance did not release this buffer. Only this
++         * validated TQM completion permits reuse, including failed TX. */
++        t->owned[i] = 0; t->in_flight--;
++        if (((d[2] >> 13) & 15) == 0) t->acked++;
++        else t->dropped++;
++    }
++    if (t->in_flight) {
++        uint64_t current = now(t);
++        for (unsigned i = 0; i < PEACH_TX_BUFFERS; i++)
++            if (t->owned[i] && current - t->submitted_at[i] > 10000000)
++                return t->error = PeachMhiTimeout;
++    }
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/qcom/PeachTx.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PEACH_TX_H
++#define PEACH_TX_H
++#include "PeachSrng.h"
++
++#define PEACH_TX_BUFFERS 64u
++#define PEACH_TX_BUFFER_BYTES 2048u
++#define PEACH_TX_DMA_BYTES (PEACH_TX_BUFFERS * PEACH_TX_BUFFER_BYTES)
++typedef struct {
++    PeachSrng *ring, *completion;
++    PeachHtt *htt;
++    PeachMhiDma memory;
++    unsigned prepared, bound, authorized, lmac, pdev, vdev, peer, ast, hash;
++    unsigned in_flight, next;
++    unsigned char owned[PEACH_TX_BUFFERS];
++    uint32_t cookies[PEACH_TX_BUFFERS];
++    uint64_t submitted_at[PEACH_TX_BUFFERS];
++    uint64_t submitted, acked, dropped;
++    uint32_t last_descriptor[8], last_status;
++    int error;
++} PeachTx;
++int peach_tx_prepare(PeachTx *, PeachSrng rings[PeachSrngKinds], PeachHtt *,
++                     PeachMhiDma, unsigned lmac, unsigned pdev);
++/* Binding must use a real HTT peer map after successful association. The
++ * caller may authorize only after the required security/key setup succeeds.
++ * Unbind needs all outstanding completions; no timeout-based DMA freeing. */
++int peach_tx_bind(PeachTx *, unsigned vdev, unsigned peer, unsigned ast, unsigned hash);
++int peach_tx_authorize(PeachTx *, unsigned enabled);
++int peach_tx_send(PeachTx *, const void *, size_t, unsigned tid);
++int peach_tx_poll(PeachTx *);
++#endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -138,6 +138,7 @@
+ bsd/dev/qcom/PeachHtt.c		standard
+ bsd/dev/qcom/PeachSrng.c		standard
+ bsd/dev/qcom/PeachRx.c		standard
++bsd/dev/qcom/PeachTx.c		standard
+ bsd/dev/pandora_wifi.c			standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard

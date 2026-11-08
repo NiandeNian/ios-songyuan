@@ -1,0 +1,55 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -16,6 +16,44 @@
+ #include <sys/proc.h>
+ #endif
+ 
++#if defined(PANDORA)
++/* Nezha's first LaunchServices rebuild asks MobileGestalt for the built-in
++ * network identity. MG waits for IONetworkController before reading its
++ * parent's local-mac-address, even without a network connection. Publish only that identity
++ * from the collected Android handoff; no interface or transport is registered.
++ * Replace this shim when an actual IONetworkingFamily driver is introduced. */
++class IONetworkController : public IOService {
++	OSDeclareDefaultStructors(IONetworkController);
++};
++OSDefineMetaClassAndStructors(IONetworkController, IOService);
++
++static void
++nezha_network_identity(IOService *provider)
++{
++	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++	OSData *mac = chosen ? OSDynamicCast(OSData, chosen->getProperty("nezha-wifi-mac")) : NULL;
++	if (mac && mac->getLength() == 6) {
++		IONetworkController *identity = new IONetworkController;
++		if (identity && identity->init()) {
++			identity->setName("NezhaNetworkIdentity");
++			identity->setProperty("IOMACAddress", mac);
++			provider->setProperty("local-mac-address", mac);
++			identity->setProperty("built-in", kOSBooleanTrue);
++			if (identity->attach(provider)) {
++				if (identity->start(provider)) {
++					identity->registerService();
++					IOLog("NEZHA: network identity published (no transport)\n");
++				} else {
++					identity->detach(provider);
++				}
++			}
++		}
++		OSSafeReleaseNULL(identity);
++	}
++	OSSafeReleaseNULL(chosen);
++}
++#endif
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -42,6 +80,7 @@
+ #if defined(PANDORA)
+ 	/* 0210: what an iPhone's RTC driver publishes; IOKitInitializeTime waits up to 30 s for it. */
+ 	publishResource("IORTC", this);
++	nezha_network_identity(this);
+ #endif
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;

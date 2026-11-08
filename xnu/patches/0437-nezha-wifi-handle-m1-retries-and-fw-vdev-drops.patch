@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/qcom/PeachRsn.c b/bsd/dev/qcom/PeachRsn.c
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -230,11 +230,17 @@
+         bytes != 99u + data_bytes) return 0;
+     if (info == 0x008a) {
+         if (be16(key + 3) != 16 || zero(key + 13, 32) || !zero(key + 77, 16)) return 0;
+-        if (r->phase == PeachRsnM3 && replay == r->m1_replay && equal(key + 13, r->anonce, 32)) {
++        if (r->phase == PeachRsnM3 && equal(key + 13, r->anonce, 32)) {
++            /* The AP may increment its counter when retrying M1. Echo that
++             * counter with the existing SNonce/PTK; never roll it back. */
++            if (replay < r->m1_replay) return 0;
++            r->m1_replay = r->replay = replay;
+             make_reply(r, e, 0x010a, 1, r->station->rsn_bytes); schedule(r, ReplyM2); return 0;
+         }
++        /* In-place PTK replacement is not implemented. An unsigned M1
++         * after connection must not replace keys or close the data port. */
+         if ((r->have_replay && replay <= r->replay) ||
+-            (r->phase != PeachRsnM1 && r->phase != PeachRsnConnected)) return 0;
++            r->phase != PeachRsnM1) return 0;
+         RTRY(r, peach_tx_authorize(r->station->tx, 0));
+         memcpy(r->anonce, key + 13, 32); read_random(r->snonce, 32); derive_ptk(r);
+         r->m1_replay = r->replay = replay; r->have_replay = 1; r->have_response = 0;
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -196,7 +196,10 @@
+         /* The FW status valid bit qualifies peer/TID metadata, not the
+          * ownership return or OK status. The cookie identifies our packet
+          * even when those optional fields are unavailable. */
+-        if (source == 3 && status > 4) return invalid(t);
++        /* FW VDEVID_MISMATCH=6 also returns the packet. Native dp_be_tx.c
++         * releases it as a drop; it is not a transport failure or an ACK.
++         * MEC=5 was handled above and never transfers ownership. */
++        if (source == 3 && status > 6) return invalid(t);
+         unsigned i = cookie & (PEACH_TX_BUFFERS - 1);
+         if (!t->bound || !t->owned[i] || cookie != t->cookies[i] ||
+             ((source == 0 || (status < 3 && (d[5] & (1u << 21)))) && peer != t->peer)) return invalid(t);

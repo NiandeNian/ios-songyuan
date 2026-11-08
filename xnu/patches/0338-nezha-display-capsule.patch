@@ -1,0 +1,67 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -291,6 +291,37 @@
+ 	}
+ 	return on != 0;
+ }
++
++/* Static Pro Max style mask, after the GPU fence and before either display path.
++ * Coordinates scale with the composed frame; no UI process or input handler. */
++static void
++nezha_draw_capsule(SweetSurface *s)
++{
++	if (!s->memory || s->pixelFormat != 0x42475241 || s->bytesPerElement != 4 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || s->width < 375 ||
++	    s->bytesPerRow < (uint64_t)s->width * 4 ||
++	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
++		return;
++	}
++	const uint32_t w = s->width * 110 / 375, h = s->width * 32 / 375;
++	const uint32_t x0 = (s->width - w) / 2, y0 = s->width * 14 / 375 - (s->width * 2 + 600) / 1200;
++	uintptr_t pixels = s->kernelAddress();
++	if (!pixels || y0 + h > s->height) {
++		return;
++	}
++	for (uint32_t y = 0; y < h; y++) {
++		const int64_t dy = 2 * (int64_t)y + 1 - h;
++		uint32_t inset = 0;
++		while ((2 * (int64_t)inset + 1 - h) * (2 * (int64_t)inset + 1 - h) + dy * dy > (int64_t)h * h) {
++			inset++;
++		}
++		uint32_t *row = (uint32_t *)(pixels + s->offset + (uint64_t)(y0 + y) * s->bytesPerRow);
++		for (uint32_t x = x0 + inset; x < x0 + w - inset; x++) {
++			row[x] = 0xff000000;
++		}
++		flush_dcache((vm_offset_t)(row + x0), w * 4, FALSE);
++	}
++}
+ #endif
+ 
+ enum {
+@@ -1774,6 +1805,26 @@
+ 	}
+ 
+ #if defined(PANDORA)
++	static int capsule = -1;
++	if (capsule < 0) {
++		capsule = 0;
++		PE_parse_boot_argn("nezha_island", &capsule, sizeof(capsule));
++	}
++	uint32_t composed = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			composed |= 1u << layer;
++		}
++	}
++	if (capsule && composed && (composed & (composed - 1)) == 0) {
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++			SweetSurface *s = (mask & (1u << layer)) ? sweet_surface_copy(get32(rec, 0x54 + 4 * layer)) : NULL;
++			if (s && s != fSurface && s->width == fLogicalW && s->height == fLogicalH) {
++				nezha_draw_capsule(s);
++			}
++			OSSafeReleaseNULL(s);
++		}
++	}
+ 	/* 0217: the pipes take the frame themselves when they can; else the panel memory and the copy below. */
+ 	const bool scanned = shows && scanPresent(rec, mask);
+ 	if (shows && !scanned) {

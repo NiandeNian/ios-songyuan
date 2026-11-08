@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -182,7 +182,10 @@
+         /* FW reinject/inspect return ownership too (dp_tx_*_handler),
+          * but are dropped by this STA path and never counted as ACKs.
+          * Their overlay is not the OK/DROP/TTL peer-status layout. */
+-        if (source == 3 && (status > 4 || (!status && !(d[5] & (1u << 21))))) return invalid(t);
++        /* The FW status valid bit qualifies peer/TID metadata, not the
++         * ownership return or OK status. The cookie identifies our packet
++         * even when those optional fields are unavailable. */
++        if (source == 3 && status > 4) return invalid(t);
+         unsigned i = cookie & (PEACH_TX_BUFFERS - 1);
+         if (!t->bound || !t->owned[i] || cookie != t->cookies[i] ||
+             ((source == 0 || (status < 3 && (d[5] & (1u << 21)))) && peer != t->peer)) return invalid(t);

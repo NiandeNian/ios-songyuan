@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -240,12 +240,12 @@
+     if (r->type == PeachHttSwToHw) command[3] |= 1u << 25;
+     command[4] = (uint32_t)r->head.iova; command[5] = (uint32_t)(r->head.iova >> 32);
+     command[6] = (uint32_t)r->tail.iova; command[7] = (uint32_t)(r->tail.iova >> 32);
+-    /* Native Peach sends RXDMA_HOST_BUF/SW-to-HW without a response.
+-     * HTT 3.143 does not emit DONE for that hardware-buffer configuration;
+-     * it still emits real DONE for HOST1, HOST4 and the RXDMA destination. */
+-    unsigned no_reply = h->minor == 143 && r->id == 0 && r->type == PeachHttSwToHw;
++    /* This phone's complete native HTT setup stream leaves response_required
++     * clear for every ring. Do not insert a completion wait into that sequence.
++     * Frame reception is still required to prove the resulting RX path. */
++    unsigned no_reply = h->minor == 143;
+     command[12] = no_reply ? 0 : 1u << 19;
+-    if (no_reply) {
++    if (no_reply && r->id == 0 && r->type == PeachHttSwToHw) {
+         /* This ring is filled by firmware. Native RXMAC setup retains
+          * its device low-watermark wakeup even though the host polls.
+          * Captured 4096-entry ring: timer 0x40, low threshold 0x400. */
+@@ -265,7 +265,7 @@
+     h->configured[r->pdev] |= 1u << r->id;
+     h->setup_pending = 0;
+     if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
+-        no_reply ? "HTT RXMAC setup submitted pdev/ring" :
++        no_reply ? "HTT native SRING_SETUP submitted pdev/ring" :
+         "HTT SRING_SETUP confirmed pdev/ring", r->pdev, r->id);
+     return 0;
+ }
+diff --git a/bsd/dev/qcom/PeachHtt.h b/bsd/dev/qcom/PeachHtt.h
+--- a/bsd/dev/qcom/PeachHtt.h
++++ b/bsd/dev/qcom/PeachHtt.h
+@@ -37,9 +37,9 @@
+ /* Real VERSION_REQ/CONF, retaining implicit V1 TCL metadata. A completed
+  * negotiation is not a configured DP path or evidence of packet exchange. */
+ int peach_htt_negotiate(PeachHtt *);
+-/* Serialized SRING_SETUP -> matching successful SRING_SETUP_DONE. Native
+- * HTT 3.143 RXMAC buffer setup is submission-only, as that command has no
+- * completion. Neither result proves that RX or association is working. */
++/* HTT 3.143 follows the captured native submission-only setup stream;
++ * other versions require a matching successful SRING_SETUP_DONE.
++ * Neither result proves that RX or association is working. */
+ int peach_htt_setup_ring(PeachHtt *, const PeachHttRing *);
+ /* Full Peach RX_MSDU_END + RX_MPDU_START, 4-byte tags, no packet-header
+  * TLV/word compaction. RXDMA ring 0 is distinct from host refill ring 5.
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1217,10 +1217,11 @@
+         return EIO;
+     }
+     wifi_phase = 14;
++    /* Actual Android order: management refill precedes the data/RXDMA rings. */
++    wifi_step = "management RX refill";
++    WIFI_TRY(peach_wmi_start_management(&wifi_wmi, &wifi_htt));
+     wifi_step = "Peach UMAC/LMAC SRNG setup";
+     WIFI_TRY(wifi_setup_srng());
+-    wifi_step = "management RX refill";
+-    WIFI_TRY(peach_wmi_start_management(&wifi_wmi, &wifi_htt));
+     if (peach_station_init(&wifi_station, &wifi_wmi, &wifi_htt, &wifi_rx, &wifi_tx)) return EIO;
+     wifi_phase = 15;
+     wifi_step = "regulatory rules and passive scan";

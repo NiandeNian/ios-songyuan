@@ -1,0 +1,231 @@
+diff --git a/bsd/dev/qcom/PeachControl.h b/bsd/dev/qcom/PeachControl.h
+--- a/bsd/dev/qcom/PeachControl.h
++++ b/bsd/dev/qcom/PeachControl.h
+@@ -5,7 +5,7 @@
+ #define PEACH_CONTROL_NAME "org.unixnu.nezha.wifi"
+ #define PEACH_CONTROL_VERSION 1u
+ #define PEACH_CONTROL_BSS 32u
+-enum { PeachControlStatus = 1, PeachControlJoin, PeachControlScan };
++enum { PeachControlStatus = 1, PeachControlJoin, PeachControlScan, PeachControlLeave };
+ enum { PeachNetStarting, PeachNetReady, PeachNetScanning, PeachNetAssociating,
+        PeachNetHandshake, PeachNetOnline, PeachNetFailed, PeachNetRecovering };
+ typedef struct {
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -33,6 +33,7 @@
+ static PeachNetRequest net_request;
+ static mbuf_t net_queue[TX_QUEUE], net_pending;
+ static unsigned net_head, net_count, net_online;
++static unsigned net_trace[2];
+ static unsigned char net_frame[1518]; /* worker-owned, never exposed as DMA */
+ static errno_t control_connect(kern_ctl_ref c, struct sockaddr_ctl *s, void **p)
+ { (void)c; (void)s; *p = NULL; return 0; }
+@@ -42,7 +43,8 @@
+ {
+     if (!request) return EINVAL;
+     unsigned opt = request->action;
+-    if (opt != PeachControlJoin && opt != PeachControlScan) return ENOPROTOOPT;
++    if (opt != PeachControlJoin && opt != PeachControlScan && opt != PeachControlLeave)
++        return ENOPROTOOPT;
+     if (opt == PeachControlJoin) {
+         const PeachControlJoinData *j = &request->join;
+         if (j->version != PEACH_CONTROL_VERSION || j->security > PeachStationWpa2Psk ||
+@@ -56,11 +58,13 @@
+     }
+     lck_mtx_lock(&net_lock);
+     int err = net_snapshot.state == PeachNetFailed ? ENXIO :
+-        net_snapshot.state != PeachNetReady || net_request.action ? EBUSY : 0;
++        (net_snapshot.state != PeachNetReady && net_snapshot.state != PeachNetOnline) ||
++        net_request.action ? EBUSY : 0;
+     if (!err) {
+         net_request = *request;
+         if (opt == PeachControlJoin) { net_join_pending = 1; net_info_data.result = 0; }
+-        net_snapshot.state = opt == PeachControlJoin ? PeachNetAssociating : PeachNetScanning;
++        net_snapshot.state = opt == PeachControlJoin ? PeachNetAssociating :
++            opt == PeachControlScan ? PeachNetScanning : PeachNetRecovering;
+         net_snapshot.error = 0;
+     }
+     lck_mtx_unlock(&net_lock);
+@@ -69,7 +73,7 @@
+ static errno_t control_set(kern_ctl_ref c, u_int32_t u, void *p, int opt, void *data, size_t len)
+ {
+     (void)c; (void)u; (void)p;
+-    if ((opt == PeachControlScan && len) ||
++    if (((opt == PeachControlScan || opt == PeachControlLeave) && len) ||
+         (opt == PeachControlJoin && (!data || len != sizeof(PeachControlJoinData)))) return EINVAL;
+     PeachNetRequest request = {0}; request.action = opt;
+     if (opt == PeachControlJoin) memcpy(&request.join, data, len);
+@@ -113,13 +117,14 @@
+ {
+     lck_mtx_lock(&net_lock);
+     unsigned scan_done = (net_snapshot.state == PeachNetScanning || net_snapshot.state == PeachNetRecovering) &&
+-        (state == PeachNetReady || state == PeachNetFailed || state == PeachNetRecovering);
++        (state == PeachNetReady || state == PeachNetOnline ||
++         state == PeachNetFailed || state == PeachNetRecovering);
+     unsigned join_done = net_join_pending &&
+         (state == PeachNetOnline || state == PeachNetReady || state == PeachNetFailed || state == PeachNetRecovering);
+     net_snapshot.state = state; net_snapshot.error = error;
+     if (state == PeachNetRecovering) net_snapshot.count = 0;
+     if (join_done) {
+-        net_info_data.result = state == PeachNetOnline ? 1 : error == PeachMhiTimeout ? 9 : 2;
++        net_info_data.result = state == PeachNetOnline && !error ? 1 : error == PeachMhiTimeout ? 9 : 2;
+         net_join_pending = 0;
+     }
+     if (w) {
+@@ -149,6 +154,7 @@
+ {
+     lck_mtx_lock(&net_lock); net_info_data.current = *b; net_info_data.security = security;
+     lck_mtx_unlock(&net_lock);
++    net_trace[0] = net_trace[1] = 0;
+ }
+ void peach_net_info(PeachNetInfo *out)
+ {
+@@ -287,6 +293,25 @@
+     ifnet_set_flags(net_interface, up ? IFF_RUNNING : 0, IFF_RUNNING);
+     link_event(up); peach_apple80211_link(up, rssi);
+ }
++/* Bounded metadata only: enough to distinguish DHCP/ARP/DNS data flow.
++ * Runs on the protocol worker, without packet payloads or key material. */
++static void trace_frame(unsigned incoming, const unsigned char *p, size_t bytes)
++{
++    if (bytes < 14 || net_trace[incoming] >= 8) return;
++    net_trace[incoming]++;
++    unsigned type = p[12] * 256u + p[13], protocol = 0, source = 0, dest = 0;
++    if (type == 0x800 && bytes >= 34 && (p[14] >> 4) == 4) {
++        unsigned header = (p[14] & 15) * 4u;
++        protocol = p[23];
++        if (header >= 20 && bytes >= 14 + header + 4 &&
++            !(p[20] & 0x1f) && !p[21] && (protocol == 6 || protocol == 17)) {
++            source = p[14 + header] * 256u + p[15 + header];
++            dest = p[16 + header] * 256u + p[17 + header];
++        }
++    }
++    printf("NEZHA WIFI: %s Ethernet type %#x bytes %lu IP protocol %u ports %u/%u\n",
++        incoming ? "RX" : "TX", type, (unsigned long)bytes, protocol, source, dest);
++}
+ int peach_net_transmit(PeachTx *tx)
+ {
+     if (!net_interface || !tx || !tx->authorized) return 0;
+@@ -309,6 +334,7 @@
+         }
+         err = peach_tx_send(tx, net_frame, bytes, 0);
+         if (err == PeachCeFull) return 0;
++        if (!err) trace_frame(0, net_frame, bytes);
+         mbuf_freem(net_pending); net_pending = NULL;
+         ifnet_stat_increment_out(net_interface, err ? 0 : 1, err ? 0 : bytes, err != 0);
+         if (err) return err;
+@@ -318,6 +344,7 @@
+ void peach_net_receive(const void *packet, size_t bytes)
+ {
+     if (!net_interface || bytes < 14 || bytes > sizeof(net_frame)) return;
++    trace_frame(1, packet, bytes);
+     mbuf_t m;
+     if (mbuf_getpacket(MBUF_DONTWAIT, &m)) return;
+     if (mbuf_copyback(m, 0, bytes, packet, MBUF_DONTWAIT)) { mbuf_freem(m); return; }
+diff --git a/bsd/dev/qcom/PeachApple80211.c b/bsd/dev/qcom/PeachApple80211.c
+--- a/bsd/dev/qcom/PeachApple80211.c
++++ b/bsd/dev/qcom/PeachApple80211.c
+@@ -265,10 +265,10 @@
+     if (r->type == 20) return join(r);
+     if (r->type == 22) {
+         PeachNetInfo info; peach_net_info(&info);
+-        /* wifid can leave an already idle station before its first join.
+-         * A live association still needs the separate teardown path. */
+-        return info.state == PeachNetReady || info.state == PeachNetScanning ||
+-            info.state == PeachNetRecovering ? 0 : EOPNOTSUPP;
++        if (info.state == PeachNetReady || info.state == PeachNetScanning ||
++            info.state == PeachNetRecovering) return 0;
++        PeachNetRequest request = { .action = PeachControlLeave };
++        return peach_net_request(&request);
+     }
+     if (r->type == 10) {
+         if (r->length != sizeof(AppleScanRequest)) return EINVAL;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1333,18 +1333,47 @@
+     return wifi_mission_start(calibration);
+ }
+ 
++static int wifi_restart_mission(PeachMhiDma calibration);
+ static int wifi_connection_request(void)
+ {
+     if (!peach_net_take_request(&wifi_request)) return 0;
++    int err = 0;
+     if (wifi_request.action == PeachControlScan) {
+         wifi_step = "requested passive scan";
+         int err = peach_wmi_passive_scan(&wifi_wmi);
+         if (err == PeachWmiScanFailed) {
+-            peach_net_status(&wifi_wmi, PeachNetReady, EAGAIN);
++            peach_net_status(&wifi_wmi, wifi_net_state, EAGAIN);
+             return 0;
+         }
+-        if (!err) peach_net_status(&wifi_wmi, PeachNetReady, 0);
++        if (!err) peach_net_status(&wifi_wmi, wifi_net_state, 0);
+         return err;
++    }
++    if (wifi_request.action == PeachControlJoin)
++        printf("NEZHA WIFI: manual join SSID %.*s security %u\n",
++            wifi_request.join.ssid_bytes, wifi_request.join.ssid, wifi_request.join.security);
++    if (wifi_tx.bound) {
++        /* Keyed peer retirement is not implemented. Reuse the checked
++         * endpoint reset and fresh DMA path instead of reusing live keys,
++         * queues or cookies. Manual switches share its bounded budget. */
++        if (wifi_recoveries >= WIFI_RECOVERIES) {
++            peach_net_status(&wifi_wmi, wifi_net_state, EBUSY);
++            goto clear_request;
++        }
++        printf("NEZHA WIFI: manual leave/switch reset %u/%u RX %llu/%llu TX %llu/%llu/%llu\n",
++            ++wifi_recoveries, WIFI_RECOVERIES, wifi_rx.received, wifi_rx.discarded,
++            wifi_tx.submitted, wifi_tx.acked, wifi_tx.dropped);
++        wifi_net_state = PeachNetReady;
++        peach_net_link(0); peach_rsn_clear(&wifi_rsn);
++        unsigned char mac[6]; memcpy(mac, wifi_wmi.mac, sizeof(mac));
++        err = wifi_restart_mission(wifi_wlfw.calibration);
++        if (!err && memcmp(mac, wifi_wmi.mac, sizeof(mac))) err = EIO;
++        if (err) goto clear_request;
++    }
++    if (wifi_request.action == PeachControlLeave) {
++        wifi_request.action = 0;
++        peach_net_status(&wifi_wmi, PeachNetReady, 0);
++        printf("NEZHA WIFI: manual leave complete; scan ready\n");
++        goto clear_request;
+     }
+     PeachControlJoinData *j = &wifi_request.join;
+     unsigned selected = PEACH_WMI_BSS_ENTRIES;
+@@ -1355,10 +1384,13 @@
+             peach_station_candidate(b, j->security)) continue;
+         if (selected == PEACH_WMI_BSS_ENTRIES || b->rssi > wifi_wmi.bss[selected].rssi) selected = i;
+     }
+-    int err = 0;
+     if (selected == PEACH_WMI_BSS_ENTRIES) peach_net_status(&wifi_wmi, PeachNetReady, ENOENT);
+     else {
+         peach_net_selection(&wifi_wmi.bss[selected], j->security);
++        const PeachWmiBss *b = &wifi_wmi.bss[selected];
++        printf("NEZHA WIFI: selected BSSID %02x:%02x:%02x:%02x:%02x:%02x frequency %u RSSI %d\n",
++            b->bssid[0], b->bssid[1], b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5],
++            b->frequency, b->rssi);
+         if (wifi_request.passphrase_bytes)
+             err = peach_rsn_pmk(wifi_request.passphrase, wifi_request.passphrase_bytes,
+                 j->ssid, j->ssid_bytes, j->pmk);
+@@ -1381,6 +1413,7 @@
+             if (!err) err = peach_tx_authorize(&wifi_tx, 1);
+         }
+     }
++clear_request:;
+     volatile unsigned char *secret = (void *)&wifi_request;
+     for (size_t i = 0; i < sizeof(wifi_request); i++) secret[i] = 0;
+     return err;
+@@ -1497,7 +1530,11 @@
+     while (!err) {
+         err = peach_htc_poll(&wifi_htc);
+         if (!err) err = wifi_station.error;
++        unsigned rsn_phase = wifi_rsn.phase;
+         if (!err) err = peach_rsn_poll(&wifi_rsn);
++        if (wifi_rsn.phase != rsn_phase)
++            printf("NEZHA WIFI: RSN phase %u -> %u error %d action %u\n",
++                rsn_phase, wifi_rsn.phase, err, wifi_rsn.tx_action);
+         if (!err) err = wifi_connection_request();
+         if (err) err = wifi_connection_recover(err);
+         if (!err && wifi_tx.authorized) {

@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -93,7 +93,10 @@
+     memcpy(p, packet, bytes);
+     size_t length = bytes < 60 ? 60 : bytes;
+     if (length > bytes) memset(p + bytes, 0, length - bytes);
+-    unsigned previous = t->cookies[i], generation = (previous >> 6) + 1;
++    unsigned previous = t->cookies[i];
++    /* Native starts at slot ID zero. Add a generation only when a slot
++     * is reused after its validated completion, not on its first send. */
++    unsigned generation = t->submitted < PEACH_TX_BUFFERS ? 0 : (previous >> 6) + 1;
+     if (generation > 16383) generation = 1;
+     unsigned cookie = generation << 6 | i;
+     t->cookies[i] = cookie;

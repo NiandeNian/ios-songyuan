@@ -1,0 +1,289 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -591,7 +591,12 @@
+     R(29, 256); R(30, w->max_fragments > 10 ? 10 : w->max_fragments);
+     R(44, 1u << 30 | 1u << 10); /* IPA disabled; native 20-bit TX MSDU IDs */
+     R(54, 1); R(63, 1); R(81, 1); /* pdev IDs, single STA/active vdev */
+-    if (w->mgmt_rx_dma.bytes) R(68, 1u << 21); /* real MGMT_SRNG, native flags2 */
++    /* Native EAPOL uses TCL TX_NOTIFY=3. Its firmware path must first be
++     * enabled by NOTIFY_FRAME_CONFIG_ENABLE (flags2 bit14), as in the
++     * captured native INIT (0x013040e0) and wmi_copy_resource_config.
++     * WBM FW completions are handled by PeachTx. */
++    R(68, 1u << 14 | (w->mgmt_rx_dma.bytes ? 1u << 21 : 0));
++    report(w, "WMI INIT flags1/flags2", u32(p + 44 * 4), u32(p + 68 * 4));
+     if (service(w, 143)) R(57, 0x22); /* allow V2 map/unmap; legacy still legal */
+ #undef R
+     p += RESOURCE_WORDS * 4;
+diff --git a/bsd/dev/qcom/PeachStation.c b/bsd/dev/qcom/PeachStation.c
+--- a/bsd/dev/qcom/PeachStation.c
++++ b/bsd/dev/qcom/PeachStation.c
+@@ -265,8 +265,10 @@
+     s->phase = PeachStationAssoc; STRY(s, associate(s, b));
+     STRY(s, peach_wmi_wmm(s->wmi, s->association.qos ? s->received.frame + 30 : NULL,
+         s->association.qos ? s->received.bytes - 30 : 0));
+-    if (s->association.qos)
+-        STRY(s, peach_wmi_peer_queue(s->wmi, s->htt, s->bssid, 6, peach_rx_queue(s->rx, 6)));
++    /* WMM APs can use every traffic class, including video and background
++     * IP traffic. TID0 was prepared above; queues already exist for 1..7. */
++    if (s->association.qos) for (unsigned tid = 1; tid < 8; tid++)
++        STRY(s, peach_wmi_peer_queue(s->wmi, s->htt, s->bssid, tid, peach_rx_queue(s->rx, tid)));
+     STRY(s, peach_wmi_peer_assoc(s->wmi, s->htt, &s->association));
+     STRY(s, peach_wmi_vdev_up(s->wmi));
+     STRY(s, peach_tx_bind(s->tx, 0, s->bssid));
+diff --git a/bsd/dev/qcom/PeachControl.h b/bsd/dev/qcom/PeachControl.h
+--- a/bsd/dev/qcom/PeachControl.h
++++ b/bsd/dev/qcom/PeachControl.h
+@@ -7,7 +7,7 @@
+ #define PEACH_CONTROL_BSS 32u
+ enum { PeachControlStatus = 1, PeachControlJoin, PeachControlScan };
+ enum { PeachNetStarting, PeachNetReady, PeachNetScanning, PeachNetAssociating,
+-       PeachNetHandshake, PeachNetOnline, PeachNetFailed };
++       PeachNetHandshake, PeachNetOnline, PeachNetFailed, PeachNetRecovering };
+ typedef struct {
+     uint32_t frequency, ssid_bytes, privacy, reserved;
+     int32_t rssi;
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -112,11 +112,12 @@
+ void peach_net_status(const PeachWmi *w, unsigned state, int error)
+ {
+     lck_mtx_lock(&net_lock);
+-    unsigned scan_done = net_snapshot.state == PeachNetScanning &&
+-        (state == PeachNetReady || state == PeachNetFailed);
++    unsigned scan_done = (net_snapshot.state == PeachNetScanning || net_snapshot.state == PeachNetRecovering) &&
++        (state == PeachNetReady || state == PeachNetFailed || state == PeachNetRecovering);
+     unsigned join_done = net_join_pending &&
+-        (state == PeachNetOnline || state == PeachNetReady || state == PeachNetFailed);
++        (state == PeachNetOnline || state == PeachNetReady || state == PeachNetFailed || state == PeachNetRecovering);
+     net_snapshot.state = state; net_snapshot.error = error;
++    if (state == PeachNetRecovering) net_snapshot.count = 0;
+     if (join_done) {
+         net_info_data.result = state == PeachNetOnline ? 1 : error == PeachMhiTimeout ? 9 : 2;
+         net_join_pending = 0;
+@@ -139,7 +140,8 @@
+     }
+     lck_mtx_unlock(&net_lock);
+     if (state == PeachNetOnline) peach_net_link(1);
+-    else if (state == PeachNetReady || state == PeachNetHandshake || state == PeachNetFailed) peach_net_link(0);
++    else if (state == PeachNetReady || state == PeachNetHandshake || state == PeachNetFailed ||
++             state == PeachNetRecovering) peach_net_link(0);
+     if (scan_done) peach_apple80211_event(PeachAppleScanDone);
+     if (join_done) peach_apple80211_event(PeachAppleJoinDone);
+ }
+@@ -157,7 +159,7 @@
+ int peach_net_bss(unsigned index, PeachWmiBss *out)
+ {
+     lck_mtx_lock(&net_lock);
+-    int err = net_snapshot.state == PeachNetScanning ? EBUSY :
++    int err = net_snapshot.state == PeachNetScanning || net_snapshot.state == PeachNetRecovering ? EBUSY :
+         index >= net_snapshot.count ? EIO : 0;
+     if (!err) *out = net_bss[index];
+     lck_mtx_unlock(&net_lock); return err;
+@@ -335,3 +337,11 @@
+     for (size_t i = 0; i < sizeof(net_request); i++) secret[i] = 0;
+     lck_mtx_unlock(&net_lock);
+ }
++void peach_net_recovering(int error)
++{
++    peach_net_status(NULL, PeachNetRecovering, error);
++    lck_mtx_lock(&net_lock);
++    volatile unsigned char *secret = (void *)&net_request;
++    for (size_t i = 0; i < sizeof(net_request); i++) secret[i] = 0;
++    lck_mtx_unlock(&net_lock);
++}
+diff --git a/bsd/dev/qcom/PeachNet.h b/bsd/dev/qcom/PeachNet.h
+--- a/bsd/dev/qcom/PeachNet.h
++++ b/bsd/dev/qcom/PeachNet.h
+@@ -28,4 +28,7 @@
+ int peach_net_transmit(PeachTx *);
+ void peach_net_receive(const void *, size_t);
+ void peach_net_stop(int error);
++/* Keep the registered interface and administrative radio state during a
++ * real firmware restart. Link/data stay down until a fresh manual join. */
++void peach_net_recovering(int error);
+ #endif
+diff --git a/bsd/dev/qcom/PeachApple80211.c b/bsd/dev/qcom/PeachApple80211.c
+--- a/bsd/dev/qcom/PeachApple80211.c
++++ b/bsd/dev/qcom/PeachApple80211.c
+@@ -267,7 +267,8 @@
+         PeachNetInfo info; peach_net_info(&info);
+         /* wifid can leave an already idle station before its first join.
+          * A live association still needs the separate teardown path. */
+-        return info.state == PeachNetReady || info.state == PeachNetScanning ? 0 : EOPNOTSUPP;
++        return info.state == PeachNetReady || info.state == PeachNetScanning ||
++            info.state == PeachNetRecovering ? 0 : EOPNOTSUPP;
+     }
+     if (r->type == 10) {
+         if (r->length != sizeof(AppleScanRequest)) return EINVAL;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -96,17 +96,20 @@
+ static uint64_t wifi_context_offset, wifi_dma_next, wifi_check_at;
+ static uint32_t wifi_context_control;
+ static unsigned wifi_table_next, wifi_allocations;
+-#define WIFI_DMA_ALLOCATIONS (PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 7)
++#define WIFI_RECOVERIES 3u
++#define WIFI_DMA_ALLOCATIONS ((PEACH_WLFW_SEGMENTS + PEACH_WMI_MEMORY_REQUESTS + 12) * (WIFI_RECOVERIES + 1))
+ static vm_offset_t wifi_owned_dma[WIFI_DMA_ALLOCATIONS];
+ #define WIFI_IOVA 0x20000000ull
+ #define WIFI_DMA_BYTES 0x920000u
+-#define WIFI_DMA_LIMIT 0x28000000ull
++#define WIFI_DMA_LIMIT 0x30000000ull
+ /* Peach firmware validates the DDR geometry through the IPA window's end,
+  * as CNSS host_cap does on this phone. This publishes an address range;
+  * allocations stay capped above and SMMU entries exist only for owned pages. */
+ #define WIFI_IOVA_LIMIT 0xb0010000ull
+-#define WIFI_TABLE_BYTES 0x50000u
++#define WIFI_TABLE_BYTES 0x90000u
+ #define WIFI_MSI_OFFSET 0x808000u
++static uint64_t wifi_arena_iova = WIFI_IOVA;
++static unsigned wifi_recoveries;
+ #define WIFI_TRY(expr) do { int err_ = (expr); if (err_) return err_; } while (0)
+ static int wifi_dma_health(void);
+ 
+@@ -700,7 +703,7 @@
+ 
+ static PeachMhiDma wifi_dma_part(size_t offset, size_t bytes)
+ {
+-    return (PeachMhiDma){(void *)(wifi_arena + offset), WIFI_IOVA + offset, bytes};
++    return (PeachMhiDma){(void *)(wifi_arena + offset), wifi_arena_iova + offset, bytes};
+ }
+ static int wifi_firmware_read(void *c, uint64_t o, void *p, size_t n)
+ { (void)c; return pandora_firmware_pread("peach/amss20.bin", o, p, n, NULL); }
+@@ -731,7 +734,7 @@
+     unsigned wide = !!(cap & 1u << 23), mask = !!(cap & 1u << 24);
+     unsigned data_off = wifi_msi_cap + (wide ? 12 : 8);
+     unsigned mask_off = wifi_msi_cap + (wide ? 16 : 12);
+-    uint32_t address = (uint32_t)(WIFI_IOVA + WIFI_MSI_OFFSET);
++    uint32_t address = (uint32_t)(wifi_arena_iova + WIFI_MSI_OFFSET);
+     *(volatile uint32_t *)(wifi_arena + WIFI_MSI_OFFSET) = 0;
+     wifi_barrier(NULL);
+     if (mask) WIFI_TRY(wifi_wr(W_CFG, mask_off, 0xffffffffu));
+@@ -1130,25 +1133,10 @@
+     return 0;
+ }
+ 
+-static int
+-wifi_start(void)
+-{
+-    for (unsigned i = 0; i < W_NWIN; i++) WIFI_TRY(wifi_map(i));
+-    WIFI_TRY(wifi_power());
+-    WIFI_TRY(wifi_pcie_resources());
+-    WIFI_TRY(wifi_pcie_link());
+-    WIFI_TRY(wifi_dma());
+-    WIFI_TRY(wifi_boot_firmware((PeachMhiDma){0}));
+-    wifi_step = "cold boot calibration";
+-    int err = peach_wlfw_calibrate(&wifi_wlfw);
+-    if (err) {
+-        printf("NEZHA WIFI: calibration failed %d, QMI %#x remote %u\n", err,
+-            wifi_wlfw.message, wifi_wlfw.remote_error);
+-        return EIO;
+-    }
+-    PeachMhiDma calibration = wifi_wlfw.calibration;
+-    /* CNSS restarts firmware after calibration; it retains CAL memory.
+-     * Disable bus mastering and verify PERST before reusing MHI contexts. */
++static int wifi_reset_endpoint(void)
++{
++    /* This resets only the owned WLAN endpoint. It does not prove that an
++     * old DMA allocation may be released or reused after a firmware crash. */
+     uint32_t command, check;
+     WIFI_TRY(wifi_rd(W_CFG, 4, &command));
+     WIFI_TRY(wifi_wr(W_CFG, 4, command & 0xfffbu));
+@@ -1163,7 +1151,12 @@
+     WIFI_TRY(wifi_pcie_link());
+     WIFI_TRY(wifi_dma_health());
+     wifi_target_window = 0xffffffffu;
+-    printf("NEZHA WIFI: endpoint reset after calibration; CAL DMA retained\n");
++    return 0;
++}
++
++static int wifi_mission_start(PeachMhiDma calibration)
++{
++    int err;
+     WIFI_TRY(wifi_boot_firmware(calibration));
+     wifi_step = "prepare CE DMA";
+     PeachMhiDma ce_dma;
+@@ -1262,6 +1255,27 @@
+     printf("NEZHA WIFI: passive scan completed with %u BSS; awaiting explicit network selection\n",
+         wifi_wmi.bss_count);
+     return 0;
++}
++
++static int wifi_start(void)
++{
++    for (unsigned i = 0; i < W_NWIN; i++) WIFI_TRY(wifi_map(i));
++    WIFI_TRY(wifi_power());
++    WIFI_TRY(wifi_pcie_resources());
++    WIFI_TRY(wifi_pcie_link());
++    WIFI_TRY(wifi_dma());
++    WIFI_TRY(wifi_boot_firmware((PeachMhiDma){0}));
++    wifi_step = "cold boot calibration";
++    int err = peach_wlfw_calibrate(&wifi_wlfw);
++    if (err) {
++        printf("NEZHA WIFI: calibration failed %d, QMI %#x remote %u\n", err,
++            wifi_wlfw.message, wifi_wlfw.remote_error);
++        return EIO;
++    }
++    PeachMhiDma calibration = wifi_wlfw.calibration;
++    WIFI_TRY(wifi_reset_endpoint());
++    printf("NEZHA WIFI: endpoint reset after calibration; CAL DMA retained\n");
++    return wifi_mission_start(calibration);
+ }
+ 
+ static int wifi_connection_request(void)
+@@ -1358,6 +1372,44 @@
+     }
+ }
+ 
++static int wifi_firmware_recover(int error)
++{
++    if (wifi_fault || wifi_recoveries >= WIFI_RECOVERIES ||
++        !wifi_wlfw.calibration_done || !wifi_wlfw.calibration.bytes || !wifi_wmi.ready)
++        return error;
++    PeachMhiDma calibration = wifi_wlfw.calibration;
++    unsigned char mac[6]; memcpy(mac, wifi_wmi.mac, sizeof(mac));
++    printf("NEZHA WIFI: firmware recovery %u/%u, error %d station/RSN %u/%u\n",
++        ++wifi_recoveries, WIFI_RECOVERIES, error, wifi_station.phase, wifi_rsn.phase);
++    wifi_net_state = PeachNetRecovering;
++    peach_net_recovering(error); peach_rsn_clear(&wifi_rsn);
++    wifi_mhi_failure();
++    if (wifi_fault) return error;
++    wifi_step = "firmware recovery reset";
++    WIFI_TRY(wifi_reset_endpoint());
++    /* Quarantine every old context, packet buffer, crash dump and MSI word.
++     * Only fresh monotonic IOVAs are exposed to the new firmware instance.
++     * The existing isolated SMMU bank/tables and successful CAL are retained. */
++    PeachMhiDma arena;
++    WIFI_TRY(wifi_allocate_dma(NULL, WIFI_DMA_BYTES, &arena));
++    wifi_arena = (vm_offset_t)arena.bytes; wifi_arena_iova = arena.iova;
++    memset(&wifi_firmware, 0, sizeof(wifi_firmware));
++    memset(&wifi_rddm, 0, sizeof(wifi_rddm)); wifi_rddm_session = 0;
++    memset(&wifi_host, 0, sizeof(wifi_host)); memset(&wifi_wlfw, 0, sizeof(wifi_wlfw));
++    memset(&wifi_ce, 0, sizeof(wifi_ce)); memset(&wifi_htc, 0, sizeof(wifi_htc));
++    memset(&wifi_htt, 0, sizeof(wifi_htt)); memset(&wifi_wmi, 0, sizeof(wifi_wmi));
++    memset(wifi_srng, 0, sizeof(wifi_srng));
++    memset(wifi_rxmac, 0, sizeof(wifi_rxmac)); wifi_rxmac_count = 0;
++    memset(&wifi_rx, 0, sizeof(wifi_rx)); memset(&wifi_tx, 0, sizeof(wifi_tx));
++    memset(&wifi_station, 0, sizeof(wifi_station));
++    WIFI_TRY(wifi_mission_start(calibration));
++    if (memcmp(mac, wifi_wmi.mac, sizeof(mac))) return EIO;
++    wifi_net_state = PeachNetReady;
++    peach_net_status(&wifi_wmi, wifi_net_state, 0);
++    printf("NEZHA WIFI: firmware recovered; en0 retained, scan ready, manual join required\n");
++    return 0;
++}
++
+ static void
+ wifi_thread(void *unused, wait_result_t result)
+ {
+@@ -1389,6 +1441,7 @@
+             wifi_net_state = PeachNetHandshake;
+             peach_net_status(&wifi_wmi, wifi_net_state, 0);
+         }
++        if (err && wifi_net_attached) err = wifi_firmware_recover(err);
+         if (!err) wifi_sleep(NULL, wifi_tx.bound ? 1000 : 5000);
+     }
+     printf("NEZHA WIFI: failure station/RSN/action %u/%u/%u WMI event %#x\n",

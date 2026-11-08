@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -1054,7 +1054,9 @@
+      * EHT/UHR arrays and the single-word flags union. No PHY feature flags. */
+     memset(w->command, 0, sizeof(w->command));
+     unsigned char *p = w->command + 4;
+-    tlv(p, TAG_ASSOC, 380); peer_mac(p + 4, s->mac);
++    /* Native Peach module send_peer_assoc_cmd_tlv: 280-byte fixed struct,
++     * not the later UHR/V2 ABI. Follow its five optional arrays below. */
++    tlv(p, TAG_ASSOC, 276); peer_mac(p + 4, s->mac);
+     p32(p + 16, 1); p32(p + 20, a->aid);
+     p32(p + 24, a->protected_network ? 0x24 : 1); /* need PTK/PRIV or open AUTH */
+     p32(p + 28, a->capabilities); p32(p + 32, 10); p32(p + 52, 1);
+@@ -1063,11 +1065,12 @@
+         if (w->channels[i].frequency == w->vdev_frequency && (w->channels[i].flags & 4)) mode = 2;
+     p32(p + 60, mode); p32(p + 72, a->rate_count);
+     p32(p + 172, a->protected_network ? 11 : 1); /* RSNA_PSK / OPEN */
+-    p32(p + 252, 1); p32(p + 256, 1);
+-    p += 384; unsigned padded = (a->rate_count + 3) & ~3u;
++    p32(p + 252, 1); /* peer_max_tx_nss */
++    p += 280; unsigned padded = (a->rate_count + 3) & ~3u;
+     tlv(p, 17, padded); memcpy(p + 4, a->rates, a->rate_count); p += 4 + padded;
+     tlv(p, 17, 0); p += 4; tlv(p, TAG_VHT_RATES, 20); p += 24;
+-    for (unsigned i = 0; i < 9; i++, p += 4) tlv(p, TAG_ARRAY, 0);
++    for (unsigned i = 0; i < 5; i++, p += 4) tlv(p, TAG_ARRAY, 0);
++    report(w, "WMI native peer assoc bytes/rates", (uint32_t)(p - w->command), a->rate_count);
+     WTRY(w, send_command(w, 0x6005, (size_t)(p - w->command))); s->assoc_sent = 1;
+     s->assoc_id = a->aid; s->protected_network = a->protected_network;
+     if (service(w, 79)) WTRY(w, wait_flag(w, &s->assoc_confirmed));

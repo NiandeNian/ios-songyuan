@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -1058,7 +1058,9 @@
+      * not the later UHR/V2 ABI. Follow its five optional arrays below. */
+     tlv(p, TAG_ASSOC, 276); peer_mac(p + 4, s->mac);
+     p32(p + 16, 1); p32(p + 20, a->aid);
+-    p32(p + 24, a->protected_network ? 0x24 : 1); /* need PTK/PRIV or open AUTH */
++    /* Native protected association requests PTK/GTK handshakes. PRIV
++     * would enable encryption before a pairwise key exists for M2. */
++    p32(p + 24, a->protected_network ? 0x14 : 1);
+     p32(p + 28, a->capabilities); p32(p + 32, 10); p32(p + 52, 1);
+     unsigned mode = w->vdev_frequency < 2500 ? 1 : 0;
+     for (unsigned i = 0; i < w->channel_count; i++)

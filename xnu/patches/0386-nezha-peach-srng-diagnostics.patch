@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -895,7 +895,8 @@
+         printf("NEZHA WIFI: TX prepare failed %d\n", tx_err);
+         return EIO;
+     }
+-    for (unsigned i = PeachSrngTclTx; i < PeachSrngRxBuffer; i++) {
++    for (unsigned i = PeachSrngTclTx; i < PeachSrngKinds; i++) {
++        if (wifi_srng[i].lmac) continue;
+         int err = peach_srng_start_host(&wifi_srng[i]);
+         if (err) {
+             printf("NEZHA WIFI: SRNG %u failed %d at %#x value %#x\n", i, err,
+@@ -903,9 +904,6 @@
+             return EIO;
+         }
+     }
+-    if (peach_srng_start_host(&wifi_srng[PeachSrngIdleLink])) return EIO;
+-    if (peach_srng_start_host(&wifi_srng[PeachSrngWbmRelease])) return EIO;
+-    if (peach_srng_start_host(&wifi_srng[PeachSrngTxCompletion])) return EIO;
+     /* Vendor QCA_HOST2FW_RXBUF_RING path: HOST1_TO_FW is software ring 5
+      * in the single host-MAC slot 0. RXDMA destination uses target PDEV. */
+     int err = peach_srng_start_lmac(&wifi_srng[PeachSrngRxBuffer], &wifi_htt,

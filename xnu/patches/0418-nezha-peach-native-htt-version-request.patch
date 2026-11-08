@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -202,9 +202,10 @@
+ int peach_htt_negotiate(PeachHtt *h)
+ {
+     if (!h || !h->htc || !h->htc->started || h->requested) return PeachMhiInvalid;
+-    /* Without MAX_TX_QUEUE_GROUPS the protocol defaults to four groups.
+-     * This host has no flow-group handlers, so explicitly negotiate zero. */
+-    const uint32_t request[] = {0, 3u | 1u << 8};
++    /* Native Peach dp_htt_h2t_add_tcl_metadata_ver negotiates TCL v1,
++     * with the scalar TLV's byte length. Do not apply the HL queue-group
++     * override to this low-latency TCL/WBM datapath. */
++    const uint32_t request[] = {0, 5u | 4u << 8 | 1u << 16};
+     h->requested = 1;
+     int err = send_message(h, request, sizeof(request));
+     return err ? err : wait_flag(h, &h->confirmed);

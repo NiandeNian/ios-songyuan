@@ -1,0 +1,32 @@
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -51,6 +51,7 @@
+ #include <uuid/uuid.h>
+ #include <sys/random.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
+ 
+ #include <sys/pgo.h>
+ 
+@@ -351,7 +352,7 @@
+ static bool                 sDeferredLoadSucceeded     = false;
+ static bool                 sConsiderUnloadsExecuted   = false;
+ 
+-#if NO_KEXTD
++#if NO_KEXTD || defined(PANDORA)
+ static bool                 sKernelRequestsEnabled     = false;
+ #else
+ static bool                 sKernelRequestsEnabled     = true;
+@@ -1486,6 +1487,11 @@
+ bool
+ OSKext::iokitDaemonAvailable(void)
+ {
++#if defined(PANDORA)
++	/* This iOS port starts only its prelinked drivers; there is no kextd.
++	 * Do not hold registry matching or queue loads for a missing daemon. */
++	return false;
++#endif
+ 	int notused;
+ 	if (PE_parse_boot_argn("-restore", &notused, sizeof(notused))) {
+ 		return false;

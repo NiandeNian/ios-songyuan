@@ -1,0 +1,195 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -14,7 +14,7 @@
+ int peach_tx_prepare(PeachTx *t, PeachSrng rings[PeachSrngKinds], PeachHtt *h,
+                      PeachMhiDma memory, unsigned lmac, unsigned pdev)
+ {
+-    if (!t || !rings || !h || !h->confirmed || h->metadata_version != 1 ||
++    if (!t || !rings || !h || !h->htc || !h->htc->started || h->metadata_version != 1 ||
+         lmac > 3 || pdev > 3 || !memory.bytes || !memory.iova ||
+         ((uintptr_t)memory.bytes & 127) || (memory.iova & 127) ||
+         memory.capacity < PEACH_TX_DMA_BYTES || memory.iova >= 0x100000000ull ||
+@@ -34,15 +34,26 @@
+     PeachSrngOps *ops = &t->ring->ops;
+     TTRY(t, ops->health(ops->context));
+     memset(memory.bytes, 0, PEACH_TX_DMA_BYTES); ops->barrier(ops->context);
++    t->prepared = 1;
++    return 0;
++}
++int peach_tx_start(PeachTx *t)
++{
++    if (!t || !t->prepared || t->started || !t->htt->confirmed ||
++        t->htt->metadata_version != 1 || !t->ring->started || !t->completion->started)
++        return PeachMhiInvalid;
++    if (t->error) return t->error;
++    PeachSrngOps *ops = &t->ring->ops;
++    TTRY(t, ops->health(ops->context));
+     /* Bank 0 is host-owned; Peach has eight banks, last reserved for FW.
+      * hal_be_generic_api.h's Peach layout uses DSCP table bits at 17, not
+      * newer MCAST_PACKET_CTRL bits. STA uses the real BSS AST index.
+      * Non-raw encryption is taken from the peer, not this bank. */
+-    uint32_t config = 2u << 1 | 1u << 9 | lmac << 15, check;
++    uint32_t config = 2u << 1 | 1u << 9 | t->lmac << 15, check;
+     TTRY(t, ops->write32(ops->context, 0x00a4408c, config));
+     TTRY(t, ops->read32(ops->context, 0x00a4408c, &check));
+     if (check != config) return invalid(t);
+-    t->prepared = 1;
++    t->started = 1;
+     return 0;
+ }
+ static int mapping_live(PeachTx *t)
+@@ -54,7 +65,7 @@
+ }
+ int peach_tx_bind(PeachTx *t, unsigned vdev, const unsigned char mac[6])
+ {
+-    if (!t || !t->prepared || t->authorized || t->in_flight || vdev || !mac)
++    if (!t || !t->started || t->authorized || t->in_flight || vdev || !mac)
+         return PeachMhiInvalid;
+     if (t->error) return t->error;
+     if (t->htt->error) return t->error = t->htt->error;
+@@ -83,7 +94,7 @@
+ }
+ static int send_packet(PeachTx *t, const void *packet, size_t bytes, unsigned tid, unsigned control)
+ {
+-    if (!t || !t->prepared || !t->bound || (!t->authorized && !control) || !packet ||
++    if (!t || !t->started || !t->bound || (!t->authorized && !control) || !packet ||
+         bytes < 14 || bytes > 1518 || tid > 15 ||
+         !t->ring->started || !t->completion->started) return PeachMhiInvalid;
+     if (t->error) return t->error;
+@@ -152,7 +163,7 @@
+ }
+ int peach_tx_poll(PeachTx *t)
+ {
+-    if (!t || !t->prepared || !t->completion->started) return 0;
++    if (!t || !t->started || !t->completion->started) return 0;
+     if (t->error) return t->error;
+     if (t->bound && !mapping_live(t)) t->authorized = 0;
+     for (unsigned budget = 0; budget < 64; budget++) {
+diff --git a/bsd/dev/qcom/PeachTx.h b/bsd/dev/qcom/PeachTx.h
+--- a/bsd/dev/qcom/PeachTx.h
++++ b/bsd/dev/qcom/PeachTx.h
+@@ -10,7 +10,7 @@
+     PeachSrng *ring, *completion;
+     PeachHtt *htt;
+     PeachMhiDma memory;
+-    unsigned prepared, bound, authorized, lmac, pdev, vdev, peer, ast, hash, qos;
++    unsigned prepared, started, bound, authorized, lmac, pdev, vdev, peer, ast, hash, qos;
+     uint32_t peer_generation;
+     unsigned char peer_mac[6];
+     unsigned in_flight, next;
+@@ -25,6 +25,9 @@
+ } PeachTx;
+ int peach_tx_prepare(PeachTx *, PeachSrng rings[PeachSrngKinds], PeachHtt *,
+                      PeachMhiDma, unsigned lmac, unsigned pdev);
++/* Host SRNGs precede WMI INIT; enable packet TX only after HTT confirms
++ * the metadata ABI and the firmware has completed initialization. */
++int peach_tx_start(PeachTx *);
+ /* Binding must use a real HTT peer map after successful association. The
+  * caller may authorize only after the required security/key setup succeeds.
+  * Unbind needs all outstanding completions; no timeout-based DMA freeing. */
+diff --git a/bsd/dev/qcom/PeachRx.c b/bsd/dev/qcom/PeachRx.c
+--- a/bsd/dev/qcom/PeachRx.c
++++ b/bsd/dev/qcom/PeachRx.c
+@@ -168,7 +168,9 @@
+     if (r->error) return r->error;
+     for (unsigned i = 0; i < PeachSrngKinds; i++)
+         if (!r->rings[i].started || r->rings[i].error) return PeachMhiInvalid;
+-    RTRY(r, peach_srng_seed_idle(&r->rings[PeachSrngIdleLink], r->links, PEACH_RX_LINKS));
++    /* The idle link pool is published before WMI INIT, alongside host
++     * TCL/WBM rings; firmware initialization may already reference it. */
++    if (r->rings[PeachSrngIdleLink].wp != PEACH_RX_LINKS) return PeachMhiInvalid;
+     RTRY(r, peach_htt_config_rx(h, pdev, PEACH_RX_BUFFER_BYTES));
+     r->repost = PEACH_RX_BUFFERS;
+     RTRY(r, replenish(r));
+diff --git a/bsd/dev/qcom/PeachRx.h b/bsd/dev/qcom/PeachRx.h
+--- a/bsd/dev/qcom/PeachRx.h
++++ b/bsd/dev/qcom/PeachRx.h
+@@ -32,6 +32,8 @@
+  * peer setup. Initial non-BA queues have PN disabled: protected peers need
+  * explicit PN/BA configuration before they can be connected. */
+ int peach_rx_prepare(PeachRx *, PeachSrng rings[PeachSrngKinds], PeachMhiDma);
++/* Host rings and the idle link pool are started/seeded before WMI INIT.
++ * After HTT setup, this final step publishes packet buffers and filters. */
+ int peach_rx_start(PeachRx *, PeachHtt *, unsigned pdev);
+ PeachMhiDma peach_rx_queue(const PeachRx *, unsigned tid);
+ /* After peer retirement only: use fresh retained storage. Old descriptors
+diff --git a/bsd/dev/qcom/PeachStation.c b/bsd/dev/qcom/PeachStation.c
+--- a/bsd/dev/qcom/PeachStation.c
++++ b/bsd/dev/qcom/PeachStation.c
+@@ -113,7 +113,7 @@
+ }
+ int peach_station_init(PeachStation *s, PeachWmi *w, PeachHtt *h, PeachRx *r, PeachTx *t)
+ {
+-    if (!s || !w || !h || !r || !t || !w->ready || !h->confirmed || !r->started || !t->prepared)
++    if (!s || !w || !h || !r || !t || !w->ready || !h->confirmed || !r->started || !t->started)
+         return PeachMhiInvalid;
+     memset(s, 0, sizeof(*s)); s->wmi = w; s->htt = h; s->rx = r; s->tx = t;
+     return 0;
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -890,11 +890,19 @@
+             wifi_rx.last_register, wifi_rx.last_value);
+         return EIO;
+     }
+-    /* Match ath12k_core_start: host REO destinations precede WMI INIT;
+-     * HTT-dependent TX/LMAC setup remains after READY/version negotiation. */
+-    WIFI_TRY(peach_srng_start_host(&wifi_srng[PeachSrngReoRx]));
+-    WIFI_TRY(peach_srng_start_host(&wifi_srng[PeachSrngReoException]));
+-    printf("NEZHA WIFI: host REO rings ready before WMI INIT\n");
++    PeachMhiDma tx_memory;
++    WIFI_TRY(wifi_allocate_dma(NULL, PEACH_TX_DMA_BYTES, &tx_memory));
++    WIFI_TRY(peach_tx_prepare(&wifi_tx, wifi_srng, &wifi_htt, tx_memory,
++        wifi_wmi.radio.lmac, wifi_wmi.radio.pdev));
++    /* dp_cmn_device_init precedes core_start/WMI INIT in the working
++     * driver. That includes TCL, WBM completions and the seeded idle-link
++     * pool, not only REO destinations. HTT configures LMAC rings later. */
++    for (unsigned i = 0; i < PeachSrngKinds; i++) {
++        if (wifi_srng[i].lmac) continue;
++        WIFI_TRY(peach_srng_start_host(&wifi_srng[i]));
++    }
++    WIFI_TRY(peach_srng_seed_idle(&wifi_srng[PeachSrngIdleLink], wifi_rx.links, PEACH_RX_LINKS));
++    printf("NEZHA WIFI: host REO/TCL/WBM rings and idle pool ready before WMI INIT\n");
+     return 0;
+ }
+ /* Android's actual HTT stream configures HOST1/SW-to-SW and, separately,
+@@ -925,22 +933,10 @@
+ }
+ static int wifi_setup_srng(void)
+ {
+-    PeachMhiDma tx_memory;
+-    WIFI_TRY(wifi_allocate_dma(NULL, PEACH_TX_DMA_BYTES, &tx_memory));
+-    int tx_err = peach_tx_prepare(&wifi_tx, wifi_srng, &wifi_htt, tx_memory,
+-        wifi_wmi.radio.lmac, wifi_wmi.radio.pdev);
++    int tx_err = peach_tx_start(&wifi_tx);
+     if (tx_err) {
+         printf("NEZHA WIFI: TX prepare failed %d\n", tx_err);
+         return EIO;
+-    }
+-    for (unsigned i = PeachSrngTclTx; i < PeachSrngKinds; i++) {
+-        if (wifi_srng[i].lmac) continue;
+-        int err = peach_srng_start_host(&wifi_srng[i]);
+-        if (err) {
+-            printf("NEZHA WIFI: SRNG %u failed %d at %#x value %#x\n", i, err,
+-                wifi_srng[i].last_register, wifi_srng[i].last_value);
+-            return EIO;
+-        }
+     }
+     /* Vendor QCA_HOST2FW_RXBUF_RING path: HOST1_TO_FW is software ring 5
+      * in the single host-MAC slot 0. RXDMA destination uses target PDEV. */
+@@ -1039,6 +1035,14 @@
+ static void wifi_mhi_failure(void)
+ {
+     if (wifi_phase < 6 || wifi_fault) return;
++    if (wifi_tx.prepared && wifi_tx.ring->started && wifi_tx.completion->started) {
++        wifi_barrier(NULL);
++        printf("NEZHA WIFI: TX TCL published/consumed DWORDs %u/%u WBM head/tail %u/%u in-flight %u\n",
++            wifi_tx.ring->wp * wifi_tx.ring->dwords,
++            *(volatile uint32_t *)wifi_tx.ring->tail.bytes,
++            *(volatile uint32_t *)wifi_tx.completion->head.bytes,
++            wifi_tx.completion->rp * wifi_tx.completion->dwords, wifi_tx.in_flight);
++    }
+     printf("NEZHA WIFI: last MSI data %#x\n",
+         *(volatile uint32_t *)(wifi_arena + WIFI_MSI_OFFSET));
+     uint32_t status = 0, debug[6] = {0};

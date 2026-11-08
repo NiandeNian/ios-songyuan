@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/qcom/PeachHtt.c b/bsd/dev/qcom/PeachHtt.c
+--- a/bsd/dev/qcom/PeachHtt.c
++++ b/bsd/dev/qcom/PeachHtt.c
+@@ -62,6 +62,16 @@
+     if (!p || n < 4 || (n & 3)) { h->error = PeachCeProtocol; return; }
+     uint32_t word = u32(p);
+     h->last_message = word;
++    if ((word & 255) == 0x30) { /* htt_t2h_ppdu_id_fmt_ind_t */
++        if (!h->confirmed || n != 20 || word != 0x30) {
++            h->error = PeachCeProtocol; return;
++        }
++        /* This describes PPDU statistics bit packing, with no DMA ownership
++         * or ACK. Neither PPDU statistics nor monitor/MLO decoding is used. */
++        if (h->htc->ops.log) h->htc->ops.log(h->htc->ops.context,
++            "HTT PPDU format metadata", u32(p + 4), u32(p + 8));
++        return;
++    }
+     if ((word & 255) == 0x24) {
+         unsigned pdev = (word >> 8) & 255, kind = (word >> 16) & 255, ring = word >> 24;
+         if (!h->confirmed || n != 12 || kind > 1 ||

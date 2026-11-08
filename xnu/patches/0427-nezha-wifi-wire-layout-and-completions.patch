@@ -1,0 +1,482 @@
+diff --git a/bsd/dev/qcom/PeachTx.c b/bsd/dev/qcom/PeachTx.c
+--- a/bsd/dev/qcom/PeachTx.c
++++ b/bsd/dev/qcom/PeachTx.c
+@@ -71,6 +71,15 @@
+     if (t->error) return t->error;
+     t->authorized = enabled;
+     return 0;
++}
++int peach_tx_unbind(PeachTx *t)
++{
++    if (!t || !t->prepared || t->authorized || t->in_flight || t->control_pending)
++        return PeachMhiInvalid;
++    if (t->error) return t->error;
++    t->bound = t->qos = t->control_done = t->control_acked = 0;
++    t->peer_generation = 0; memset(t->peer_mac, 0, sizeof(t->peer_mac));
++    return 0; /* retain cookie generations and all DMA storage */
+ }
+ static int send_packet(PeachTx *t, const void *packet, size_t bytes, unsigned tid, unsigned control)
+ {
+@@ -156,6 +165,12 @@
+         /* FW overlays HTT v3 transmit status on DWORDs 2..6. WBM still
+          * owns the cookie fields; the peer moves from DWORD7 to DWORD5. */
+         unsigned source = d[2] & 7, status = (d[2] >> 13) & 15;
++        /* MEC is a multicast learning notification, not ownership return
++         * for this cookie. It may precede the actual TQM completion. */
++        if (source == 3 && status == 5) {
++            if (d[2] & 0x80000000u) return invalid(t);
++            continue;
++        }
+         if ((source != 0 && source != 3) || ((d[2] >> 6) & 7) != 0 ||
+             ((d[2] >> 9) & 15) != TX_RBM || (d[2] & 0xc0000000u)) return invalid(t);
+         unsigned cookie = (d[2] >> 18) & 4095 | ((d[7] >> 20) & 255) << 12;
+@@ -164,12 +179,13 @@
+             t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion source/status", source, status);
+             t->htt->htc->ops.log(t->htt->htc->ops.context, "TX completion cookie/peer", cookie, peer);
+         }
+-        /* Only FW OK/DROP/TTL release a packet here. Reinjection, inspect
+-         * and MEC notifications are not transmission acknowledgements. */
+-        if (source == 3 && (status > 2 || (!status && !(d[5] & (1u << 21))))) return invalid(t);
++        /* FW reinject/inspect return ownership too (dp_tx_*_handler),
++         * but are dropped by this STA path and never counted as ACKs.
++         * Their overlay is not the OK/DROP/TTL peer-status layout. */
++        if (source == 3 && (status > 4 || (!status && !(d[5] & (1u << 21))))) return invalid(t);
+         unsigned i = cookie & (PEACH_TX_BUFFERS - 1);
+         if (!t->bound || !t->owned[i] || cookie != t->cookies[i] ||
+-            ((source == 0 || (d[5] & (1u << 21))) && peer != t->peer)) return invalid(t);
++            ((source == 0 || (status < 3 && (d[5] & (1u << 21)))) && peer != t->peer)) return invalid(t);
+         /* A source TP advance did not release this buffer. Only this
+          * validated completion permits reuse, including failed TX. */
+         t->owned[i] = 0; t->in_flight--;
+diff --git a/bsd/dev/qcom/PeachTx.h b/bsd/dev/qcom/PeachTx.h
+--- a/bsd/dev/qcom/PeachTx.h
++++ b/bsd/dev/qcom/PeachTx.h
+@@ -29,6 +29,7 @@
+  * caller may authorize only after the required security/key setup succeeds.
+  * Unbind needs all outstanding completions; no timeout-based DMA freeing. */
+ int peach_tx_bind(PeachTx *, unsigned vdev, const unsigned char mac[6]);
++int peach_tx_unbind(PeachTx *);
+ int peach_tx_authorize(PeachTx *, unsigned enabled);
+ int peach_tx_send(PeachTx *, const void *, size_t, unsigned tid);
+ /* One retained EAPOL packet, also allowed before ordinary data authorization.
+diff --git a/bsd/dev/qcom/PeachApple80211.c b/bsd/dev/qcom/PeachApple80211.c
+--- a/bsd/dev/qcom/PeachApple80211.c
++++ b/bsd/dev/qcom/PeachApple80211.c
+@@ -91,7 +91,7 @@
+                sizeof(AppleLink) == 32, "Apple80211 join/link ABI");
+ static LCK_GRP_DECLARE(apple_group, "nezha-apple80211");
+ static LCK_MTX_DECLARE(apple_lock, &apple_group);
+-static unsigned result_next;
++static unsigned result_next, result_generation;
+ static void erase(void *p, size_t n)
+ { volatile unsigned char *v = p; while (n--) *v++ = 0; }
+ static int give(AppleRequest *r, const void *data, size_t bytes)
+@@ -156,9 +156,9 @@
+         return give(r, name, sizeof(name));
+     }
+     case 12: {
+-        /* AES, AES-CCM, short preamble/slot, WPA2. No WME, HT, power-save
++        /* AES, AES-CCM, short preamble/slot, WPA2 and WME. No HT, power-save
+          * or PMF capability until their actual protocol paths exist. */
+-        const uint8_t capabilities[13] = {0x0c, 0x46};
++        const uint8_t capabilities[13] = {0x0c, 0x46, 0x02};
+         return give(r, capabilities, sizeof(capabilities));
+     }
+     case 15: r->value = 1; return 0; /* station */
+@@ -197,10 +197,16 @@
+     case 11: {
+         PeachWmiBss b;
+         lck_mtx_lock(&apple_lock);
+-        int err = peach_net_bss(result_next, &b);
+-        if (!err) result_next++;
++        unsigned index = result_next, generation = result_generation;
++        int err = peach_net_bss(index, &b);
+         lck_mtx_unlock(&apple_lock);
+-        return err ? err : network(r, &b);
++        if (!err) err = network(r, &b);
++        /* User memory faults and allocation must not block scan events
++         * on the protocol worker. Advance only this successful snapshot. */
++        lck_mtx_lock(&apple_lock);
++        if (!err && result_next == index && result_generation == generation) result_next++;
++        lck_mtx_unlock(&apple_lock);
++        return err;
+     }
+     default: break;
+     }
+@@ -311,7 +317,7 @@
+ void peach_apple80211_event(unsigned code)
+ {
+     if (code == PeachAppleScanDone) {
+-        lck_mtx_lock(&apple_lock); result_next = 0; lck_mtx_unlock(&apple_lock);
++        lck_mtx_lock(&apple_lock); result_next = 0; result_generation++; lck_mtx_unlock(&apple_lock);
+     }
+     post(code, NULL, 0);
+ }
+diff --git a/bsd/dev/qcom/PeachWmi.c b/bsd/dev/qcom/PeachWmi.c
+--- a/bsd/dev/qcom/PeachWmi.c
++++ b/bsd/dev/qcom/PeachWmi.c
+@@ -963,22 +963,22 @@
+             d.iova - w->ops.iova_base > w->ops.iova_bytes ||
+             PEACH_WMI_MGMT_BYTES > w->ops.iova_bytes - (d.iova - w->ops.iova_base)) return bad(w);
+     }
+-    /* 36-word fixed struct, wmi_channel and all eight optional arrays.
++    /* Native 35-word fixed struct, channel, NOA/MLO/partner arrays.
+      * No HT/VHT/HE/EHT or MLO capability is advertised by this start. */
+     memset(w->command, 0, sizeof(w->command));
+     unsigned char *p = w->command + 4;
+     /* Peach's vendor start command leaves requestor_id zero. One start
+      * per boot is allowed; match that zero with the pending vdev below. */
+-    tlv(p, TAG_START, 140); p32(p + 8, w->vdev_request);
++    tlv(p, TAG_START, 136); p32(p + 8, w->vdev_request);
+     p32(p + 12, b->beacon_interval); p32(p + 16, b->dtim_period);
+     p32(p + 20, pmf << 1); p32(p + 76, 1); p32(p + 80, 1);
+     p32(p + 132, 1); p32(p + 136, 1);
+-    p += 144; tlv(p, TAG_CHANNEL, 24); p32(p + 4, c->frequency); p32(p + 8, c->frequency);
++    p += 140; tlv(p, TAG_CHANNEL, 24); p32(p + 4, c->frequency); p32(p + 8, c->frequency);
+     unsigned mode = c->frequency < 2500 ? ((c->flags & 4) ? 2 : 1) : 0;
+     p32(p + 16, mode | ((c->flags & 2) ? 1u << 10 : 0));
+     p32(p + 20, c->power << 8 | c->power << 16);
+     p32(p + 24, c->antenna | c->power << 8); p += 28;
+-    for (unsigned i = 0; i < 8; i++, p += 4) tlv(p, TAG_ARRAY, 0);
++    for (unsigned i = 0; i < 3; i++, p += 4) tlv(p, TAG_ARRAY, 0);
+     w->vdev_frequency = b->frequency; w->vdev_reg_generation = r->generation;
+     memcpy(w->vdev_bssid, b->bssid, 6); w->mgmt_head = w->mgmt_count = 0;
+     WTRY(w, send_command(w, 0x5003, (size_t)(p - w->command))); w->vdev_start_sent = 1;
+@@ -999,9 +999,13 @@
+     if (!w || !w->vdev_started || w->vdev_stop_sent || (!ies && bytes)) return PeachMhiInvalid;
+     if (w->error) return w->error;
+     const unsigned char *params = NULL;
+-    while (bytes >= 2 && ies[1] <= bytes - 2) {
++    while (bytes) {
++        if (bytes < 2 || ies[1] > bytes - 2) return PeachMhiInvalid;
+         if (ies[0] == 221 && ies[1] == 24 &&
+-            !memcmp(ies + 2, "\x00\x50\xf2\x02\x01\x01", 6)) params = ies + 10;
++            !memcmp(ies + 2, "\x00\x50\xf2\x02\x01\x01", 6)) {
++            if (params) return PeachMhiInvalid;
++            params = ies + 10;
++        }
+         size_t n = ies[1] + 2u; ies += n; bytes -= n;
+     }
+     static const unsigned defaults[4][4] = {
+@@ -1050,7 +1054,7 @@
+     memcpy(p, frame, prefix); p += padded;
+     /* tx_params_valid=0 still requires this fixed TLV. */
+     tlv(p, TAG_TX_PARAMS, 8); p += 12;
+-    for (unsigned i = 0; i < 2; i++, p += 4) tlv(p, TAG_ARRAY, 0);
++    /* Native non-MLO management TX ends at tx_send_params. */
+     w->mgmt_done = 0; w->mgmt_status = 0xffffffffu;
+     WTRY(w, send_command(w, 0x7008, (size_t)(p - w->command))); w->mgmt_in_flight = 1;
+     WTRY(w, wait_flag(w, &w->mgmt_done));
+@@ -1122,10 +1126,9 @@
+     PeachWmiPeer *s = peer_find(w, w->vdev_bssid);
+     if (!s || !s->assoc_sent || s->delete_sent ||
+         (service(w, 79) && !s->assoc_confirmed)) return PeachMhiInvalid;
+-    memset(w->command, 0, 48); tlv(w->command + 4, TAG_UP, 36);
++    memset(w->command, 0, 44); tlv(w->command + 4, TAG_UP, 36);
+     p32(w->command + 12, s->assoc_id); peer_mac(w->command + 16, s->mac);
+-    tlv(w->command + 44, TAG_ARRAY, 0); /* co-located channel list */
+-    WTRY(w, send_command(w, 0x5005, 48)); w->vdev_up_sent = 1;
++    WTRY(w, send_command(w, 0x5005, 44)); w->vdev_up_sent = 1;
+     return 0;
+ }
+ int peach_wmi_install_ccmp(PeachWmi *w, const PeachHtt *h, unsigned group, unsigned index,
+@@ -1178,6 +1181,41 @@
+      * no completion for this command; success means queued, not data proof. */
+     memset(w->command, 0, 28); tlv(w->command + 4, 100, 20);
+     peer_mac(w->command + 12, s->mac); p32(w->command + 20, 3);
++    /* WMI_PEER_AUTHORIZE_TYPE distinguishes secured and open ports. */
+     p32(w->command + 24, s->protected_network ? 1 : 2);
+     return send_command(w, 0x6004, 28);
+ }
++int peach_wmi_retire_unkeyed(PeachWmi *w, PeachHtt *h, uint32_t generation)
++{
++    if (!w || !h || !w->ready || !generation || w->scan_active ||
++        w->mgmt_in_flight || w->key_pending || !service(w, 92)) return PeachMhiInvalid;
++    if (w->error || h->error) return w->error ? w->error : h->error;
++    for (unsigned i = 0; i < 5; i++)
++        if (w->keys[i].installed) return PeachMhiInvalid;
++    PeachWmiPeer *s = peer_find(w, w->vdev_bssid);
++    const PeachHttPeer *p = peach_htt_peer(h, 0, w->vdev_bssid);
++    if (!s || !s->type || !s->create_sent || s->delete_sent ||
++        (p && p->generation != generation)) return PeachMhiInvalid;
++    if (w->vdev_started) WTRY(w, peach_wmi_vdev_stop(w));
++    else if (w->vdev_start_sent && !w->vdev_stopped) return PeachMhiInvalid;
++    WTRY(w, peach_wmi_peer_delete(w, s->mac));
++    uint64_t end = w->htc->ops.now_us(w->htc->ops.context) + 10000000;
++    while ((p = peach_htt_peer(h, 0, s->mac))) {
++        if (p->generation != generation) return bad(w);
++        WTRY(w, progress(w));
++        if (w->htc->ops.now_us(w->htc->ops.context) >= end)
++            return w->error = PeachMhiTimeout;
++        w->htc->ops.sleep_us(w->htc->ops.context, 1000);
++    }
++    if (h->error) return h->error;
++    if (w->vdev_up_sent) {
++        memset(w->command, 0, 12); tlv(w->command + 4, 94, 4);
++        WTRY(w, send_command(w, 0x5007, 12)); /* VDEV_DOWN, vdev0 */
++    }
++    memset(s, 0, sizeof(*s));
++    w->vdev_start_sent = w->vdev_started = w->vdev_stop_sent = w->vdev_stopped = w->vdev_up_sent = 0;
++    w->vdev_frequency = w->vdev_reg_generation = 0;
++    w->mgmt_head = w->mgmt_count = w->mgmt_done = 0;
++    memset(w->vdev_bssid, 0, sizeof(w->vdev_bssid));
++    return 0;
++}
+diff --git a/bsd/dev/qcom/PeachWmi.h b/bsd/dev/qcom/PeachWmi.h
+--- a/bsd/dev/qcom/PeachWmi.h
++++ b/bsd/dev/qcom/PeachWmi.h
+@@ -131,6 +131,10 @@
+  * successful START_RESP. No authentication/association or network link. */
+ int peach_wmi_vdev_start(PeachWmi *, unsigned bss_index, unsigned pmf);
+ int peach_wmi_vdev_stop(PeachWmi *);
++/* No installed keys or outstanding management TX. Requires an observed
++ * peer generation, real STOP/DELETE responses and HTT unmap before reset.
++ * Queue descriptors and packet DMA remain allocated by their owners. */
++int peach_wmi_retire_unkeyed(PeachWmi *, PeachHtt *, uint32_t peer_generation);
+ /* Program four EDCA queues from the AP's WMM parameters, or defaults
+  * for a legacy AP. No U-APSD or MU-EDCA is enabled. */
+ int peach_wmi_wmm(PeachWmi *, const unsigned char *ies, size_t bytes);
+@@ -141,7 +145,7 @@
+ int peach_wmi_mgmt_rx(PeachWmi *, PeachWmiMgmt *);
+ /* Caller has already validated the AP's successful on-air association
+  * response. WMI ASSOC_CONF only acknowledges the firmware configuration.
+- * Legacy, non-QoS, 20MHz, one stream; protected peers remain unauthorized. */
++ * Legacy 20MHz, one stream, optional WMM; protected peers remain unauthorized. */
+ int peach_wmi_peer_assoc(PeachWmi *, const PeachHtt *, const PeachWmiAssociation *);
+ /* No ACK in this ABI: success records vdev_up_sent, not a connected NIC. */
+ int peach_wmi_vdev_up(PeachWmi *);
+diff --git a/bsd/dev/qcom/PeachStation.c b/bsd/dev/qcom/PeachStation.c
+--- a/bsd/dev/qcom/PeachStation.c
++++ b/bsd/dev/qcom/PeachStation.c
+@@ -245,6 +245,8 @@
+     const PeachWmiBss *b = &s->wmi->bss[bss_index];
+     int err = peach_station_candidate(b, security);
+     if (err) return err;
++    const PeachWmiRegDomain *reg = &s->wmi->regulatory[s->wmi->radio.phy];
++    if (!reg->valid || reg->generation != s->wmi->scan_reg_generation) return PeachMhiInvalid;
+     s->security = security; memcpy(s->bssid, b->bssid, 6);
+     if (security) {
+         static const unsigned char selected[] = {48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};
+@@ -292,3 +294,30 @@
+     }
+     return 0;
+ }
++int peach_station_recover_unkeyed(PeachStation *s)
++{
++    if (!s || !s->wmi || !s->tx || !s->rx || !s->htt) return PeachMhiInvalid;
++    PeachWmi *w = s->wmi; PeachTx *t = s->tx;
++    if (w->error || s->htt->error || s->rx->error || t->error || w->key_pending)
++        return PeachMhiInvalid;
++    for (unsigned i = 0; i < 5; i++) if (w->keys[i].installed) return PeachMhiInvalid;
++    if (s->phase == PeachStationIdle) return 0; /* selection/PMK failed before setup */
++    if (!s->peer_generation) return PeachMhiInvalid;
++    (void)peach_tx_authorize(t, 0);
++    s->phase = PeachStationFailed; /* no new MLME while teardown polls */
++    uint64_t end = now(s) + 10000000;
++    while (t->in_flight || w->mgmt_in_flight) {
++        int err = progress(s);
++        if (err) return err;
++        if (now(s) >= end) return PeachMhiTimeout;
++        sleep_ms(s);
++    }
++    int err = peach_wmi_retire_unkeyed(w, s->htt, s->peer_generation);
++    if (err) return err;
++    PeachMhiDma queues;
++    err = w->ops.allocate(w->ops.context, PEACH_RX_QUEUE_BYTES, &queues);
++    if (!err) err = peach_rx_new_queues(s->rx, queues);
++    if (!err) err = peach_tx_unbind(t);
++    if (err) return err;
++    return peach_station_init(s, w, s->htt, s->rx, t);
++}
+diff --git a/bsd/dev/qcom/PeachStation.h b/bsd/dev/qcom/PeachStation.h
+--- a/bsd/dev/qcom/PeachStation.h
++++ b/bsd/dev/qcom/PeachStation.h
+@@ -26,7 +26,7 @@
+ /* Selection-time compatibility check; does not mutate station/hardware state. */
+ int peach_station_candidate(const PeachWmiBss *, unsigned security);
+ /* Explicit BSS selection by the future network control path. Open-system
+- * 802.11 auth + real association response, legacy 20MHz/non-QoS only.
++ * 802.11 auth + real association response, legacy 20MHz and optional WMM.
+  * WPA2 supports PSK/CCMP selection and stops in AwaitKeys; no ordinary data
+  * authorization, key installation, NIC or address acquisition is implied.
+  * Hidden SSIDs, required PMF, enterprise, WPA1 and WPA3 are unsupported. */
+@@ -34,4 +34,7 @@
+ /* Single worker; called by protocol progress, never recursively polls HTC.
+  * Unmap/deauth/regulatory changes revoke TX and propagate failure. */
+ int peach_station_poll(PeachStation *);
++/* Recover an unsuccessful pre-key association. Refuses installed keys,
++ * transport errors or ambiguous completions; never reuses old REO queues. */
++int peach_station_recover_unkeyed(PeachStation *);
+ #endif
+diff --git a/bsd/dev/qcom/PeachRx.c b/bsd/dev/qcom/PeachRx.c
+--- a/bsd/dev/qcom/PeachRx.c
++++ b/bsd/dev/qcom/PeachRx.c
+@@ -143,6 +143,23 @@
+         if (err) return r->error = err;
+         r->repost--;
+     }
++    return 0;
++}
++int peach_rx_new_queues(PeachRx *r, PeachMhiDma memory)
++{
++    if (!r || !r->prepared || !memory.bytes || !memory.iova ||
++        ((uintptr_t)memory.bytes & 127) || (memory.iova & 127) ||
++        memory.capacity < PEACH_RX_QUEUE_BYTES || memory.iova >= 0x100000000ull ||
++        PEACH_RX_QUEUE_BYTES > 0x100000000ull - memory.iova ||
++        (memory.iova < r->memory.iova + r->memory.capacity &&
++         r->memory.iova < memory.iova + PEACH_RX_QUEUE_BYTES) ||
++        (memory.iova < r->queues.iova + r->queues.capacity &&
++         r->queues.iova < memory.iova + PEACH_RX_QUEUE_BYTES)) return PeachMhiInvalid;
++    if (r->error) return r->error;
++    RTRY(r, health(r));
++    r->queues = memory;
++    memset(memory.bytes, 0, PEACH_RX_QUEUE_BYTES);
++    prepare_queues(r); barrier(r);
+     return 0;
+ }
+ int peach_rx_start(PeachRx *r, PeachHtt *h, unsigned pdev)
+diff --git a/bsd/dev/qcom/PeachRx.h b/bsd/dev/qcom/PeachRx.h
+--- a/bsd/dev/qcom/PeachRx.h
++++ b/bsd/dev/qcom/PeachRx.h
+@@ -34,6 +34,9 @@
+ int peach_rx_prepare(PeachRx *, PeachSrng rings[PeachSrngKinds], PeachMhiDma);
+ int peach_rx_start(PeachRx *, PeachHtt *, unsigned pdev);
+ PeachMhiDma peach_rx_queue(const PeachRx *, unsigned tid);
++/* After peer retirement only: use fresh retained storage. Old descriptors
++ * may still be cached by REO and must never be cleared or reassigned. */
++int peach_rx_new_queues(PeachRx *, PeachMhiDma);
+ /* Callback borrows a complete Ethernet MSDU only until it returns. No data
+  * callback means discard; configuring RX does not publish a NIC. Linked
+  * exceptions are dropped/reclaimed through SW2WBM. Unknown ownership stops
+diff --git a/bsd/dev/qcom/PeachRsn.c b/bsd/dev/qcom/PeachRsn.c
+--- a/bsd/dev/qcom/PeachRsn.c
++++ b/bsd/dev/qcom/PeachRsn.c
+@@ -316,6 +316,8 @@
+          * installed. Retransmitted M3 responses take ReplyAgain above. */
+         if (action == ReplyM4 || action == ReplyGroup) RTRY(r, install(r, action == ReplyM4));
+     }
++    /* WMI key-install waits progress RX and can observe an AP deauth. */
++    if (s->error) return fail(r, s->error);
+     if (r->phase == PeachRsnKeys) {
+         const PeachHttPeer *p = peach_htt_peer(s->htt, 0, s->bssid);
+         if (!p || p->generation != s->peer_generation) return fail(r, PeachMhiDeviceError);
+diff --git a/bsd/dev/qcom/PeachNet.c b/bsd/dev/qcom/PeachNet.c
+--- a/bsd/dev/qcom/PeachNet.c
++++ b/bsd/dev/qcom/PeachNet.c
+@@ -139,7 +139,7 @@
+     }
+     lck_mtx_unlock(&net_lock);
+     if (state == PeachNetOnline) peach_net_link(1);
+-    else if (state == PeachNetHandshake || state == PeachNetFailed) peach_net_link(0);
++    else if (state == PeachNetReady || state == PeachNetHandshake || state == PeachNetFailed) peach_net_link(0);
+     if (scan_done) peach_apple80211_event(PeachAppleScanDone);
+     if (join_done) peach_apple80211_event(PeachAppleJoinDone);
+ }
+@@ -265,6 +265,22 @@
+     unsigned changed = net_online != !!up; net_online = !!up;
+     int rssi = net_info_data.current.rssi;
+     lck_mtx_unlock(&net_lock);
++    if (!up) {
++        /* Called by the protocol worker. Do not retain packets belonging
++         * to an ended connection for a later manual join. */
++        if (net_pending) { mbuf_freem(net_pending); net_pending = NULL; }
++        for (;;) {
++            mbuf_t m = NULL;
++            lck_mtx_lock(&net_lock);
++            if (net_count) {
++                m = net_queue[net_head]; net_queue[net_head] = NULL;
++                net_head = (net_head + 1) % TX_QUEUE; net_count--;
++            }
++            lck_mtx_unlock(&net_lock);
++            if (!m) break;
++            mbuf_freem(m);
++        }
++    }
+     if (!net_interface || !changed) return;
+     ifnet_set_flags(net_interface, up ? IFF_RUNNING : 0, IFF_RUNNING);
+     link_event(up); peach_apple80211_link(up, rssi);
+@@ -284,7 +300,12 @@
+         if (!net_pending) return 0;
+         size_t bytes = mbuf_pkthdr_len(net_pending);
+         int err = mbuf_copydata(net_pending, 0, bytes, net_frame);
+-        if (!err) err = peach_tx_send(tx, net_frame, bytes, 0);
++        if (err) {
++            mbuf_freem(net_pending); net_pending = NULL;
++            ifnet_stat_increment_out(net_interface, 0, 0, 1);
++            continue; /* a malformed BSD packet does not stop the radio */
++        }
++        err = peach_tx_send(tx, net_frame, bytes, 0);
+         if (err == PeachCeFull) return 0;
+         mbuf_freem(net_pending); net_pending = NULL;
+         ifnet_stat_increment_out(net_interface, err ? 0 : 1, err ? 0 : bytes, err != 0);
+@@ -313,16 +334,4 @@
+     volatile unsigned char *secret = (void *)&net_request;
+     for (size_t i = 0; i < sizeof(net_request); i++) secret[i] = 0;
+     lck_mtx_unlock(&net_lock);
+-    if (net_pending) { mbuf_freem(net_pending); net_pending = NULL; }
+-    for (;;) {
+-        mbuf_t m = NULL;
+-        lck_mtx_lock(&net_lock);
+-        if (net_count) {
+-            m = net_queue[net_head]; net_queue[net_head] = NULL;
+-            net_head = (net_head + 1) % TX_QUEUE; net_count--;
+-        }
+-        lck_mtx_unlock(&net_lock);
+-        if (!m) break;
+-        mbuf_freem(m);
+-    }
+-}
++}
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -820,7 +820,10 @@
+     if (!err) err = peach_wmi_poll_management(&wifi_wmi);
+     if (!err) err = peach_rx_poll(&wifi_rx, wifi_packet_receive, NULL);
+     if (!err) err = peach_tx_poll(&wifi_tx);
+-    return err ? err : peach_station_poll(&wifi_station);
++    /* AP rejection/deauthentication is connection state, not an HTC/CE
++     * failure. The outer worker owns recovery and reports it to iOS. */
++    if (!err) (void)peach_station_poll(&wifi_station);
++    return err;
+ }
+ static int wifi_service_receive(void *c, unsigned service, const void *p, size_t n)
+ {
+@@ -1314,6 +1317,26 @@
+     return err;
+ }
+ 
++static int wifi_connection_recover(int error)
++{
++    if (wifi_htc.error || wifi_ce.error || wifi_wmi.error || wifi_htt.error ||
++        wifi_rx.error || wifi_tx.error || wifi_wlfw.error || wifi_host.poisoned ||
++        wifi_dma_health()) return error;
++    printf("NEZHA WIFI: connection failed %d, on-air status %u; checking pre-key retirement\n",
++        error, wifi_station.on_air_status);
++    peach_rsn_clear(&wifi_rsn);
++    int err = peach_station_recover_unkeyed(&wifi_station);
++    if (err) {
++        printf("NEZHA WIFI: connection retirement unconfirmed: %d\n", err);
++        return error;
++    }
++    wifi_net_state = PeachNetReady;
++    peach_net_status(&wifi_wmi, wifi_net_state, error);
++    wifi_step = "awaiting explicit network selection";
++    printf("NEZHA WIFI: pre-key connection retired; manual retry available, old DMA retained\n");
++    return 0;
++}
++
+ /* PERST assertion is the sole recovery write permitted after another MMIO
+  * fault. It uses only the already mapped, always-on TLMM GPIO102 window.
+  * Retain DMA and tables even if containment fails; never infer drain. */
+@@ -1351,8 +1374,10 @@
+     }
+     while (!err) {
+         err = peach_htc_poll(&wifi_htc);
++        if (!err) err = wifi_station.error;
+         if (!err) err = peach_rsn_poll(&wifi_rsn);
+         if (!err) err = wifi_connection_request();
++        if (err) err = wifi_connection_recover(err);
+         if (!err && wifi_tx.authorized) {
+             if (!err && wifi_net_state != PeachNetOnline) {
+                 wifi_net_state = PeachNetOnline;
