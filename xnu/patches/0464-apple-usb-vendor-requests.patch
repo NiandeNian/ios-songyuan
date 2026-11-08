@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -454,6 +454,21 @@
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+ 		ok = (length == 0);
++	} else if ((type & 0x60) == 0x40) {
++		/*
++		 * Apple vendor requests.  usbmuxd asks GET_MODE (0x45) and switches
++		 * with SET_MODE (0x52); it tolerates a STALL, but Apple's own driver
++		 * probes for it, so answer the same way a phone in "initial mode"
++		 * does: 3:3:3:0.  Everything stays in one configuration.
++		 */
++		if (req == 0x45) {
++			data[0] = 3; data[1] = 3; data[2] = 3; data[3] = 0;
++			n = 4;
++		} else if (req == 0x52) {
++			printf("SWEET USB: vendor SET_MODE %u ignored\n", index);
++		} else {
++			ok = false;
++		}
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
