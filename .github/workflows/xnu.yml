@@ -30,9 +30,11 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-13
+    # macos-13 / macos-14 hosted labels are retired (jobs stay queued with
+    # runner_id 0 forever).  macos-15-intel is the closest surviving x86_64
+    # image.  It has no Xcode 15, so the Deps step selects the oldest Xcode
+    # available (16.0) -- watch for iig IORPC.kernelContent ABI differences.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
