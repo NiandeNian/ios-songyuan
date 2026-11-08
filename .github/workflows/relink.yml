@@ -50,6 +50,13 @@ jobs:
              relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA/.LDFLAGS
           cp relink/mat/relink-link.filelist.old \
              relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA/link.filelist
+          # -alias_list / -sectcreate __LINKINFO,__symbolsets refer to files in
+          # the build tree; the originals ship inside the object archive.
+          cp relink/ci/obj/DEVELOPMENT_ARM64_PANDORA/all-alias.exp \
+             relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA/
+          cp relink/ci/obj/DEVELOPMENT_ARM64_PANDORA/symbolsets.plist \
+             relink/buildtree/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA/
+          ls -la relink/ci/linklibs/
           echo "objects: $(find relink/ci/obj -name '*.o' | wc -l)"
           echo "drivers: $(ls relink/drivers/*.o | wc -l)"
 
