@@ -246,7 +246,7 @@ index b6028f9..9ffdef4 100644
      let shape = state.shape();
      let states = execute.states(device);
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index 27200c8..68ad717 100644
+index 27200c8..09a671a 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -327,7 +327,8 @@ use metal2vulkan::bind::BindingPlan;
@@ -290,7 +290,7 @@ index 27200c8..68ad717 100644
 +            let mut scratch = std::mem::take(&mut self.scratch_used_resources);
 +            self.residency.fill_used_resources(&mut scratch);
 +            if state.used_resources != scratch {
-+                reshape.0 = true;
++                reshape.unbound();
 +                std::mem::swap(&mut state.used_resources, &mut scratch);
 +            }
 +            // scratch now holds the old Vec (or empty); return the allocation.
@@ -309,15 +309,29 @@ index 27200c8..68ad717 100644
          };
          // The draw's push bytes, filled in place.
          let push = binding::push_writes(std::mem::take(&mut commands.push_constants), &bound.holes)?;
-@@ -6729,6 +6748,8 @@ impl RenderCommandEncoder {
-                 set
-             }
-         };
-+        // Return the write table for reuse by the next draw.
+@@ -7044,6 +7063,8 @@ impl RenderCommandEncoder {
+                 set,
+             );
+         }
++        // Last use of `writes` is above; hand the allocation back for the next draw.
 +        self.scratch_writes = writes;
-         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
-         // pass's one.
-         let sized = device.shared().sized_index_bind;
+         self.driver_restarts |= tessellated;
+         if let Some(made) = made {
+             self.shadow = Some(made);
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index 05b9958..0223b0c 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -2034,6 +2034,9 @@ impl RenderExecution {
+             dispatches: Vec::new(),
+             dispatched: false,
+             scratch: Vec::new(),
++            // Reused across draws to avoid a fresh write table / used-resource list each draw.
++            scratch_writes: Vec::new(),
++            scratch_used_resources: Vec::new(),
+             // The pass's shader-side stencil's shadow, and its fragment imageblock storage.
+             shadow: storage.shadow,
+             // A replayed draw that returns its stencil announces it as the pass's runs end.
 diff --git a/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs b/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
 index 709bccc..b649460 100644
 --- a/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
