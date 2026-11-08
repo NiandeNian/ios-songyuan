@@ -246,7 +246,7 @@ index b6028f9..9ffdef4 100644
      let shape = state.shape();
      let states = execute.states(device);
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index 27200c8..09a671a 100644
+index 27200c8..492fd14 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -327,7 +327,8 @@ use metal2vulkan::bind::BindingPlan;
@@ -254,52 +254,42 @@ index 27200c8..09a671a 100644
  use metal2vulkan::bind::{
      DrawCall, DrawCommands, FragmentTests, HeapPlacement, ImageblockSize, IndexBufferRef,
 -    IndirectRef, MeshDispatch, MeshGroups, TessellationFactors, ViewSetup, WriteSource,
-+    IndirectRef, MeshDispatch, MeshGroups, TessellationFactors, UsedResource, ViewSetup,
++    IndirectRef, MeshDispatch, MeshGroups, TessellationFactors, ViewSetup,
 +    WriteSource,
  };
  use metal2vulkan::cache::SpecializationKey;
  use metal2vulkan::device::{DriverFact, FormatUsage, VkFeature};
-@@ -1131,6 +1132,10 @@ pub struct RenderCommandEncoder {
+@@ -1131,6 +1132,8 @@ pub struct RenderCommandEncoder {
      argument_samplers_room: Vec<SamplerState>,
      /// The views and sampler descriptions its draws' binds made or found (`binding::BindMemo`).
      bind_memo: binding::BindMemo,
 +    /// Reusable write table for [`binding::bind`], avoiding per-draw allocation.
 +    scratch_writes: Vec<binding::Write>,
-+    /// Reusable buffer for [`Residency::fill_used_resources`], avoiding per-draw allocation.
-+    scratch_used_resources: Vec<UsedResource>,
      /// Immutable set-zero snapshots of this encoder's successful draws.
      descriptor_memo: crate::descriptor_memo::Memo<vk::DescriptorSet>,
      /// What its last draw retained of its own ([`LastRetained`]).
-@@ -1404,6 +1409,8 @@ impl CommandBuffer {
+@@ -1404,6 +1407,7 @@ impl CommandBuffer {
              uses_room: Vec::new(),
              argument_samplers_room: Vec::new(),
              bind_memo: binding::BindMemo::default(),
 +            scratch_writes: Vec::new(),
-+            scratch_used_resources: Vec::new(),
              descriptor_memo: crate::descriptor_memo::Memo::default(),
              last_retained: LastRetained::default(),
          })
-@@ -4265,7 +4272,18 @@ impl RenderCommandEncoder {
+@@ -4265,7 +4269,11 @@ impl RenderCommandEncoder {
              let kept = state.stages.entry(stage).or_default();
              table.refresh_reading(kept, (stage, interface), maps, &mut reshape);
          }
 -        reshape.field(&mut state.used_resources, self.residency.used_resources());
-+        // Reuse the used_resources Vec allocation: fill a scratch buffer, compare with the
-+        // kept one, and swap only when changed (so reshape sees the real old value).
-+        {
-+            let mut scratch = std::mem::take(&mut self.scratch_used_resources);
-+            self.residency.fill_used_resources(&mut scratch);
-+            if state.used_resources != scratch {
-+                reshape.unbound();
-+                std::mem::swap(&mut state.used_resources, &mut scratch);
-+            }
-+            // scratch now holds the old Vec (or empty); return the allocation.
-+            self.scratch_used_resources = scratch;
-+        }
++        // `refresh_bind_state` takes `&self`, so there is no encoder scratch to reuse here.
++        // fill_used_resources still avoids the intermediate collect() of the old code.
++        let mut used = Vec::new();
++        self.residency.fill_used_resources(&mut used);
++        reshape.field(&mut state.used_resources, used);
          // Listed again only where the device's sampler states changed since.
          if !heap_sets::lists(&state.argument_samplers, argument_samplers) {
              reshape.field(
-@@ -6688,7 +6706,8 @@ impl RenderCommandEncoder {
+@@ -6688,7 +6696,8 @@ impl RenderCommandEncoder {
          let bound = {
              let mut state = self.core.command_buffer().state();
              let memo = Some(&mut self.bind_memo);
@@ -309,7 +299,7 @@ index 27200c8..09a671a 100644
          };
          // The draw's push bytes, filled in place.
          let push = binding::push_writes(std::mem::take(&mut commands.push_constants), &bound.holes)?;
-@@ -7044,6 +7063,8 @@ impl RenderCommandEncoder {
+@@ -7044,6 +7053,8 @@ impl RenderCommandEncoder {
                  set,
              );
          }
@@ -319,16 +309,15 @@ index 27200c8..09a671a 100644
          if let Some(made) = made {
              self.shadow = Some(made);
 diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
-index 05b9958..0223b0c 100644
+index 05b9958..75bafbb 100644
 --- a/crates/metal2vulkan-runtime/src/render/executions.rs
 +++ b/crates/metal2vulkan-runtime/src/render/executions.rs
-@@ -2034,6 +2034,9 @@ impl RenderExecution {
+@@ -2034,6 +2034,8 @@ impl RenderExecution {
              dispatches: Vec::new(),
              dispatched: false,
              scratch: Vec::new(),
-+            // Reused across draws to avoid a fresh write table / used-resource list each draw.
++            // Reused across draws to avoid a fresh write table each draw.
 +            scratch_writes: Vec::new(),
-+            scratch_used_resources: Vec::new(),
              // The pass's shader-side stencil's shadow, and its fragment imageblock storage.
              shadow: storage.shadow,
              // A replayed draw that returns its stencil announces it as the pass's runs end.
