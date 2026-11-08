@@ -1,0 +1,28 @@
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -3640,6 +3640,28 @@ gpu_hang_dump(uint32_t ring)
+ 			    h->first, (unsigned long long)h->ib0, h->dw0, (unsigned long long)h->ibn, h->dwn);
+ 		}
+ 	}
++	/* Recovery: advance the ring timestamp to unblock fence waiters. The GPU is stuck on
++	 * a command that will never complete, so the fence will never be signaled by hardware.
++	 * Advancing the timestamp lets Turnip's WaitFence return and the frame be dropped.
++	 * The GPU itself remains stuck; the next submission will hit CP_WAIT_TIMESTAMP on the
++	 * previous (now-advanced) fence and proceed.  If the GPU truly cannot recover, the
++	 * watchdog will dump again next tick. */
++	{
++		volatile uint32_t *mem = (volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
++		uint32_t stuck_ring = mem[1];
++		if ((int32_t)(gpu_seqno - stuck_ring) > 0) {
++			mem[1] = gpu_seqno;
++			flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
++			printf("PANDORA GPU HANG: advanced ring timestamp %u -> %u to unblock fence waiters\n",
++			    stuck_ring, gpu_seqno);
++			/* Wake all fence waiters sleeping on gpu_fence_chan. */
++			thread_wakeup((event_t)&gpu_fence_chan);
++		}
++		/* Re-kick the ring: if the GPU's CP is idle but the wptr was lost, this restarts it. */
++		gw(CP_RB_WPTR, ring_wptr);
++	}
+ }
+
