@@ -1,0 +1,273 @@
+diff --git a/bsd/dev/apple_usb.h b/bsd/dev/apple_usb.h
+--- a/bsd/dev/apple_usb.h
++++ b/bsd/dev/apple_usb.h
+@@ -24,6 +24,7 @@
+ 
+ /* ---- services -> mux ---- */
+ int  apple_mux_send(void *conn, const void *buf, uint32_t len);
++uint32_t apple_mux_space(void *conn);
+ void apple_mux_close(void *conn);
+ 
+ /*
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+--- a/bsd/dev/apple_usbmux.c
++++ b/bsd/dev/apple_usbmux.c
+@@ -29,7 +29,7 @@
+ 
+ #define AMUX_MAX_CONN   8
+ #define AMUX_RXBUF      8192
+-#define AMUX_RING       16384
++#define AMUX_RING       65536   /* >= one 32 KiB AFC reply plus a queued one */
+ #define AMUX_CTRL_Q     8
+ #define AMUX_CTRL_MAX   96
+ #define AMUX_TCP_HDR    20
+@@ -61,8 +61,7 @@
+ 	uint16_t dport;         /* host-side port */
+ 	uint32_t tx_seq;
+ 	uint32_t rx_seq;
+-	struct amux_ring in;
+-	struct amux_ring out;
++	struct amux_ring out;   /* inbound bytes go straight to the service */
+ 	struct apple_service *svc;
+ 	void    *ctx;
+ };
+@@ -281,7 +280,6 @@
+ 	if (c->svc != NULL && c->svc->close != NULL && c->ctx != NULL) {
+ 		c->svc->close(c, c->ctx);
+ 	}
+-	ring_free(&c->in);
+ 	ring_free(&c->out);
+ 	memset(c, 0, sizeof(*c));
+ }
+@@ -321,7 +319,6 @@
+ 	c->rx_seq = seq + 1;
+ 	c->svc = svc;
+ 	c->ctx = NULL;
+-	(void)ring_init(&c->in, AMUX_RING);
+ 	(void)ring_init(&c->out, AMUX_RING);
+ 	if (svc->open != NULL) {
+ 		svc->open(c, &c->ctx);
+@@ -378,7 +375,6 @@
+ 	}
+ 	if (plen != 0) {
+ 		c->rx_seq = seq + plen;
+-		(void)ring_push(&c->in, pl, plen);
+ 		mux_send_small(c->sport, c->dport, c->tx_seq, c->rx_seq, TH_ACK);
+ 		if (c->svc != NULL && c->svc->input != NULL) {
+ 			c->svc->input(c, c->ctx, pl, plen);
+@@ -518,6 +514,17 @@
+ 	return 0;
+ }
+ 
++uint32_t
++apple_mux_space(void *conn)
++{
++	struct amux_conn *c = (struct amux_conn *)conn;
++
++	if (c == NULL || !c->used || c->out.buf == NULL) {
++		return 0;
++	}
++	return c->out.cap - c->out.count;
++}
++
+ int
+ apple_mux_send(void *conn, const void *buf, uint32_t len)
+ {
+@@ -562,7 +569,6 @@
+ 		am.rxbuf_alloc = (uint32_t)bytes;
+ 	}
+ 	for (int i = 0; i < AMUX_MAX_CONN; i++) {
+-		(void)ring_init(&am.conn[i].in, AMUX_RING);
+ 		(void)ring_init(&am.conn[i].out, AMUX_RING);
+ 	}
+ 	am.up = true;
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -508,10 +508,13 @@
+ 
+ #define AFC_ROOT        "/private/var/mobile/Media/UniXNU"
+ #define AFC_HDR         40
+-#define AFC_BUF         8192
++/* AFC_BUF is one whole DATA packet (header included in afc_out); AFC_IO_MAX is
++ * the largest single read/write payload. Both must stay below the mux ring
++ * capacity (AMUX_RING) so a reply is never truncated by apple_mux_send. */
++#define AFC_BUF         32768
+ #define AFC_SLOTS       2
+ #define AFC_FILES       16
+-#define AFC_IO_MAX      65536
++#define AFC_IO_MAX      32768
+ 
+ #define AFC_OP_STATUS    0x01
+ #define AFC_OP_DATA      0x02
+@@ -605,12 +608,26 @@
+ afc_reply(void *conn, struct afc_ctx *c, uint64_t op, const void *payload, uint32_t len)
+ {
+ 	uint8_t *h = (uint8_t *)afc_out;
+-	uint32_t total = AFC_HDR + len;
++	uint32_t space = apple_mux_space(conn);
++	uint32_t total;
+ 
+ 	if (len > AFC_BUF) {
+ 		len = AFC_BUF;
+-		total = AFC_HDR + len;
+-	}
++	}
++	/*
++	 * A clamped ring_push() would cut the packet mid-payload and desync the
++	 * AFC stream, so never queue more than the mux ring can hold. Callers
++	 * that must not lose bytes (FILE_READ) cap their payload beforehand and
++	 * land here with len already small enough.
++	 */
++	if (space <= AFC_HDR) {
++		printf("APPLE AFC: reply dropped, mux ring full\n");
++		return;
++	}
++	if (len > space - AFC_HDR) {
++		len = space - AFC_HDR;
++	}
++	total = AFC_HDR + len;
+ 	memcpy(afc_out, "CFA6LPAA", 8);
+ 	apple_put_le64(h + 8, total);
+ 	apple_put_le64(h + 16, total);
+@@ -805,8 +822,16 @@
+ 	vfs_context_t vctx = vfs_context_kernel();
+ 	UIO_STACKBUF(uio_store, 1);
+ 	uio_t uio;
++	/* One READDIR round fills dbuf; the compacted NUL-separated names go to
++	 * obuf.  They must be separate regions: the compaction writes at or
++	 * before the record it is reading, and an in-place copy would clobber
++	 * d_reclen/d_namlen of the record being processed. */
++	uint8_t *dbuf = (uint8_t *)afc_io;
++	uint8_t *obuf = (uint8_t *)afc_io + 4096;
++	const uint32_t ocap = AFC_BUF - 4096;
+ 	uint32_t out = 0;
+-	int eofflag = 0, numdirent = 0, err;
++	off_t next = 0;
++	int eofflag = 0, numdirent = 0, err = 0, rounds;
+ 
+ 	if (afc_path(rel, path, sizeof(path)) != 0) {
+ 		afc_status(conn, c, AFC_E_PERM);
+@@ -822,46 +847,65 @@
+ 		afc_status(conn, c, AFC_E_ISDIR);
+ 		return;
+ 	}
+-	memset(afc_io, 0, 4096);
+-	uio = uio_createwithbuffer(1, 0, UIO_SYSSPACE, UIO_READ, uio_store,
+-	    sizeof(uio_store));
+-	if (uio == NULL) {
+-		vnode_put(vp);
+-		afc_status(conn, c, AFC_E_IO);
+-		return;
+-	}
+-	uio_addiov(uio, (user_addr_t)(uintptr_t)afc_io, 4096);
+-	err = VNOP_READDIR(vp, uio, 0, &eofflag, &numdirent, vctx);
++	/* AFC READ_DIR has no continuation, so the whole list has to come back in
++	 * one DATA packet: drain the directory until eofflag or the buffer fills. */
++	for (rounds = 0; rounds < 16 && !eofflag; rounds++) {
++		uint32_t used, o;
++		int progressed = 0;
++
++		memset(dbuf, 0, 4096);
++		uio = uio_createwithbuffer(1, next, UIO_SYSSPACE, UIO_READ,
++		    uio_store, sizeof(uio_store));
++		if (uio == NULL) {
++			err = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, (user_addr_t)(uintptr_t)dbuf, 4096);
++		eofflag = 0;
++		numdirent = 0;
++		err = VNOP_READDIR(vp, uio, 0, &eofflag, &numdirent, vctx);
++		if (err != 0) {
++			break;
++		}
++		used = 4096 - (uint32_t)uio_resid(uio);
++		next = uio_offset(uio);
++
++		for (o = 0; o + sizeof(struct dirent) <= used; ) {
++			struct dirent *dp = (struct dirent *)(void *)(dbuf + o);
++			uint32_t reclen = dp->d_reclen;
++			uint32_t namlen = dp->d_namlen;
++
++			if (reclen == 0 || o + reclen > used) {
++				break;
++			}
++			if (namlen != 0 && dp->d_name[0] != '\0') {
++				uint32_t n = namlen + 1;
++
++				if (out + n + 1 > ocap) {
++					eofflag = 1;    /* truncated, stop here */
++					break;
++				}
++				memmove(obuf + out, dp->d_name, n);
++				out += n;
++				progressed = 1;
++			}
++			o += reclen;
++		}
++		if (!progressed && !eofflag) {
++			break;                          /* no forward progress */
++		}
++		if (out + 1 > ocap) {
++			break;
++		}
++	}
+ 	vnode_put(vp);
+ 	if (err != 0) {
+ 		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ 		return;
+ 	}
+-	{
+-		uint32_t used = 4096 - (uint32_t)uio_resid(uio);
+-
+-		for (uint32_t o = 0; o + sizeof(struct dirent) <= used; ) {
+-			struct dirent *dp = (struct dirent *)(void *)(afc_io + o);
+-
+-			if (dp->d_reclen == 0 || o + dp->d_reclen > used) {
+-				break;
+-			}
+-			if (dp->d_namlen != 0 && dp->d_name[0] != '\0') {
+-				uint32_t n = (uint32_t)dp->d_namlen + 1;
+-				if (out + n + 1 > 4096) {
+-					break;
+-				}
+-				memcpy(afc_io + out, dp->d_name, n);
+-				out += n;
+-			}
+-			o += dp->d_reclen;
+-		}
+-	}
+ 	/* the list is terminated by an empty string */
+-	if (out + 1 <= 4096) {
+-		afc_io[out++] = '\0';
+-	}
+-	afc_reply(conn, c, AFC_OP_DATA, afc_io, out);
++	obuf[out++] = '\0';
++	afc_reply(conn, c, AFC_OP_DATA, obuf, out);
+ }
+ 
+ static void
+@@ -917,6 +961,22 @@
+ 	}
+ 	if (want > AFC_IO_MAX) {
+ 		want = AFC_IO_MAX;
++	}
++	/*
++	 * Only read what the mux ring can carry: f->off advances by the bytes
++	 * handed to the host, so a reply that gets clamped after the read would
++	 * silently skip that part of the file.
++	 */
++	{
++		uint32_t space = apple_mux_space(conn);
++
++		if (space <= AFC_HDR + 1) {
++			printf("APPLE AFC: read deferred, mux ring full\n");
++			return;
++		}
++		if (want > space - AFC_HDR) {
++			want = space - AFC_HDR;
++		}
+ 	}
+ 	if (want == 0) {
+ 		afc_reply(conn, c, AFC_OP_DATA, NULL, 0);
