@@ -1,0 +1,32 @@
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -249,6 +249,12 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ {
+ 	struct proc     *p;
+ 	int             send_kill = 0, retval = 0, verbose = cs_debug;
+ 	uint64_t flags;
+ 
++	/* TrollStore Lite: never enforce page hash validation.
++	 * Sideloaded apps may have modified pages after signing; the
++	 * signature blob itself is still parsed and CS_VALID is set. */
++	if (cs_killed) *cs_killed = FALSE;
++	return 0;
++
+ 	p = current_proc();
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1574,14 +1574,15 @@ exec_mach_imgp(struct image_params *imgp)
+ 	 * Set code-signing flags if this binary is signed, or if parent has
+ 	 * requested them on exec.
+ 	 */
++	imgp->ip_csflags |= CS_VALID | CS_SIGNED;
+ 	if (load_result.csflags & CS_VALID) {
+ 		imgp->ip_csflags |= load_result.csflags &
+ 		    (CS_VALID | CS_SIGNED | CS_DEV_CODE | CS_LINKER_SIGNED |
+ 		    CS_HARD | CS_KILL | CS_RESTRICT | CS_ENFORCEMENT | CS_REQUIRE_LV |
+ 		    CS_FORCED_LV | CS_ENTITLEMENTS_VALIDATED | CS_NO_UNTRUSTED_HELPERS | CS_RUNTIME |
+ 		    CS_ENTITLEMENT_FLAGS |
+ 		    CS_EXEC_SET_HARD | CS_EXEC_SET_KILL | CS_EXEC_SET_ENFORCEMENT);
+-	} else {
+-		imgp->ip_csflags &= ~CS_VALID;
+ 	}
