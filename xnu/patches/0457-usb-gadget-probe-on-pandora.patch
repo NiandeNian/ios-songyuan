@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -1587,6 +1587,9 @@ static int sweet_ufs_probe(void)
+@@ -1587,5 +1587,8 @@ static int sweet_ufs_probe(void)
  	/* USB controller handover state, read only, boot-arg pandora_usb (bsd/dev/pandora_usb.c). */
  	pandora_usb_init();
 +	/* USB gadget probe / start, boot-arg sweetusb (bsd/dev/sweet_usb.c).

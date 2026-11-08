@@ -1,6 +1,6 @@
 --- a/bsd/dev/pandora_gpu.c
 +++ b/bsd/dev/pandora_gpu.c
-@@ -3640,6 +3640,28 @@ gpu_hang_dump(uint32_t ring)
+@@ -3640,4 +3640,24 @@ gpu_hang_dump(uint32_t ring)
  			    h->first, (unsigned long long)h->ib0, h->dw0, (unsigned long long)h->ibn, h->dwn);
  		}
  	}

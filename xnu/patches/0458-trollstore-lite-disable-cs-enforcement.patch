@@ -15,7 +15,7 @@
  	p = current_proc();
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -1574,14 +1574,15 @@ exec_mach_imgp(struct image_params *imgp)
+@@ -1574,13 +1574,12 @@ exec_mach_imgp(struct image_params *imgp)
  	 * Set code-signing flags if this binary is signed, or if parent has
  	 * requested them on exec.
  	 */
