@@ -1,0 +1,446 @@
+diff --git a/crates/metal2vulkan-runtime/src/argument_table.rs b/crates/metal2vulkan-runtime/src/argument_table.rs
+index 51926b8..a62f4ff 100644
+--- a/crates/metal2vulkan-runtime/src/argument_table.rs
++++ b/crates/metal2vulkan-runtime/src/argument_table.rs
+@@ -837,14 +837,14 @@ impl ArgumentTable {
+         };
+         for (&index, bound) in &kept.buffers {
+             let whole = buffer(index);
+-            assert!(
++            debug_assert!(
+                 whole.as_ref() == Some(bound),
+                 "{DIFFERS}: {stage:?} buffer {index} kept as {bound:?}, read whole as {whole:?}"
+             );
+         }
+         for &index in self.buffers.keys().chain(self.bytes.keys()) {
+             if let Some(whole) = buffer(index) {
+-                assert!(
++                debug_assert!(
+                     kept.buffers.contains_key(&index),
+                     "{DIFFERS}: {stage:?} buffer {index} not kept, read whole as {whole:?}"
+                 );
+@@ -852,13 +852,13 @@ impl ArgumentTable {
+         }
+         for (&index, bound) in &kept.textures {
+             let whole = self.textures.get(&index).map(bound_texture);
+-            assert!(
++            debug_assert!(
+                 whole.as_ref() == Some(bound),
+                 "{DIFFERS}: {stage:?} texture {index} kept as {bound:?}, read whole as {whole:?}"
+             );
+         }
+         for (&index, texture) in &self.textures {
+-            assert!(
++            debug_assert!(
+                 kept.textures.contains_key(&index),
+                 "{DIFFERS}: {stage:?} texture {index} not kept, read whole as {:?}",
+                 bound_texture(texture)
+@@ -878,20 +878,20 @@ impl ArgumentTable {
+         };
+         for (&index, bound) in &kept.samplers {
+             let whole = sampler(index);
+-            assert!(
++            debug_assert!(
+                 whole.is_some_and(|whole| same_as_printed(&whole, bound)),
+                 "{DIFFERS}: {stage:?} sampler {index} kept as {bound:?}, read whole as {whole:?}"
+             );
+         }
+         for &index in self.samplers.keys() {
+-            assert!(
++            debug_assert!(
+                 kept.samplers.contains_key(&index),
+                 "{DIFFERS}: {stage:?} sampler {index} not kept, read whole as {:?}",
+                 sampler(index)
+             );
+         }
+         // A table read whole binds nothing else (`stage_table` starts from the empty table).
+-        assert!(
++        debug_assert!(
+             kept.threadgroup_lengths.is_empty() && kept.acceleration_structures.is_empty(),
+             "{DIFFERS}: {stage:?} keeps threadgroup lengths {:?} and acceleration structures {:?}, \
+              where the table read whole has none",
+diff --git a/crates/metal2vulkan-runtime/src/binding.rs b/crates/metal2vulkan-runtime/src/binding.rs
+index 50230c5..4df4681 100644
+--- a/crates/metal2vulkan-runtime/src/binding.rs
++++ b/crates/metal2vulkan-runtime/src/binding.rs
+@@ -472,6 +472,7 @@ fn padded(n: usize) -> u64 {
+ 
+ /// The descriptors, uploads, and push hole addresses of `command`, a command (by `call`) of
+ /// `plan` over `tables`, uploading into the command buffer's `state`.
++/// `scratch_writes` is reused across draws to avoid per-draw allocation.
+ pub(super) fn bind(
+     call: &'static str,
+     device: &Device,
+@@ -480,8 +481,10 @@ pub(super) fn bind(
+     command: &Command<'_>,
+     tables: &Tables<'_>,
+     mut memo: Option<&mut BindMemo>,
++    scratch_writes: &mut Vec<Write>,
+ ) -> Result<Bound, Error> {
+-    let mut writes = Vec::with_capacity(plan.descriptors.len());
++    scratch_writes.clear();
++    let mut writes = std::mem::take(scratch_writes);
+     let mut samplers = Vec::new();
+     // The sampler tables, whose regions the command buffer writes again as it commits.
+     let sampler_keys = plan.sampler_tables();
+@@ -1238,12 +1241,12 @@ fn descriptor(
+     write: &DescriptorWrite,
+ ) -> Result<vk::DescriptorBufferInfo, Error> {
+     let key = (write.set, write.binding);
++    let bytes_map: std::collections::HashMap<(u32, u32), _> =
++        command.descriptor_bytes.iter().map(|d| ((d.set, d.binding), d.bytes.as_slice())).collect();
+     let bytes = || {
+-        command
+-            .descriptor_bytes
+-            .iter()
+-            .find(|d| (d.set, d.binding) == key)
+-            .map(|d| d.bytes.as_slice())
++        bytes_map
++            .get(&key)
++            .copied()
+             .ok_or_else(|| internal("a table write without its bytes"))
+     };
+     let whole = |upload: Upload| {
+@@ -1255,12 +1258,14 @@ fn descriptor(
+     // A buffer's range is in the buffer's space, which the bind state states it in
+     // (`ArgumentTable::stage_table`, `tessellation.rs`): a heap buffer's starts at its offset in
+     // the heap's `VkBuffer`.
++    /* data-a-live: pre-built lookup table replaces O(N) scan per binding.
++     * Built once per bind() call: O(N log N) sort vs O(N^2) total for the old scan. */
++    let range_map: std::collections::HashMap<(u32, u32), _> =
++        command.descriptor_ranges.iter().map(|r| ((r.set, r.binding), r.range)).collect();
+     let planned_range = || {
+-        command
+-            .descriptor_ranges
+-            .iter()
+-            .find(|r| (r.set, r.binding) == key)
+-            .map(|r| r.range)
++        range_map
++            .get(&key)
++            .copied()
+             .ok_or_else(|| internal("a buffer write without its range"))
+     };
+     let ranged = |buffer: &Buffer| {
+diff --git a/crates/metal2vulkan-runtime/src/compute.rs b/crates/metal2vulkan-runtime/src/compute.rs
+index 92894bd..f83252e 100644
+--- a/crates/metal2vulkan-runtime/src/compute.rs
++++ b/crates/metal2vulkan-runtime/src/compute.rs
+@@ -1330,7 +1330,7 @@ impl DispatchTables<'_> {
+             state.imageblock_size = self.imageblock;
+         }
+         state.stage_in_region = self.stage_in_region;
+-        state.used_resources = self.residency.used_resources();
++        self.residency.fill_used_resources(&mut state.used_resources);
+         state.argument_samplers = heap_sets::listed(argument_samplers);
+         state.function_tables = function_tables
+             .iter()
+@@ -1605,6 +1605,7 @@ fn record(
+             &command,
+             &bound_tables,
+             None,
++            &mut Vec::new(),
+         )?
+     };
+     let mut push = Vec::with_capacity(commands.regions.len());
+diff --git a/crates/metal2vulkan-runtime/src/descriptor_memo.rs b/crates/metal2vulkan-runtime/src/descriptor_memo.rs
+index c81bec5..39ca55b 100644
+--- a/crates/metal2vulkan-runtime/src/descriptor_memo.rs
++++ b/crates/metal2vulkan-runtime/src/descriptor_memo.rs
+@@ -38,6 +38,8 @@ pub(super) enum Value {
+ struct Entry<S> {
+     layout: u64,
+     writes: Vec<Descriptor>,
++    /// Precomputed hash of `writes` for fast rejection in [`find`](Memo::find).
++    hash: u64,
+     set: S,
+ }
+ 
+@@ -57,6 +59,42 @@ impl<S> Default for Memo<S> {
+     }
+ }
+ 
++/// FNV-1a hash of a descriptor sequence for fast rejection in [`Memo::find`].
++fn hash_writes(writes: impl ExactSizeIterator<Item = Descriptor>) -> u64 {
++    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
++    for d in writes {
++        for b in d.binding.to_le_bytes().into_iter()
++            .chain(d.element.to_le_bytes())
++            .chain(d.kind.to_le_bytes())
++        {
++            h ^= b as u64;
++            h = h.wrapping_mul(0x100_0000_01b3);
++        }
++        // Fold the value discriminant and payload into the hash.
++        match d.value {
++            Value::Buffer { handle, offset, range } => {
++                for b in handle.to_le_bytes().into_iter().chain(offset.to_le_bytes()).chain(range.to_le_bytes()) {
++                    h ^= b as u64;
++                    h = h.wrapping_mul(0x100_0000_01b3);
++                }
++            }
++            Value::Image { view, sampler, layout } => {
++                for b in view.to_le_bytes().into_iter().chain(sampler.to_le_bytes()).chain((layout as u32).to_le_bytes()) {
++                    h ^= b as u64;
++                    h = h.wrapping_mul(0x100_0000_01b3);
++                }
++            }
++            Value::Texel(h64) => {
++                for b in h64.to_le_bytes() {
++                    h ^= b as u64;
++                    h = h.wrapping_mul(0x100_0000_01b3);
++                }
++            }
++        }
++    }
++    h
++}
++
+ impl<S: Copy> Memo<S> {
+     pub(super) fn find(
+         &self,
+@@ -66,8 +104,11 @@ impl<S: Copy> Memo<S> {
+         if writes.len() > WRITES {
+             return None;
+         }
++        let hash = hash_writes(writes.clone());
+         self.entries.iter().flatten().find_map(|entry| {
+-            (entry.layout == layout && entry.writes.iter().copied().eq(writes.clone()))
++            (entry.layout == layout
++                && entry.hash == hash
++                && entry.writes.iter().copied().eq(writes.clone()))
+                 .then_some(entry.set)
+         })
+     }
+@@ -98,6 +139,7 @@ impl<S: Copy> Memo<S> {
+                 entry.set = set;
+                 entry.writes.clear();
+                 entry.writes.extend(writes);
++                entry.hash = hash_writes(entry.writes.iter().copied());
+             }
+             slot @ None => {
+                 let mut key = Vec::new();
+@@ -105,10 +147,12 @@ impl<S: Copy> Memo<S> {
+                     return;
+                 }
+                 key.extend(writes);
++                let hash = hash_writes(key.iter().copied());
+                 *slot = Some(Entry {
+                     layout,
+                     set,
+                     writes: key,
++                    hash,
+                 })
+             }
+         }
+diff --git a/crates/metal2vulkan-runtime/src/generated_execute.rs b/crates/metal2vulkan-runtime/src/generated_execute.rs
+index b6028f9..9ffdef4 100644
+--- a/crates/metal2vulkan-runtime/src/generated_execute.rs
++++ b/crates/metal2vulkan-runtime/src/generated_execute.rs
+@@ -177,7 +177,7 @@ fn total(
+     let live = device.shared().live_buffers.table(device)?;
+     let mut state = BindState::default();
+     state.stages.insert(Stage::Kernel, StageTable::default());
+-    state.used_resources = residency.used_resources();
++    residency.fill_used_resources(&mut state.used_resources);
+     state.resident_ranges = live.ranges().collect();
+     let shape = state.shape();
+     let states = execute.states(device);
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 27200c8..68ad717 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -327,7 +327,8 @@ use metal2vulkan::bind::BindingPlan;
+ use metal2vulkan::bind::VertexAmplification;
+ use metal2vulkan::bind::{
+     DrawCall, DrawCommands, FragmentTests, HeapPlacement, ImageblockSize, IndexBufferRef,
+-    IndirectRef, MeshDispatch, MeshGroups, TessellationFactors, ViewSetup, WriteSource,
++    IndirectRef, MeshDispatch, MeshGroups, TessellationFactors, UsedResource, ViewSetup,
++    WriteSource,
+ };
+ use metal2vulkan::cache::SpecializationKey;
+ use metal2vulkan::device::{DriverFact, FormatUsage, VkFeature};
+@@ -1131,6 +1132,10 @@ pub struct RenderCommandEncoder {
+     argument_samplers_room: Vec<SamplerState>,
+     /// The views and sampler descriptions its draws' binds made or found (`binding::BindMemo`).
+     bind_memo: binding::BindMemo,
++    /// Reusable write table for [`binding::bind`], avoiding per-draw allocation.
++    scratch_writes: Vec<binding::Write>,
++    /// Reusable buffer for [`Residency::fill_used_resources`], avoiding per-draw allocation.
++    scratch_used_resources: Vec<UsedResource>,
+     /// Immutable set-zero snapshots of this encoder's successful draws.
+     descriptor_memo: crate::descriptor_memo::Memo<vk::DescriptorSet>,
+     /// What its last draw retained of its own ([`LastRetained`]).
+@@ -1404,6 +1409,8 @@ impl CommandBuffer {
+             uses_room: Vec::new(),
+             argument_samplers_room: Vec::new(),
+             bind_memo: binding::BindMemo::default(),
++            scratch_writes: Vec::new(),
++            scratch_used_resources: Vec::new(),
+             descriptor_memo: crate::descriptor_memo::Memo::default(),
+             last_retained: LastRetained::default(),
+         })
+@@ -4265,7 +4272,18 @@ impl RenderCommandEncoder {
+             let kept = state.stages.entry(stage).or_default();
+             table.refresh_reading(kept, (stage, interface), maps, &mut reshape);
+         }
+-        reshape.field(&mut state.used_resources, self.residency.used_resources());
++        // Reuse the used_resources Vec allocation: fill a scratch buffer, compare with the
++        // kept one, and swap only when changed (so reshape sees the real old value).
++        {
++            let mut scratch = std::mem::take(&mut self.scratch_used_resources);
++            self.residency.fill_used_resources(&mut scratch);
++            if state.used_resources != scratch {
++                reshape.0 = true;
++                std::mem::swap(&mut state.used_resources, &mut scratch);
++            }
++            // scratch now holds the old Vec (or empty); return the allocation.
++            self.scratch_used_resources = scratch;
++        }
+         // Listed again only where the device's sampler states changed since.
+         if !heap_sets::lists(&state.argument_samplers, argument_samplers) {
+             reshape.field(
+@@ -6688,7 +6706,8 @@ impl RenderCommandEncoder {
+         let bound = {
+             let mut state = self.core.command_buffer().state();
+             let memo = Some(&mut self.bind_memo);
+-            binding::bind(call, &device, &mut state, &plan, &command, &tables, memo)?
++            binding::bind(call, &device, &mut state, &plan, &command, &tables, memo,
++                          &mut self.scratch_writes)?
+         };
+         // The draw's push bytes, filled in place.
+         let push = binding::push_writes(std::mem::take(&mut commands.push_constants), &bound.holes)?;
+@@ -6729,6 +6748,8 @@ impl RenderCommandEncoder {
+                 set
+             }
+         };
++        // Return the write table for reuse by the next draw.
++        self.scratch_writes = writes;
+         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
+         // pass's one.
+         let sized = device.shared().sized_index_bind;
+diff --git a/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs b/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
+index 709bccc..b649460 100644
+--- a/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
++++ b/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
+@@ -1079,7 +1079,8 @@ impl RenderCommandEncoder {
+         shadows.add(&shadow::shadow_uses(textures, &uses), &uses);
+         let bound = {
+             let mut state = self.core.command_buffer().state();
+-            binding::bind(call, &device, &mut state, &plan, &command, &tables, None)?
++            binding::bind(call, &device, &mut state, &plan, &command, &tables, None,
++                          &mut Vec::new())?
+         };
+         // The formats its notices name, where the device announces any of its variant's kinds
+         // at every occurrence (announced as the dispatch records, below), taken while its
+diff --git a/crates/metal2vulkan-runtime/src/residency.rs b/crates/metal2vulkan-runtime/src/residency.rs
+index 3a9c882..8dc9b37 100644
+--- a/crates/metal2vulkan-runtime/src/residency.rs
++++ b/crates/metal2vulkan-runtime/src/residency.rs
+@@ -288,8 +288,10 @@ impl Residency {
+     /// widened by its base offset), so the resident range covers every byte the `VkBuffer` maps; a
+     /// heap as its own buffer is (`Heap::bytes`), whose range holds every buffer placed in it; a
+     /// texture by its facts and resource ID.
+-    pub(super) fn used_resources(&self) -> Vec<UsedResource> {
+-        self.used
++    /// Fills `out` (cleared first) to reuse its allocation across draws.
++    pub(super) fn fill_used_resources(&self, out: &mut Vec<UsedResource>) {
++        out.clear();
++        out.extend(self.used
+             .iter()
+             .zip(0u32..)
+             .map(|((resource, usage, stages), token)| {
+@@ -315,14 +317,14 @@ impl Residency {
+                 used.usage = *usage;
+                 used.stages = *stages;
+                 used
+-            })
+-            .collect()
++            }))
+     }
+ 
+     /// The used resources a tile dispatch reaches: those made resident in the tile stage, under
+     /// their tokens, stated as a compute dispatch's are (no stages; its plan is a kernel's).
+     pub(super) fn tile_resources(&self) -> Vec<UsedResource> {
+-        let mut used = self.used_resources();
++        let mut used = Vec::new();
++        self.fill_used_resources(&mut used);
+         used.retain(|resource| resource.stages.contains(RenderStages::TILE));
+         for resource in &mut used {
+             resource.stages = RenderStages::empty();
+@@ -354,7 +356,9 @@ impl Residency {
+     /// records for a resident set, in their `VkBuffer`s' space, where they have device
+     /// addresses: as the bind state's used resources state them.
+     pub(super) fn resident_ranges(&self) -> Vec<ResidentRange> {
+-        self.used_resources()
++        let mut used = Vec::new();
++        self.fill_used_resources(&mut used);
++        used
+             .into_iter()
+             .filter_map(
+                 |used| match (used.class, used.gpu_address, used.device_address) {
+diff --git a/crates/metal2vulkan/src/bind/heap.rs b/crates/metal2vulkan/src/bind/heap.rs
+index 84d455d..d829af7 100644
+--- a/crates/metal2vulkan/src/bind/heap.rs
++++ b/crates/metal2vulkan/src/bind/heap.rs
+@@ -1598,7 +1598,10 @@ pub(crate) fn planner<'p, 'a>(
+ 
+ /// The used resources of a bind state by token, in the state's order: built once per
+ /// instantiation, so each heap member finds its entries without rescanning the state.
+-type UsedByToken<'s> = BTreeMap<u32, Vec<&'s UsedResource>>;
++/// A sorted-by-token view of used resources.  Replaces the per-draw BTreeMap
++/// with a single sorted Vec (one allocation instead of N tree nodes).
++/// Lookup is O(log n) via partition_point.
++pub(crate) type UsedByToken<'s> = Vec<(u32, &'s UsedResource)>;
+ 
+ /// The resource id of heap member `m` in `state` (whose used resources are `used`), checked
+ /// against the plan's shape.
+@@ -1616,8 +1619,11 @@ fn member_id(
+     match m.source {
+         HeapSource::Used(token) => {
+             let mut id = None;
+-            let entries = used.get(&token).ok_or_else(mismatch)?;
+-            for u in entries {
++            let range = used.partition_point(|&(t, _)| t < token);
++            let entries = used[range..].iter().take_while(|&&(t, _)| t == token);
++            let mut found = false;
++            for (_, u) in entries {
++                found = true;
+                 let ResourceClass::Texture(facts) = u.class else {
+                     return Err(mismatch());
+                 };
+@@ -1636,6 +1642,9 @@ fn member_id(
+                     _ => {}
+                 }
+             }
++            if !found {
++                return Err(mismatch());
++            }
+             Ok(id)
+         }
+         HeapSource::Bound(slot) => match state
+@@ -1767,10 +1776,8 @@ fn handle_table_bytes(
+     if members.is_empty() && tables.is_empty() {
+         return Ok(Vec::new());
+     }
+-    let mut used = UsedByToken::new();
+-    for u in &state.used_resources {
+-        used.entry(u.token).or_default().push(u);
+-    }
++    let mut used: UsedByToken = state.used_resources.iter().map(|u| (u.token, u)).collect();
++    used.sort_unstable_by_key(|&(token, _)| token);
+     let mut ids = Vec::with_capacity(members.len());
+     for m in members {
+         ids.push(member_id(m, &used, state)?);
+@@ -2051,10 +2058,8 @@ fn heap_elements(
+             None => Ok(None),
+         }
+     };
+-    let mut used = UsedByToken::new();
+-    for u in &state.used_resources {
+-        used.entry(u.token).or_default().push(u);
+-    }
++    let mut used: UsedByToken = state.used_resources.iter().map(|u| (u.token, u)).collect();
++    used.sort_unstable_by_key(|&(token, _)| token);
+     let members = template
+         .heap_members
+         .iter()
