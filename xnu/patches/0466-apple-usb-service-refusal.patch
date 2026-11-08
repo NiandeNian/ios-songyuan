@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+--- a/bsd/dev/apple_usbmux.c
++++ b/bsd/dev/apple_usbmux.c
+@@ -322,6 +322,16 @@
+ 	(void)ring_init(&c->out, AMUX_RING);
+ 	if (svc->open != NULL) {
+ 		svc->open(c, &c->ctx);
++		if (c->ctx == NULL) {
++			/* the service has no room: refuse here instead of letting
++			 * input() see a NULL context.  conn_release() first so the
++			 * slot is free again before the RST goes out. */
++			printf("APPLE MUX: service %s refused port %u\n",
++			    svc->name, hdport);
++			conn_release(c);
++			mux_send_small(hdport, hsport, 0, seq + 1, TH_RST | TH_ACK);
++			return;
++		}
+ 	}
+ 	mux_send_small(c->sport, c->dport, c->tx_seq, c->rx_seq, TH_SYN | TH_ACK);
+ 	c->tx_seq++;
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -258,7 +258,7 @@
+ 
+ #define LOCK_PORT        62078
+ #define LOCK_BUF         4096
+-#define LOCK_SLOTS       2
++#define LOCK_SLOTS       4
+ 
+ struct lock_ctx {
+ 	bool     used;
+@@ -282,8 +282,9 @@
+ 			return;
+ 		}
+ 	}
++	/* Refuse by returning a NULL context: the mux layer answers with a RST
++	 * instead of a SYN|ACK, and it owns the connection teardown. */
+ 	*ctx = NULL;
+-	apple_mux_close(conn);
+ }
+ 
+ static void
+@@ -515,7 +516,7 @@
+  * the largest single read/write payload. Both must stay below the mux ring
+  * capacity (AMUX_RING) so a reply is never truncated by apple_mux_send. */
+ #define AFC_BUF         32768
+-#define AFC_SLOTS       2
++#define AFC_SLOTS       4
+ #define AFC_FILES       16
+ #define AFC_IO_MAX      32768
+ 
+@@ -727,8 +728,9 @@
+ 			return;
+ 		}
+ 	}
++	/* Refuse by returning a NULL context: the mux layer answers with a RST
++	 * instead of a SYN|ACK, and it owns the connection teardown. */
+ 	*ctx = NULL;
+-	apple_mux_close(conn);
+ }
+ 
+ static void
