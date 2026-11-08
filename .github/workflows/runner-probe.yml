@@ -12,11 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         label:
-          - macos-13
           - macos-14
+          - macos-15-intel
           - macos-15
           - macos-latest
-          - ubuntu-latest
     runs-on: ${{ matrix.label }}
     timeout-minutes: 5
     steps:
@@ -26,3 +25,7 @@ jobs:
           uname -a
           sw_vers 2>/dev/null || true
           xcodebuild -version 2>/dev/null || true
+          echo "--- installed Xcode images ---"
+          ls -d /Applications/Xcode* 2>/dev/null || true
+          echo "--- architectures ---"
+          uname -m
