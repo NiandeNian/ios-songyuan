@@ -33,7 +33,7 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,666 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -56,8 +56,13 @@ new file mode 100644
 + *       read-only, so the pre-write state is in the same log.
 + *     - C-2b-w1: enable TITAN_TOP GDSC (0x21334), CORE_AHB (0x21348) and
 + *       CAM_TOP_AHB (0x2137c), each with a bounded status poll and A/B prints,
-+ *       then roll back in reverse order. This is the first MMIO write this file
-+ *       performs; it is the only one. See CAMERA_C2B_WRITE_SEQUENCE.md §3/§5.
++ *       then roll back in reverse order and bounded-poll POWER_DOWN_COMPLETE.
++ *       This is the first MMIO write this file performs; it is the only one.
++ *       See CAMERA_C2B_WRITE_SEQUENCE.md §3/§5 and CAMERA_C2BW1_RESULT.md §6.
++ *       Verdict compares GDSCR *control bits only* ([23:0]); the high byte is
++ *       live hardware status and never reads back what was written. A CORE_AHB
++ *       enable bit that does not stick is printed as an unresolved observation,
++ *       never silently folded into a success.
 + *   NO:
 + *     - It never votes RPMh rails, never drives the GPIO regulators, never
 + *       clocks the sensors, never writes an RCG / rate, never enables a CCI
@@ -143,6 +148,12 @@ new file mode 100644
 + *   pandora_camera=<level>   default 0 (off). 1 or 2 = run the diagnostics
 + *   in a short-lived thread, including the C-2b-w1 write/rollback probe.
 + *   Nothing else is gated by this file.
++ *   Use the 11-04 user-verified cmdline baseline plus this flag
++ *   (cmdline-good-plus-camera-reboot90.txt, 603/608 B). The older camera-only
++ *   cmdline (cmdline-camera-reboot90.txt) crash-loops SpringBoard at 49 s for
++ *   unrelated reasons -- see DESKTOP_BOOT_RECOVERY.md. A single-variable A/B
++ *   confirmed this flag is compatible with the good cmdline (1 exec / 0 CRASH).
++ *   Do not report camera results from a boot that never reached the desktop.
 + *   pandora_camera_delay=<s> seconds to wait before mapping anything, so a
 + *   rail that settles late can be told from a rail nobody enables in iOS.
 + *   pandora_steps=<ms>       before the first access to each MMIO region and
@@ -194,6 +205,15 @@ new file mode 100644
 +#define PC_GDSC_RETAIN_FF      PC_BIT(11)
 +#define PC_CFG_GDSC_PWR_DOWN   PC_BIT(15)
 +#define PC_CFG_GDSC_PWR_UP     PC_BIT(16)
++
++/* GDSCR software control/config bits are [23:0]: upstream gdsc.c defines
++ * SW_COLLAPSE bit0, HW_CONTROL bit1, SW_OVERRIDE bit2, RETAIN_FF bit11,
++ * RETAIN_PERIPH bit13, RETAIN_MEM bit14, and the CLK_DIS/EN_FEW/EN_REST
++ * wait fields in bits 15..23. Bit 31 is PWR_ON status and bits 24..30 are
++ * hardware status. C-2b-w1 logs show that high byte changing on every access
++ * (0x02 -> 0x6a -> 0xfa -> 0x72) while [23:0] stays 0x22f801; a whole-word
++ * comparison can therefore never report "restored". */
++#define PC_GDSCR_CTRL_MASK     0x00ffffffu
 +#define PC_CBCR_ENABLE         PC_BIT(0)
 +#define PC_CBCR_CLK_OFF        PC_BIT(31)
 +
@@ -357,13 +377,14 @@ new file mode 100644
 +	printf("PANDORA CAMERA: C-2b-p clock probe done (read-only)\n");
 +}
 +
-+/* C-2b-w0. Emit the register name and offset BEFORE the read, one register
-+ * per line, so a Synchronous External abort still leaves the last attempted
-+ * offset in the persistent log. Read-only: no write is issued here. */
++/* Emit the register name and offset BEFORE the read, one register per line,
++ * so a Synchronous External abort still leaves the last attempted offset in
++ * the persistent log. Used by both read-only snapshots (w0 before the write,
++ * w1 while the domain is up). No write is issued here. */
 +static void
-+pc_w0_reg(const char *what, vm_offset_t b, uint32_t off)
++pc_dump_reg(const char *phase, const char *what, vm_offset_t b, uint32_t off)
 +{
-+	printf("PANDORA CAMERA: w0 %s +%#x = ", what, off);
++	printf("PANDORA CAMERA: %s %s +%#x = ", phase, what, off);
 +	printf("%#x\n", pc_rd(b, off));
 +}
 +
@@ -371,19 +392,39 @@ new file mode 100644
 +pc_w0_dump(void)
 +{
 +	printf("PANDORA CAMERA: C-2b-w0 status snapshot (read-only, before any write)\n");
-+	pc_w0_reg("CAMCC cfg_gdscr", pc_camcc, PC_CFG_GDSCR);
++	pc_dump_reg("w0", "CAMCC cfg_gdscr", pc_camcc, PC_CFG_GDSCR);
 +	if (!pc_cci[0]) {
 +		printf("PANDORA CAMERA: C-2b-w0 CCI0 unmapped, CCI status skipped\n");
 +	} else {
-+		pc_w0_reg("CCI0 hw_version", pc_cci[0], PC_CCI_HW_VERSION);
-+		pc_w0_reg("CCI0 irq_mask_0", pc_cci[0], PC_CCI_IRQ_MASK_0);
-+		pc_w0_reg("CCI0 irq_status_0", pc_cci[0], PC_CCI_IRQ_STATUS_0);
-+		pc_w0_reg("CCI0 m0q0 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 0));
-+		pc_w0_reg("CCI0 m0q1 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 1));
-+		pc_w0_reg("CCI0 m0 read_buf_level", pc_cci[0], PC_CCI_READ_BUF_LEVEL(0));
-+		pc_w0_reg("CCI0 m0 scl_ctl", pc_cci[0], 0x100u);
++		pc_dump_reg("w0", "CCI0 hw_version", pc_cci[0], PC_CCI_HW_VERSION);
++		pc_dump_reg("w0", "CCI0 irq_mask_0", pc_cci[0], PC_CCI_IRQ_MASK_0);
++		pc_dump_reg("w0", "CCI0 irq_status_0", pc_cci[0], PC_CCI_IRQ_STATUS_0);
++		pc_dump_reg("w0", "CCI0 m0q0 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 0));
++		pc_dump_reg("w0", "CCI0 m0q1 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 1));
++		pc_dump_reg("w0", "CCI0 m0 read_buf_level", pc_cci[0], PC_CCI_READ_BUF_LEVEL(0));
++		pc_dump_reg("w0", "CCI0 m0 scl_ctl", pc_cci[0], 0x100u);
 +	}
 +	printf("PANDORA CAMERA: C-2b-w0 snapshot done (read-only)\n");
++}
++
++/* C-2b-w1: re-read CCI0 status while its parent GDSC is up but the CCI branch
++ * and RCG are still off. w0's zeros came from an unpowered domain; this tells
++ * the next stage whether the controller becomes readable with the domain alone
++ * or needs its own branch clock too. Read-only. */
++static void
++pc_w1_cci_snapshot(void)
++{
++	if (!pc_cci[0]) {
++		printf("PANDORA CAMERA: w1 CCI0 after-domain snapshot skipped (unmapped)\n");
++		return;
++	}
++	printf("PANDORA CAMERA: w1 CCI0 after-domain status (read-only; CCI branch/RCG still off)\n");
++	pc_dump_reg("w1", "CCI0 hw_version", pc_cci[0], PC_CCI_HW_VERSION);
++	pc_dump_reg("w1", "CCI0 irq_mask_0", pc_cci[0], PC_CCI_IRQ_MASK_0);
++	pc_dump_reg("w1", "CCI0 irq_status_0", pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	pc_dump_reg("w1", "CCI0 m0q0 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 0));
++	pc_dump_reg("w1", "CCI0 m0 scl_ctl", pc_cci[0], 0x100u);
++	printf("PANDORA CAMERA: w1 CCI0 after-domain snapshot done (read-only)\n");
 +}
 +
 +static int
@@ -393,6 +434,23 @@ new file mode 100644
 +		uint32_t cfg = pc_rd(pc_camcc, PC_CFG_GDSCR);
 +		printf("PANDORA CAMERA: w1 gdsc poll %u cfg_gdscr=%#x\n", i, cfg);
 +		if (cfg & PC_CFG_GDSC_PWR_UP) {
++			return 0;
++		}
++		pc_sleep(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* Upstream gdsc_disable() -> gdsc_toggle_logic() -> gdsc_poll_status() polls
++ * CFG_GDSCR POWER_DOWN_COMPLETE (bit 15) for a POLL_CFG_GDSCR domain. One
++ * read is not proof the domain returned to OFF. */
++static int
++pc_wait_gdsc_down(void)
++{
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		uint32_t cfg = pc_rd(pc_camcc, PC_CFG_GDSCR);
++		printf("PANDORA CAMERA: w1 gdsc-down poll %u cfg_gdscr=%#x\n", i, cfg);
++		if (cfg & PC_CFG_GDSC_PWR_DOWN) {
 +			return 0;
 +		}
 +		pc_sleep(1);
@@ -424,9 +482,10 @@ new file mode 100644
 +pc_w1_bringup(void)
 +{
 +	static const uint32_t critical[] = { 0x21398u, 0x21390u, 0x21364u, 0x21368u };
-+	uint32_t gdscr0, core0, top0, cfg;
-+	int ret = 0;
-+	bool gdsc_up = false, branch_up = false, restored;
++	uint32_t gdscr0, core0, top0, cfg, gdscr_now;
++	int ret = 0, down_ret;
++	bool gdsc_up = false, branch_up = false, restored, power_down_ok = false;
++	bool core_ahb_stuck = false;
 +
 +	printf("PANDORA CAMERA: C-2b-w1 bring-up starts (GDSC + 2 AHB branches; "
 +	    "no rail vote, no RCG, no CCI, no GPIO)\n");
@@ -470,8 +529,15 @@ new file mode 100644
 +		pc_step("w1 CORE_AHB", PC_CAMCC_PA + PC_CORE_AHB_CBCR);
 +		pc_wr(pc_camcc, PC_CORE_AHB_CBCR, core0 | PC_CBCR_ENABLE);
 +		pc_sleep(1);                 /* upstream udelay(10) */
-+		printf("PANDORA CAMERA: w1 core_ahb now=%#x (readback; BRANCH_HALT_DELAY has no halt poll)\n",
-+		    pc_rd(pc_camcc, PC_CORE_AHB_CBCR));
++		cfg = pc_rd(pc_camcc, PC_CORE_AHB_CBCR);
++		/* camcc-kaanapali.c: cam_cc_core_ahb_clk is an ordinary
++		 * clk_branch2 with enable_mask BIT(0), not a critical or
++		 * hardware-voted clock. A missing readback bit is therefore an
++		 * unexplained observation, not a BRANCH_HALT_DELAY quirk. */
++		core_ahb_stuck = !(cfg & PC_CBCR_ENABLE);
++		printf("PANDORA CAMERA: w1 core_ahb now=%#x enable_stuck=%s "
++		    "(BRANCH_HALT_DELAY has no halt poll)\n",
++		    cfg, core_ahb_stuck ? "YES" : "no");
 +
 +		/* 3. CAM_TOP_AHB: BRANCH_HALT, poll CLK_OFF clearing. */
 +		pc_step("w1 CAM_TOP_AHB", PC_CAMCC_PA + PC_CAM_TOP_AHB_CBCR);
@@ -496,6 +562,7 @@ new file mode 100644
 +		printf("PANDORA CAMERA: w1 CCI0 m0 scl_ctl=%#x (CCI branch/RCG untouched; "
 +		    "zero is expected)\n", pc_rd(pc_cci[0], 0x100u));
 +	}
++	pc_w1_cci_snapshot();
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
 +	 * before the probe, so no camera state is left changed by a diagnostic. */
@@ -503,20 +570,39 @@ new file mode 100644
 +	pc_wr(pc_camcc, PC_CAM_TOP_AHB_CBCR, top0);
 +	pc_wr(pc_camcc, PC_CORE_AHB_CBCR, core0);
 +	pc_wr(pc_camcc, PC_GDSCR, gdscr0);
++	/* Upstream gdsc_disable() polls CFG_GDSCR POWER_DOWN_COMPLETE (bit 15).
++	 * A single read is not proof the domain returned to OFF. */
++	down_ret = pc_wait_gdsc_down();
++	if (down_ret) {
++		printf("PANDORA CAMERA: w1 GDSC-DOWN ERROR %d (power-down complete never observed)\n",
++		    down_ret);
++	} else {
++		power_down_ok = true;
++	}
++	gdscr_now = pc_rd(pc_camcc, PC_GDSCR);
 +	cfg = pc_rd(pc_camcc, PC_CFG_GDSCR);
-+	restored = (pc_rd(pc_camcc, PC_GDSCR) == gdscr0) &&
++	/* Compare software control bits only. GDSCR high bits are live hardware
++	 * status and never read back the written value (PC_GDSCR_CTRL_MASK). */
++	restored = (((gdscr_now ^ gdscr0) & PC_GDSCR_CTRL_MASK) == 0) &&
 +	    (pc_rd(pc_camcc, PC_CORE_AHB_CBCR) == core0) &&
 +	    (pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR) == top0);
-+	printf("PANDORA CAMERA: w1 rollback: gdscr=%#x cfg_gdscr=%#x (power_down_bit=%s) "
-+	    "core_ahb=%#x cam_top_ahb=%#x restored=%s\n",
-+	    pc_rd(pc_camcc, PC_GDSCR), cfg,
++	printf("PANDORA CAMERA: w1 rollback: gdscr=%#x ctrl_mask=%#x cfg_gdscr=%#x "
++	    "(power_down_bit=%s) core_ahb=%#x cam_top_ahb=%#x restored=%s power_down=%s\n",
++	    gdscr_now, PC_GDSCR_CTRL_MASK, cfg,
 +	    (cfg & PC_CFG_GDSC_PWR_DOWN) ? "set" : "clear",
 +	    pc_rd(pc_camcc, PC_CORE_AHB_CBCR), pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR),
-+	    restored ? "yes" : "NO");
-+	printf("PANDORA CAMERA: C-2b-w1 result: gdsc_up=%s branch_up=%s restored=%s%s\n",
++	    restored ? "yes" : "NO", power_down_ok ? "yes" : "NO");
++	if (core_ahb_stuck) {
++		printf("PANDORA CAMERA: w1 CORE_AHB enable_stuck: BIT(0) did not read back; "
++		    "unresolved observation, NOT a success. It is reported separately and "
++		    "does not enter the verdict, whose target is the GDSC + CAM_TOP_AHB path.\n");
++	}
++	printf("PANDORA CAMERA: C-2b-w1 result: gdsc_up=%s branch_up=%s restored=%s "
++	    "power_down=%s core_ahb_enable_stuck=%s%s\n",
 +	    gdsc_up ? "yes" : "no", branch_up ? "yes" : "no",
-+	    restored ? "yes" : "no",
-+	    (gdsc_up && branch_up && restored) ? " -> PASS" : " -> NOT PASS");
++	    restored ? "yes" : "no", power_down_ok ? "yes" : "no",
++	    core_ahb_stuck ? "YES" : "no",
++	    (gdsc_up && branch_up && restored && power_down_ok) ? " -> PASS" : " -> NOT PASS");
 +}
 +
 +static void
