@@ -1,0 +1,36 @@
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -2536,8 +2536,16 @@
+ 	    if (hfsmp->jvp == NULL) {
+-		    buf_brelse(jinfo_bp);
+-		    retval = EROFS;
+-		    goto cleanup_dev_name;
++		    /* External journal device not available (e.g. RAM boot
++		     * without the journal partition).  Fall back to no journal
++		     * instead of failing the mount -- the volume is still
++		     * perfectly usable without crash protection. */
++		    printf("hfs: external journal not found, mounting without journal\n");
++		    buf_brelse(jinfo_bp);
++		    hfsmp->jvp = NULL;
++		    hfsmp->jnl_start = 0;
++		    hfsmp->jnl_size = 0;
++		    retval = 0;
++		    goto cleanup_dev_name;
+ 	    } else {
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -1589,7 +1589,7 @@
+ 			//
+ 			if ((retval = hfs_early_journal_init(hfsmp, vhp, args, embeddedOffset, mdb_offset, mdbp, cred)) == 0) {
+-				if (mp)
++				if (mp && hfsmp->jvp != NULL)
+ 					vfs_setflags(mp, (u_int64_t)((unsigned int)MNT_JOURNALED));
+ 			} else {
+@@ -1700,7 +1700,8 @@
+ 			    journal_close(hfsmp->jnl);
+ 			    hfsmp->jnl = NULL;
+ 			    if (hfs_early_journal_init(hfsmp, vhp, args, embeddedOffset, mdb_offset, mdbp, cred) == 0) {
+-					vfs_setflags(mp, (u_int64_t)((unsigned int)MNT_JOURNALED));
++					if (hfsmp->jvp != NULL)
++						vfs_setflags(mp, (u_int64_t)((unsigned int)MNT_JOURNALED));
+ 				} else {
