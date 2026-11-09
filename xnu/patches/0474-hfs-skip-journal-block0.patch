@@ -35,7 +35,7 @@
 +			 * deliberately removed (e.g. RAM-boot root.img). */
 +			if (SWAP_BE32(vhp->journalInfoBlock) == 0) {
 +				printf("hfs_mountfs: journalInfoBlock=0, clearing journaled flag\n");
-+				vcb->vcbAtrb &= ~kHFSVolumeJournaledMask;
++				HFSTOVCB(hfsmp)->vcbAtrb &= ~kHFSVolumeJournaledMask;
 +				hfsmp->jnl = NULL;
 +				hfsmp->jvp = NULL;
 +				retval = 0;
