@@ -33,14 +33,16 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,287 @@
 +/*
-+ * NEZHA camera subsystem: Stage C-1 read-only CCI diagnostic.
++ * NEZHA camera subsystem: Stage C-1/C-2a read-only CCI diagnostic (no power, no CCI I/O).
 + *
 + * What this does and does NOT do (so the next agent is not misled):
 + *
 + *   YES (mode 1, read-only):
-+ *     - Map GCC / CAMCC / TLMM / CCI0-2 and read identity/version registers.
++ *     - Map CAMCC / BDISTMCLKCC / TLMM / CCI0-2 (never GCC: other drivers own that
++ *       aperture; mapping it twice and unmapping raced the GPU/touch workers and
++ *       restarted the kernel -- see the control/no-control A/B in the log).
 + *     - Read (never write) the CCI master timing registers per DT fast-mode
 + *       values, and each sensor's strap: cell index, CCI master, CSIPHY index,
 + *       MCLK + reset TLMM pin numbers (DT gpios), and its RPMh / GPIO rail
@@ -107,9 +109,12 @@ new file mode 100644
 + *       (0x9253000..0x9273000), IFE (0x9151000..) and cam_smmu are Stage
 + *         C-2+ and are deliberately untouched here.
 + *
-+ *   So C-1 measures first and only then powers. A clean run prints
-+ *   "PANDORA CAMERA: C-1 diag done (read-only)" and leaves every rail,
-+ *   clock and pin exactly as the bootloader left it.
++ *   C-2a adds the per-master CCI timing-register dump (offsets 0x100..0x210 from
++ *   upstream camss-cci.c, validated field-for-field against the live DT
++ *   qcom,i2c_fast_mode children). It is still read-only and powers nothing.
++ *   C-2b (power + CCI read-ID) stays gated: CAMCC clock CBCR offsets, RPMh
++ *   vote sequencing through pandora_adsp.c, and the MCLK/reset mux values
++ *   must be filled before any write.
 + *
 + * Boot args:
 + *   pandora_camera=<level>   default 0 (off). 1 or 2 = run the read-only
@@ -140,11 +145,10 @@ new file mode 100644
 +#include <vm/pmap.h>
 +
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
-+extern void ml_io_unmap(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
 +void pandora_camera_init(void);
 +
-+#define PC_GCC_PA     0x00100000u
++/* PC_GCC_PA removed: GCC must not be mapped here (see header note). */
 +#define PC_CAMCC_PA   0x0956d000u
 +#define PC_BDISTM_PA  0x01760000u
 +#define PC_TLMM_PA    0x0f100000u
@@ -152,7 +156,7 @@ new file mode 100644
 +#define PC_CCI_PA(n)  (0x0941b000u + (uint32_t)(n) * 0x1000u)
 +#define PC_PRIORITY   92               /* as pandora_touch */
 +
-+static vm_offset_t pc_gcc, pc_camcc, pc_bdistm, pc_tlmm;
++static vm_offset_t pc_camcc, pc_bdistm, pc_tlmm;
 +static vm_offset_t pc_cci[3];
 +static int pc_chan;
 +static unsigned pc_level;
@@ -200,6 +204,16 @@ new file mode 100644
 +	    pc_rd(c, 0x000), pc_rd(c, 0x004), pc_rd(c, 0x008), pc_rd(c, 0x00c),
 +	    pc_rd(c, 0x010), pc_rd(c, 0x014), pc_rd(c, 0x018), pc_rd(c, 0x01c),
 +	    pc_rd(c, 0x020), pc_rd(c, 0x040), pc_rd(c, 0x080), pc_rd(c, 0x0c0));
++	/* Per-master timing (upstream camss-cci.c: SCL_CTL/SDA_CTL_0/1/2/MISC_CTL
++	 * at 0x100 + 0x100*master; each packs two DT fast-mode fields, see the
++	 * header note). Clocked hardware returns the DT values
++	 * (thigh 0x26, tlow 0x38, tsu_sto 0x28, tsu_sta 0x28, tbuf 0x3e, thd_dat
++	 * 0x16, thd_sta 0x23, trdhld 6, tsp 3, stretch 0); unclocked reads 0. */
++	for (unsigned m = 0; m < 2; m++) {
++		uint32_t b = 0x100u + 0x100u * m;
++		printf("PANDORA CAMERA: CCI%u master%u SCL=%#x SDA01=%#x SDA2=%#x MISC=%#x\n",
++		    n, m, pc_rd(c, b), pc_rd(c, b + 4), pc_rd(c, b + 8), pc_rd(c, b + 12));
++	}
 +}
 +
 +static void
@@ -245,21 +259,20 @@ new file mode 100644
 +		printf("PANDORA CAMERA: waiting %u s before read-only diag\n", delay_s);
 +		pc_sleep(delay_s * 1000u);
 +	}
-+	pc_step("GCC", PC_GCC_PA);
-+	pc_gcc = ml_io_map_unmappable(PC_GCC_PA, 0x1f4200, VM_WIMG_IO);
++	/* No GCC map: the GPU/touch drivers already map 0x100000 and report its vote; a second
++	 * unmappable mapping of the same aperture plus a later unmap unmaps the shared window. */
 +	pc_step("CAMCC", PC_CAMCC_PA);
 +	pc_camcc = ml_io_map_unmappable(PC_CAMCC_PA, 0x80000, VM_WIMG_IO);
 +	pc_step("BDISTMCLKCC", PC_BDISTM_PA);
 +	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000, VM_WIMG_IO);
 +	pc_step("TLMM", PC_TLMM_PA);
 +	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000, VM_WIMG_IO);
-+	if (!pc_gcc || !pc_camcc || !pc_bdistm || !pc_tlmm) {
-+		printf("PANDORA CAMERA: mapping failed gcc=%#llx camcc=%#llx bdistm=%#llx tlmm=%#llx\n",
-+		    (unsigned long long)pc_gcc, (unsigned long long)pc_camcc,
++	if (!pc_camcc || !pc_bdistm || !pc_tlmm) {
++		printf("PANDORA CAMERA: mapping failed camcc=%#llx bdistm=%#llx tlmm=%#llx\n",
++		    (unsigned long long)pc_camcc,
 +		    (unsigned long long)pc_bdistm, (unsigned long long)pc_tlmm);
 +		goto out;
 +	}
-+	printf("PANDORA CAMERA: GCC vote (read-only) = %#x\n", pc_rd(pc_gcc, 0x52018));
 +	for (unsigned n = 0; n < 3; n++) {
 +		pc_step("CCI", PC_CCI_PA(n));
 +		pc_cci[n] = ml_io_map_unmappable(PC_CCI_PA(n), 0x1000, VM_WIMG_IO);
@@ -274,22 +287,17 @@ new file mode 100644
 +	/* DT strap dump (not MMIO): which sensor would be read first, and what
 +	 * its rails cost. Values are the live DT's, already cross-checked by
 +	 * resolving each *-supply phandle to its regulator node. */
-+	printf("PANDORA CAMERA: sensor0 (wide) CCI0 master1 csiphy0 mclk=gpio89 rst=gpio106 vana=GPIO107 2.8V vdig=GPIO107 0.95V vaf=GPIO116 3.3V "
-+	    "vio=L5M_E1 1.8V bob=B1B_E0 bob2=B2B_E0\n");
-+	printf("PANDORA CAMERA: sensor3 (tele) CCI0 master0 csiphy3 mclk=gpio92 rst=gpio105 "
++	printf("PANDORA CAMERA: sensor0 (wide, ovx10500u 0x20) CCI0 master1 csiphy0 mclk=gpio89 rst=gpio106 "
++	    "vana=GPIO107 2.8V vdig=GPIO107 0.95V vaf=GPIO116 3.3V vio=L5M_E1 1.8V bob=B1B_E0 bob2=B2B_E0\n");
++	printf("PANDORA CAMERA: sensor3 (tele, s5khpe 0x5a) CCI0 master0 csiphy3 mclk=gpio92 rst=gpio105 "
 +	    "vana=GPIO113 2.2V vdig=GPIO113 0.95V vio=L5M_E1 vaf=L5N_E1 3.3V custom1=L3N_E1\n");
-+	printf("PANDORA CAMERA: C-1 diag done (read-only); unknown: sensor I2C addrs, "
-+	    "model, CCI master timing, CAMCC/BDISTM offsets; no rail voted, no write issued\n");
++	printf("PANDORA CAMERA: sensor (ultra, s5kjn5 0x7a) no live-DT node; front (ov50m) not in this run\n");
++	printf("PANDORA CAMERA: C-2a diag done (read-only), 3 rear sensors recorded; vendor config not downloaded; "
++	    "no rail voted, no write issued\n");
 +out:
-+	for (unsigned n = 0; n < 3; n++) {
-+		if (pc_cci[n]) {
-+			ml_io_unmap(pc_cci[n], 0x1000);
-+		}
-+	}
-+	if (pc_tlmm) ml_io_unmap(pc_tlmm, 0xb0000);
-+	if (pc_bdistm) ml_io_unmap(pc_bdistm, 0x6000);
-+	if (pc_camcc) ml_io_unmap(pc_camcc, 0x80000);
-+	if (pc_gcc) ml_io_unmap(pc_gcc, 0x1f4200);
++	/* Deliberately no unmaps anywhere in this file: a one-shot boot diagnostic shares
++	 * the TLMM/CCI apertures with the worker threads (and the GCC aperture already taught
++	 * the lesson), so the maps stay for the whole boot, like the other pandora drivers. */
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
