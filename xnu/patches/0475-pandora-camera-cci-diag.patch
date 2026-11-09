@@ -33,35 +33,39 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,580 @@
 +/*
-+ * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p read-only CCI and clock
-+ * diagnostic (no power, no clock votes, no CCI I/O).
++ * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
++ * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
++ * registers, verifies each step, then rolls them all back).
 + *
 + * What this does and does NOT do (so the next agent is not misled):
 + *
-+ *   YES (mode 1, read-only):
++ *   YES (mode 1):
 + *     - Map CAMCC / BDISTMCLKCC / TLMM / CCI0-2 (never GCC: other drivers own that
 + *       aperture; mapping it twice and unmapping raced the GPU/touch workers and
 + *       restarted the kernel -- see the control/no-control A/B in the log).
-+ *     - Read (never write) the CCI master timing registers per DT fast-mode
-+ *       values, and each sensor's strap: cell index, CCI master, CSIPHY index,
-+ *       MCLK + reset TLMM pin numbers (DT gpios), and its RPMh / GPIO rail
-+ *       voltages (DT rgltr-max-voltage).
++ *     - Read the CCI master timing registers per DT fast-mode values, and each
++ *       sensor's strap: cell index, CCI master, CSIPHY index, MCLK + reset TLMM
++ *       pin numbers (DT gpios), and its RPMh / GPIO rail voltages.
 + *     - Print the CCI pin mux state (TLMM CTL for all 12 CCI SDA/SCL pins and
 + *       the 4 sensor MCLK/reset pins).
-+ *     - Dump CAMCC / BDISTMCLKCC state registers read-only (no vote, no rate change).
-+ *     - C-2b-p: after every C-2a line has been printed, read the upstream
-+ *       Kaanapali CAMCC / CAMBISTMCLKCC clock offsets one register per printf.
++ *     - C-2b-p: read the upstream Kaanapali CAMCC / CAMBISTMCLKCC clock offsets
++ *       one register per printf, after every C-2a line has been printed.
++ *     - C-2b-w0: read CCI0 hw-version / IRQ / queue status and CAMCC CFG_GDSCR
++ *       read-only, so the pre-write state is in the same log.
++ *     - C-2b-w1: enable TITAN_TOP GDSC (0x21334), CORE_AHB (0x21348) and
++ *       CAM_TOP_AHB (0x2137c), each with a bounded status poll and A/B prints,
++ *       then roll back in reverse order. This is the first MMIO write this file
++ *       performs; it is the only one. See CAMERA_C2B_WRITE_SEQUENCE.md §3/§5.
 + *   NO:
 + *     - It never votes RPMh rails, never drives the GPIO regulators, never
-+ *       clocks the sensors, never writes a clock register, never issues a CCI
-+ *       transaction, never touches CSIPHY / CSID / IFE, never reserves SMMU,
-+ *       never maps camera regions.
++ *       clocks the sensors, never writes an RCG / rate, never enables a CCI
++ *       branch, never issues a CCI transaction, never touches CSIPHY / CSID /
++ *       IFE, never reserves SMMU, never unmaps camera regions.
 + *   Mode 2 is identical to mode 1 for now: per-sensor address + power
-+ *   bring-up is gated on vendor data the board DT does not carry (see the
-+ *   header comment below). Do not "extend" this driver to write without
-+ *   filling those unknowns first.
++ *   bring-up is gated on vendor data the board DT does not carry. Do not
++ *   "extend" this driver further without filling those unknowns first.
 + *
 + * Why Stage C-1 is a diagnostic and not a "sensor probe":
 + *
@@ -124,17 +128,26 @@ new file mode 100644
 + *   driver. The probe is the step that confirms those offsets are readable
 + *   here; it still writes nothing.
 + *
-+ *   C-2b (power + CCI read-ID) stays gated: RPMh vote sequencing through
-+ *   pandora_adsp.c, MCLK/reset mux values, the CCI queue transaction sequence
-+ *   and the real sensor chip-ID registers must be resolved before any write.
++ *   C-2b-w1 is deliberately narrow. This board's DT puts CCI0/1/2 in the
++ *   CAM_CC_TITAN_TOP_GDSC power domain (power-domains = <&camcc 5>) while the
++ *   CAMCC node itself has no parent power-domain, so bringing up the GDSC and
++ *   the two AHB branches needs no RPMh rail vote and touches no sensor pin.
++ *   Upstream gdsc.c polls CFG_GDSCR (0x21338) bit 16 for POWER_UP_COMPLETE,
++ *   NOT GDSCR bit 31; clk-branch.c polls CBCR bit 31 (CLK_OFF) clearing,
++ *   except CORE_AHB which is BRANCH_HALT_DELAY and has no halt bit.
++ *   Full C-2b (power + CCI read-ID) stays gated: RPMh vote sequencing,
++ *   MCLK/reset mux values, the CCI address-then-read encoding, the RCG rate
++ *   handshake and the real sensor chip-ID registers are still unresolved.
 + *
 + * Boot args:
-+ *   pandora_camera=<level>   default 0 (off). 1 or 2 = run the read-only
-+ *   diagnostic in a short-lived thread. Nothing else is gated by this file.
++ *   pandora_camera=<level>   default 0 (off). 1 or 2 = run the diagnostics
++ *   in a short-lived thread, including the C-2b-w1 write/rollback probe.
++ *   Nothing else is gated by this file.
 + *   pandora_camera_delay=<s> seconds to wait before mapping anything, so a
 + *   rail that settles late can be told from a rail nobody enables in iOS.
-+ *   pandora_steps=<ms>       before the first access to each MMIO region,
-+ *   print its name and wait ms (as pandora_touch). A hang leaves the name.
++ *   pandora_steps=<ms>       before the first access to each MMIO region and
++ *   before each C-2b-w1 write group, print its name and wait ms (as
++ *   pandora_touch). A hang leaves the name of the last attempted step.
 + *
 + * Sources: live DT as above; GCC CAMCC / BDISTMCLKCC register offsets are
 + * NOT yet verified here -- this file only reads CBCR / RCG state registers
@@ -167,6 +180,35 @@ new file mode 100644
 +#define PC_GPIO(n)    ((uint32_t)(n) * 0x1000u)
 +#define PC_CCI_PA(n)  (0x0941b000u + (uint32_t)(n) * 0x1000u)
 +#define PC_PRIORITY   92               /* as pandora_touch */
++#define PC_BIT(n)     (1u << (n))
++
++/* CAMCC GDSC / AHB registers used by C-2b-w1. Offsets and bit meanings come
++ * from upstream camcc-kaanapali.c, gdsc.c and clk-branch.c; see
++ * CAMERA_C2B_WRITE_SEQUENCE.md §3. TITAN_TOP_GDSC sets POLL_CFG_GDSCR, so
++ * POWER_UP_COMPLETE is polled in CFG_GDSCR (gdscr + 0x4), not in GDSCR. */
++#define PC_GDSCR               0x21334u
++#define PC_CFG_GDSCR           0x21338u
++#define PC_CORE_AHB_CBCR       0x21348u
++#define PC_CAM_TOP_AHB_CBCR    0x2137cu
++#define PC_GDSC_SW_COLLAPSE    PC_BIT(0)
++#define PC_GDSC_RETAIN_FF      PC_BIT(11)
++#define PC_CFG_GDSC_PWR_DOWN   PC_BIT(15)
++#define PC_CFG_GDSC_PWR_UP     PC_BIT(16)
++#define PC_CBCR_ENABLE         PC_BIT(0)
++#define PC_CBCR_CLK_OFF        PC_BIT(31)
++
++/* CCI0 status registers read (never written) by C-2b-w0. */
++#define PC_CCI_HW_VERSION             0x000u
++#define PC_CCI_IRQ_MASK_0             0xc04u
++#define PC_CCI_IRQ_STATUS_0           0xc0cu
++#define PC_CCI_Qn_CUR_WORD_CNT(m, q)  (0x304u + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_READ_BUF_LEVEL(m)      (0x11cu + 0x100u * (m))
++
++/* Bounded polls: pc_sleep() is millisecond-granular, so 20 x 1 ms is a
++ * deliberately generous bound (upstream uses 2 ms for GDSC and 200 us for a
++ * branch). A generous timeout cannot manufacture a success: the status bit
++ * still has to be observed. */
++#define PC_POLL_STEPS          20u
 +
 +static vm_offset_t pc_camcc, pc_bdistm, pc_tlmm;
 +static vm_offset_t pc_cci[3];
@@ -181,6 +223,18 @@ new file mode 100644
 +	uint32_t v = *(volatile uint32_t *)(b + o);
 +	__asm__ volatile("dmb oshld" ::: "memory");
 +	return v;
++}
++
++/* First write helper in this file. C-2b-w1 uses it on exactly three CAMCC
++ * registers. The trailing read forces the write out before the caller polls a
++ * status bit; no aperture is ever unmapped. */
++static void
++pc_wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile("dmb oshld" ::: "memory");
++	(void)pc_rd(b, o);
 +}
 +
 +static void
@@ -303,6 +357,168 @@ new file mode 100644
 +	printf("PANDORA CAMERA: C-2b-p clock probe done (read-only)\n");
 +}
 +
++/* C-2b-w0. Emit the register name and offset BEFORE the read, one register
++ * per line, so a Synchronous External abort still leaves the last attempted
++ * offset in the persistent log. Read-only: no write is issued here. */
++static void
++pc_w0_reg(const char *what, vm_offset_t b, uint32_t off)
++{
++	printf("PANDORA CAMERA: w0 %s +%#x = ", what, off);
++	printf("%#x\n", pc_rd(b, off));
++}
++
++static void
++pc_w0_dump(void)
++{
++	printf("PANDORA CAMERA: C-2b-w0 status snapshot (read-only, before any write)\n");
++	pc_w0_reg("CAMCC cfg_gdscr", pc_camcc, PC_CFG_GDSCR);
++	if (!pc_cci[0]) {
++		printf("PANDORA CAMERA: C-2b-w0 CCI0 unmapped, CCI status skipped\n");
++	} else {
++		pc_w0_reg("CCI0 hw_version", pc_cci[0], PC_CCI_HW_VERSION);
++		pc_w0_reg("CCI0 irq_mask_0", pc_cci[0], PC_CCI_IRQ_MASK_0);
++		pc_w0_reg("CCI0 irq_status_0", pc_cci[0], PC_CCI_IRQ_STATUS_0);
++		pc_w0_reg("CCI0 m0q0 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 0));
++		pc_w0_reg("CCI0 m0q1 cur_word_cnt", pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(0, 1));
++		pc_w0_reg("CCI0 m0 read_buf_level", pc_cci[0], PC_CCI_READ_BUF_LEVEL(0));
++		pc_w0_reg("CCI0 m0 scl_ctl", pc_cci[0], 0x100u);
++	}
++	printf("PANDORA CAMERA: C-2b-w0 snapshot done (read-only)\n");
++}
++
++static int
++pc_wait_gdsc_up(void)
++{
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		uint32_t cfg = pc_rd(pc_camcc, PC_CFG_GDSCR);
++		printf("PANDORA CAMERA: w1 gdsc poll %u cfg_gdscr=%#x\n", i, cfg);
++		if (cfg & PC_CFG_GDSC_PWR_UP) {
++			return 0;
++		}
++		pc_sleep(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++pc_wait_branch_on(uint32_t off)
++{
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		uint32_t v = pc_rd(pc_camcc, off);
++		printf("PANDORA CAMERA: w1 branch +%#x poll %u cbcr=%#x\n", off, i, v);
++		if (!(v & PC_CBCR_CLK_OFF)) {
++			return 0;
++		}
++		pc_sleep(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* C-2b-w1: the first MMIO write in this file. It enables TITAN_TOP GDSC and
++ * two AHB branches, proves each with a bounded status poll, prints the A/B
++ * values, then restores all three registers in reverse order. It does not
++ * vote a rail, touch a GPIO, write an RCG, enable a CCI branch or issue an
++ * I2C transaction. Every failure is printed as a failure and still rolls
++ * back; a missing status bit is never turned into success. */
++static void
++pc_w1_bringup(void)
++{
++	static const uint32_t critical[] = { 0x21398u, 0x21390u, 0x21364u, 0x21368u };
++	uint32_t gdscr0, core0, top0, cfg;
++	int ret = 0;
++	bool gdsc_up = false, branch_up = false, restored;
++
++	printf("PANDORA CAMERA: C-2b-w1 bring-up starts (GDSC + 2 AHB branches; "
++	    "no rail vote, no RCG, no CCI, no GPIO)\n");
++
++	/* Precondition: the critical CBCRs were enabled at boot (C-2b-p read
++	 * 0x08000001 on all four). If they are not, write nothing at all. */
++	for (unsigned i = 0; i < sizeof(critical) / sizeof(critical[0]); i++) {
++		cfg = pc_rd(pc_camcc, critical[i]);
++		printf("PANDORA CAMERA: w1 critical +%#x = %#x\n", critical[i], cfg);
++		if (!(cfg & PC_CBCR_ENABLE)) {
++			printf("PANDORA CAMERA: w1 ABORT: critical CBCR +%#x has no enable bit; no write issued\n",
++			    critical[i]);
++			return;
++		}
++	}
++
++	gdscr0 = pc_rd(pc_camcc, PC_GDSCR);
++	core0 = pc_rd(pc_camcc, PC_CORE_AHB_CBCR);
++	top0 = pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR);
++	printf("PANDORA CAMERA: w1 before: gdscr=%#x cfg_gdscr=%#x core_ahb=%#x cam_top_ahb=%#x\n",
++	    gdscr0, pc_rd(pc_camcc, PC_CFG_GDSCR), core0, top0);
++
++	/* 1. TITAN_TOP GDSC: clear SW_COLLAPSE, poll CFG_GDSCR bit 16. */
++	pc_step("w1 GDSC enable", PC_CAMCC_PA + PC_GDSCR);
++	pc_wr(pc_camcc, PC_GDSCR, gdscr0 & ~PC_GDSC_SW_COLLAPSE);
++	printf("PANDORA CAMERA: w1 wrote gdscr=%#x (SW_COLLAPSE cleared)\n",
++	    pc_rd(pc_camcc, PC_GDSCR));
++	ret = pc_wait_gdsc_up();
++	if (ret) {
++		printf("PANDORA CAMERA: w1 GDSC ERROR %d (power-up complete never observed)\n", ret);
++	} else {
++		gdsc_up = true;
++		pc_sleep(1);                 /* upstream udelay(1) after toggle */
++		pc_wr(pc_camcc, PC_GDSCR, pc_rd(pc_camcc, PC_GDSCR) | PC_GDSC_RETAIN_FF);
++		printf("PANDORA CAMERA: w1 GDSC up: gdscr=%#x cfg_gdscr=%#x\n",
++		    pc_rd(pc_camcc, PC_GDSCR), pc_rd(pc_camcc, PC_CFG_GDSCR));
++	}
++
++	/* 2. CORE_AHB: BRANCH_HALT_DELAY has no halt bit, just a delay. */
++	if (ret == 0) {
++		pc_step("w1 CORE_AHB", PC_CAMCC_PA + PC_CORE_AHB_CBCR);
++		pc_wr(pc_camcc, PC_CORE_AHB_CBCR, core0 | PC_CBCR_ENABLE);
++		pc_sleep(1);                 /* upstream udelay(10) */
++		printf("PANDORA CAMERA: w1 core_ahb now=%#x (readback; BRANCH_HALT_DELAY has no halt poll)\n",
++		    pc_rd(pc_camcc, PC_CORE_AHB_CBCR));
++
++		/* 3. CAM_TOP_AHB: BRANCH_HALT, poll CLK_OFF clearing. */
++		pc_step("w1 CAM_TOP_AHB", PC_CAMCC_PA + PC_CAM_TOP_AHB_CBCR);
++		pc_wr(pc_camcc, PC_CAM_TOP_AHB_CBCR, top0 | PC_CBCR_ENABLE);
++		ret = pc_wait_branch_on(PC_CAM_TOP_AHB_CBCR);
++		if (ret) {
++			printf("PANDORA CAMERA: w1 CAM_TOP_AHB ERROR %d (CLK_OFF never cleared)\n", ret);
++		} else {
++			branch_up = true;
++		}
++	}
++
++	/* A/B snapshot while (if) the domain is up. CCI0's own branch and RCG
++	 * were deliberately left off, so a zero CCI timing register here is the
++	 * expected state, NOT a failure of w1. */
++	printf("PANDORA CAMERA: w1 A/B snapshot: gdscr=%#x cfg_gdscr=%#x core_ahb=%#x "
++	    "cam_top_ahb=%#x cci0_cbcr=%#x\n",
++	    pc_rd(pc_camcc, PC_GDSCR), pc_rd(pc_camcc, PC_CFG_GDSCR),
++	    pc_rd(pc_camcc, PC_CORE_AHB_CBCR), pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR),
++	    pc_rd(pc_camcc, 0x21268u));
++	if (pc_cci[0]) {
++		printf("PANDORA CAMERA: w1 CCI0 m0 scl_ctl=%#x (CCI branch/RCG untouched; "
++		    "zero is expected)\n", pc_rd(pc_cci[0], 0x100u));
++	}
++
++	/* 4. Rollback in reverse order, always. Restore the exact values read
++	 * before the probe, so no camera state is left changed by a diagnostic. */
++	pc_step("w1 rollback", PC_CAMCC_PA + PC_GDSCR);
++	pc_wr(pc_camcc, PC_CAM_TOP_AHB_CBCR, top0);
++	pc_wr(pc_camcc, PC_CORE_AHB_CBCR, core0);
++	pc_wr(pc_camcc, PC_GDSCR, gdscr0);
++	cfg = pc_rd(pc_camcc, PC_CFG_GDSCR);
++	restored = (pc_rd(pc_camcc, PC_GDSCR) == gdscr0) &&
++	    (pc_rd(pc_camcc, PC_CORE_AHB_CBCR) == core0) &&
++	    (pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR) == top0);
++	printf("PANDORA CAMERA: w1 rollback: gdscr=%#x cfg_gdscr=%#x (power_down_bit=%s) "
++	    "core_ahb=%#x cam_top_ahb=%#x restored=%s\n",
++	    pc_rd(pc_camcc, PC_GDSCR), cfg,
++	    (cfg & PC_CFG_GDSC_PWR_DOWN) ? "set" : "clear",
++	    pc_rd(pc_camcc, PC_CORE_AHB_CBCR), pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR),
++	    restored ? "yes" : "NO");
++	printf("PANDORA CAMERA: C-2b-w1 result: gdsc_up=%s branch_up=%s restored=%s%s\n",
++	    gdsc_up ? "yes" : "no", branch_up ? "yes" : "no",
++	    restored ? "yes" : "no",
++	    (gdsc_up && branch_up && restored) ? " -> PASS" : " -> NOT PASS");
++}
++
 +static void
 +pc_tlmm_dump(void)
 +{
@@ -364,10 +580,13 @@ new file mode 100644
 +	    "vana=GPIO113 2.2V vdig=GPIO113 0.95V vio=L5M_E1 vaf=L5N_E1 3.3V custom1=L3N_E1\n");
 +	printf("PANDORA CAMERA: sensor (ultra, s5kjn5 0x7a) no live-DT node; front (ov50m) not in this run\n");
 +	printf("PANDORA CAMERA: C-2a diag done (read-only), 3 rear sensors recorded; vendor config not downloaded; "
-+	    "no rail voted, no write issued\n");
-+	/* Deliberately last: C-2a evidence is complete before any unproven offset
-+	 * is touched, so a restart here can only be attributed to C-2b-p. */
++	    "C-2a issued no rail vote and no write\n");
++	/* All read-only evidence (C-2a, C-2b-p, C-2b-w0) is printed before the
++	 * first write, so a restart can be attributed to a named w1 step. */
 +	pc_clock_probe();
++	pc_w0_dump();
++	pc_w1_bringup();
++	printf("PANDORA CAMERA: C-2b-w1 thread done\n");
 +out:
 +	/* Deliberately no unmaps anywhere in this file: a one-shot boot diagnostic shares
 +	 * the TLMM/CCI apertures with the worker threads (and the GCC aperture already taught
