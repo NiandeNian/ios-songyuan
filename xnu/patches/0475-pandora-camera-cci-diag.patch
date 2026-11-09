@@ -33,7 +33,7 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,821 @@
+@@ -0,0 +1,889 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -258,6 +258,25 @@ new file mode 100644
 +#define PC_CCI0_N_REG              0x2125cu
 +#define PC_CCI0_D_REG              0x21260u
 +#define PC_CMD_ROOT_OFF            PC_BIT(31)
++
++/* TAYCAN_ELU PLL0 register offsets from the CAMCC base (cam_cc_pll0.offset=0x0).
++ * These come from clk_alpha_pll_regs[CLK_ALPHA_PLL_TYPE_TAYCAN_EKO_T] (=ELU):
++ * MODE+0x0 OPMCDE+0x4 STATE+0x8 STATUS+0xc L+0x10 ALPHA+0x14 USER_CTL+0x18
++ * USER_CTL_U+0x1c CONFIG_CTL+0x20 CONFIG_CTL_U+0x24 CONFIG_CTL_U1+0x28
++ * TEST_CTL+0x2c TEST_CTL_U+0x30. Used read-only by the w4 snapshot. */
++#define PC_PLL0_MODE              0x000u
++#define PC_PLL0_OPMCDE            0x004u
++#define PC_PLL0_STATE             0x008u
++#define PC_PLL0_STATUS            0x00cu
++#define PC_PLL0_L_VAL             0x010u
++#define PC_PLL0_ALPHA             0x014u
++#define PC_PLL0_USER_CTL          0x018u
++#define PC_PLL0_USER_CTL_U        0x01cu
++#define PC_PLL0_CONFIG_CTL        0x020u
++#define PC_PLL0_CONFIG_CTL_U      0x024u
++#define PC_PLL0_CONFIG_CTL_U1     0x028u
++#define PC_PLL0_TEST_CTL          0x02cu
++#define PC_PLL0_TEST_CTL_U        0x030u
 +
 +/* Bounded polls: pc_sleep() is millisecond-granular, so 20 x 1 ms is a
 + * deliberately generous bound (upstream uses 2 ms for GDSC and 200 us for a
@@ -546,6 +565,54 @@ new file mode 100644
 +	pc_dump_reg(phase, "CCI0 m0 sda_ctl_0", pc_cci[0], PC_CCI_SDA_CTL_0(0));
 +}
 +
++/* C-2b-w4: read-only TAYCAN_ELU PLL0 + CCI0 RCG state snapshot. This is the
++ * device-side read of PLL0's runtime state that §6 of
++ * CAMERA_C2B_RCG_CCI_INPUTS.md lists as still open. The authoritative
++ * clk_taycan_elu_pll_configure() body is NOT in torvalds/linux (only the enum
++ * /regs table / dispatch case are), and the PLL bit masks live in clk-regmap.h
++ * which is not cached, so this probe does NOT write any PLL register — it only
++ * reads and prints the raw values alongside the known config values for
++ * comparison. Decoding the MODE/STATE/STATUS bits is best-effort until those
++ * masks are located; the raw hex is the deliverable. No clock is voted. */
++static void
++pc_w4_pll_snapshot(void)
++{
++	uint32_t mode, opmcde, state, status, lval, alpha, uctl, uctu;
++	uint32_t cfg, cfgu, cfgu1, tctl, tctu;
++
++	if (!pc_camcc) {
++		printf("PANDORA CAMERA: w4 PLL0 snapshot skipped (camcc unmapped)\n");
++		return;
++	}
++	mode   = pc_rd(pc_camcc, PC_PLL0_MODE);
++	opmcde = pc_rd(pc_camcc, PC_PLL0_OPMCDE);
++	state  = pc_rd(pc_camcc, PC_PLL0_STATE);
++	status = pc_rd(pc_camcc, PC_PLL0_STATUS);
++	lval   = pc_rd(pc_camcc, PC_PLL0_L_VAL);
++	alpha  = pc_rd(pc_camcc, PC_PLL0_ALPHA);
++	uctl   = pc_rd(pc_camcc, PC_PLL0_USER_CTL);
++	uctu   = pc_rd(pc_camcc, PC_PLL0_USER_CTL_U);
++	cfg    = pc_rd(pc_camcc, PC_PLL0_CONFIG_CTL);
++	cfgu   = pc_rd(pc_camcc, PC_PLL0_CONFIG_CTL_U);
++	cfgu1  = pc_rd(pc_camcc, PC_PLL0_CONFIG_CTL_U1);
++	tctl   = pc_rd(pc_camcc, PC_PLL0_TEST_CTL);
++	tctu   = pc_rd(pc_camcc, PC_PLL0_TEST_CTL_U);
++	printf("PANDORA CAMERA: C-2b-w4 PLL0 (TAYCAN_ELU, camcc+0x0) read-only snapshot\n");
++	printf("PANDORA CAMERA: w4 PLL0 mode     +0x000=%#x  opmcde +0x004=%#x  state +0x008=%#x  status +0x00c=%#x\n",
++	    mode, opmcde, state, status);
++	printf("PANDORA CAMERA: w4 PLL0 l_val    +0x010=%#x (config l=%#x)  alpha +0x014=%#x (config alpha=%#x)\n",
++	    lval, 0x3eu, alpha, 0x8000u);
++	printf("PANDORA CAMERA: w4 PLL0 user_ctl +0x018=%#x (config %#x)  user_ctu +0x01c=%#x (config %#x)\n",
++	    uctl, 0x00008408u, uctu, 0x00000002u);
++	printf("PANDORA CAMERA: w4 PLL0 cfg_ctl  +0x020=%#x (config %#x)  cfg_ctu +0x024=%#x (config %#x)  cfg_ctu1 +0x028=%#x (config %#x)\n",
++	    cfg, 0x25c400e7u, cfgu, 0x0a8062e0u, cfgu1, 0xf51dea20u);
++	printf("PANDORA CAMERA: w4 PLL0 test_ctl +0x02c=%#x  test_ctu +0x030=%#x\n", tctl, tctu);
++	printf("PANDORA CAMERA: w4 CCI0 cmd_rcgr +0x21250=%#x cfg_rcgr +0x21254=%#x m +0x21258=%#x n +0x2125c=%#x d +0x21260=%#x cbcr +0x21268=%#x\n",
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR), pc_rd(pc_camcc, PC_CCI0_CFG_RCGR),
++	    pc_rd(pc_camcc, PC_CCI0_M_REG), pc_rd(pc_camcc, PC_CCI0_N_REG),
++	    pc_rd(pc_camcc, PC_CCI0_D_REG), pc_rd(pc_camcc, PC_CCI0_CBCR));
++}
++
 +/* C-2b-w2/w3: write ONLY the CCI0 branch CBCR BIT(0) and bounded-poll
 + * CLK_OFF. Capture the full CMD_RCGR / CFG_RCGR before and after so the
 + * hardware's ROOT_OFF behaviour is visible, and read the controller state
@@ -826,6 +893,7 @@ new file mode 100644
 +	 * first write, so a restart can be attributed to a named w1 step. */
 +	pc_clock_probe();
 +	pc_w0_dump();
++	pc_w4_pll_snapshot();
 +	pc_w1_bringup();
 +	printf("PANDORA CAMERA: C-2b-w1 thread done\n");
 +out:
