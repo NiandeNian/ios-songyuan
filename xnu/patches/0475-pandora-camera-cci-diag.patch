@@ -33,9 +33,10 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,361 @@
 +/*
-+ * NEZHA camera subsystem: Stage C-1/C-2a read-only CCI diagnostic (no power, no CCI I/O).
++ * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p read-only CCI and clock
++ * diagnostic (no power, no clock votes, no CCI I/O).
 + *
 + * What this does and does NOT do (so the next agent is not misled):
 + *
@@ -50,10 +51,13 @@ new file mode 100644
 + *     - Print the CCI pin mux state (TLMM CTL for all 12 CCI SDA/SCL pins and
 + *       the 4 sensor MCLK/reset pins).
 + *     - Dump CAMCC / BDISTMCLKCC state registers read-only (no vote, no rate change).
++ *     - C-2b-p: after every C-2a line has been printed, read the upstream
++ *       Kaanapali CAMCC / CAMBISTMCLKCC clock offsets one register per printf.
 + *   NO:
 + *     - It never votes RPMh rails, never drives the GPIO regulators, never
-+ *       clocks the sensors, never issues a CCI transaction, never touches
-+ *       CSIPHY / CSID / IFE, never reserves SMMU, never maps camera regions.
++ *       clocks the sensors, never writes a clock register, never issues a CCI
++ *       transaction, never touches CSIPHY / CSID / IFE, never reserves SMMU,
++ *       never maps camera regions.
 + *   Mode 2 is identical to mode 1 for now: per-sensor address + power
 + *   bring-up is gated on vendor data the board DT does not carry (see the
 + *   header comment below). Do not "extend" this driver to write without
@@ -112,9 +116,17 @@ new file mode 100644
 + *   C-2a adds the per-master CCI timing-register dump (offsets 0x100..0x210 from
 + *   upstream camss-cci.c, validated field-for-field against the live DT
 + *   qcom,i2c_fast_mode children). It is still read-only and powers nothing.
-+ *   C-2b (power + CCI read-ID) stays gated: CAMCC clock CBCR offsets, RPMh
-+ *   vote sequencing through pandora_adsp.c, and the MCLK/reset mux values
-+ *   must be filled before any write.
++ *   C-2b-p adds a read-only probe of the upstream Kaanapali CAMCC /
++ *   CAMBISTMCLKCC clock offsets (table and evidence in
++ *   CAMERA_C2B_CLOCK_INPUTS.md). "canoe" and "kaanapali" are the same SM8850;
++ *   this board's DT clock IDs (CCI 14/15..18/19, MCLK 2/6/8/10), the 37.5 MHz
++ *   and 19.2 MHz rates and the /proc/iomem windows all match the upstream
++ *   driver. The probe is the step that confirms those offsets are readable
++ *   here; it still writes nothing.
++ *
++ *   C-2b (power + CCI read-ID) stays gated: RPMh vote sequencing through
++ *   pandora_adsp.c, MCLK/reset mux values, the CCI queue transaction sequence
++ *   and the real sensor chip-ID registers must be resolved before any write.
 + *
 + * Boot args:
 + *   pandora_camera=<level>   default 0 (off). 1 or 2 = run the read-only
@@ -232,6 +244,65 @@ new file mode 100644
 +	    pc_rd(pc_bdistm, 0x008), pc_rd(pc_bdistm, 0x00c));
 +}
 +
++/* C-2b-p upstream clock-offset probe.
++ *
++ * One register per pair of printfs on purpose: an MMIO read into an aperture
++ * that is powered off raises a Synchronous External abort (the failure mode
++ * that killed sweet_usb_probe() when it read the stale Sweet GCC offset). The
++ * offset and name are emitted before the read, so the persistent log keeps the
++ * last attempted address even if the read never returns. It runs after every
++ * C-2a line, which keeps the already verified C-2a evidence intact.
++ *
++ * Offsets come from drivers/clk/qcom/camcc-kaanapali.c and
++ * cambistmclkcc-kaanapali.c; CAMERA_C2B_CLOCK_INPUTS.md records the DT clock
++ * ID, rate and /proc/iomem cross-check. They remain candidates until this
++ * probe succeeds here. No register is written and no clock is voted. */
++static void
++pc_clock_probe(void)
++{
++	static const struct pc_reg {
++		uint32_t off;
++		const char *name;
++	} camcc_regs[] = {
++		{ 0x21250, "cci0_src_cmd_rcgr" },
++		{ 0x21268, "cci0_cbcr" },
++		{ 0x2126c, "cci1_src_cmd_rcgr" },
++		{ 0x21284, "cci1_cbcr" },
++		{ 0x21288, "cci2_src_cmd_rcgr" },
++		{ 0x212a0, "cci2_cbcr" },
++		{ 0x21334, "titan_top_gdscr" },
++		{ 0x21348, "core_ahb_cbcr" },
++		{ 0x21364, "gdsc_clk_cbcr" },
++		{ 0x21368, "sleep_clk_cbcr" },
++		{ 0x2137c, "cam_top_ahb_cbcr" },
++		{ 0x21390, "drv_xo_cbcr" },
++		{ 0x21398, "drv_ahb_cbcr" },
++	}, bdistm_regs[] = {
++		{ 0x4000, "mclk0_src_cmd_rcgr" },
++		{ 0x4018, "mclk0_cbcr" },
++		{ 0x4038, "mclk2_src_cmd_rcgr" },
++		{ 0x4050, "mclk2_cbcr" },
++		{ 0x4054, "mclk3_src_cmd_rcgr" },
++		{ 0x406c, "mclk3_cbcr" },
++		{ 0x4070, "mclk4_src_cmd_rcgr" },
++		{ 0x4088, "mclk4_cbcr" },
++		{ 0x40e0, "sleep_clk_cbcr" },
++	};
++
++	printf("PANDORA CAMERA: C-2b-p upstream clock probe (read-only, no vote)\n");
++	pc_step("CAMCC upstream clock offsets", PC_CAMCC_PA + 0x21250u);
++	for (unsigned i = 0; i < sizeof(camcc_regs) / sizeof(camcc_regs[0]); i++) {
++		printf("PANDORA CAMERA: CAMCC +%#x %s = ", camcc_regs[i].off, camcc_regs[i].name);
++		printf("%#x\n", pc_rd(pc_camcc, camcc_regs[i].off));
++	}
++	pc_step("BDISTM upstream clock offsets", PC_BDISTM_PA + 0x4000u);
++	for (unsigned i = 0; i < sizeof(bdistm_regs) / sizeof(bdistm_regs[0]); i++) {
++		printf("PANDORA CAMERA: BDISTM +%#x %s = ", bdistm_regs[i].off, bdistm_regs[i].name);
++		printf("%#x\n", pc_rd(pc_bdistm, bdistm_regs[i].off));
++	}
++	printf("PANDORA CAMERA: C-2b-p clock probe done (read-only)\n");
++}
++
 +static void
 +pc_tlmm_dump(void)
 +{
@@ -294,6 +365,9 @@ new file mode 100644
 +	printf("PANDORA CAMERA: sensor (ultra, s5kjn5 0x7a) no live-DT node; front (ov50m) not in this run\n");
 +	printf("PANDORA CAMERA: C-2a diag done (read-only), 3 rear sensors recorded; vendor config not downloaded; "
 +	    "no rail voted, no write issued\n");
++	/* Deliberately last: C-2a evidence is complete before any unproven offset
++	 * is touched, so a restart here can only be attributed to C-2b-p. */
++	pc_clock_probe();
 +out:
 +	/* Deliberately no unmaps anywhere in this file: a one-shot boot diagnostic shares
 +	 * the TLMM/CCI apertures with the worker threads (and the GCC aperture already taught
