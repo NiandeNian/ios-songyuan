@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+--- a/bsd/dev/apple_usbmux.c
++++ b/bsd/dev/apple_usbmux.c
+@@ -423,7 +423,7 @@
+ 		version_reply();
+ 		am.neg = true;
+ 		am.active = false;
+-		printf("APPLE MUX: host asked v%u.%u, replied v2.0\n", major,
++		printf("APPLE MUX: host asked v%u.%u, replied v1.0\n", major,
+ 		    apple_be32(pkt + hdr + 4));
+ 		break;
+ 	}
