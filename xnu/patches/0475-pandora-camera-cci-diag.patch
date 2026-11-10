@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..1e6ea84
+index 0000000..756ad64
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1589 @@
+@@ -0,0 +1,1590 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1068,6 +1068,7 @@ index 0000000..1e6ea84
 +#define PC_CCI_RESET_CMD_MASK   0x0f73f3f7u
 +#define PC_CCI_QUEUE_START      0x008u
 +#define PC_CCI_HALT_REQ         0x034u
++#define PC_CCI_SDA_CTL_1(m)     (0x108u + 0x100u * (m))
 +#define PC_CCI_SDA_CTL_2(m)     (0x10cu + 0x100u * (m))
 +#define PC_CCI_MISC_CTL(m)      (0x110u + 0x100u * (m))
 +#define PC_CCI_READ_DATA(m)     (0x118u + 0x100u * (m))
