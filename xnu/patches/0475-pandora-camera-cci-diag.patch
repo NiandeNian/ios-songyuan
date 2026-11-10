@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..fa419f7
+index 0000000..49ed25a
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1770 @@
+@@ -0,0 +1,1915 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -266,6 +266,7 @@ index 0000000..fa419f7
 +/* Queue word counters, needed by w0/w1/w3 status dumps. */
 +#define PC_CCI_Qn_EXEC_WORD_CNT(m, q) (0x300u + 0x200u * (m) + 0x100u * (q))
 +#define PC_CCI_Qn_CUR_WORD_CNT(m, q)  (0x304u + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_Qn_CUR_CMD(m, q)       (0x308u + 0x200u * (m) + 0x100u * (q))
 +#define PC_CCI_Qn_REPORT_STATUS(m, q) (0x30cu + 0x200u * (m) + 0x100u * (q))
 +#define PC_CCI_Qn_LOAD_DATA(m, q)     (0x310u + 0x200u * (m) + 0x100u * (q))
 +
@@ -1379,6 +1380,150 @@ index 0000000..fa419f7
 +}
 +
 +/* C-2b-w9: sensor power-up + chip-ID (Path A continuation). */
++/*
++ * C-2b-w11: CCI queue diagnostic. Verifies register writes take effect and
++ * tests minimal vs full queues. No power-up, no sensor writes.
++ */
++static void
++pc_w11_queue_diag(void)
++{
++	uint32_t v, cur, exec_cnt, qs_val;
++	unsigned m = 1;
++
++	if (pc_cci[0] == 0) {
++		printf("PANDORA CAMERA: w11 CCI not mapped, skip\n");
++		return;
++	}
++
++	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) | PC_CBCR_ENABLE);
++	if (pc_wait_branch_on("w11", PC_CCI0_CBCR) != 0) {
++		printf("PANDORA CAMERA: w11 branch did NOT come up; abort\n");
++		return;
++	}
++
++	pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++	{
++		uint32_t rst_st = 0;
++		for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++			rst_st = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++			if (rst_st & PC_BIT(24))
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA CAMERA: w11 CCI reset done (status=%#x)\n", rst_st);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, rst_st);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	}
++
++	{
++		static const uint32_t timings[][5] = {
++			{ 78u << 16 | 114u, 28u << 16 | 28u, 10u << 16 | 77u, 118u, 0x161u },
++		};
++		for (unsigned mm = 0; mm < 2; mm++) {
++			pc_wr(pc_cci[0], PC_CCI_SCL_CTL(mm), timings[0][0]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(mm), timings[0][1]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(mm), timings[0][2]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(mm), timings[0][3]);
++			pc_wr(pc_cci[0], PC_CCI_MISC_CTL(mm), timings[0][4]);
++		}
++	}
++	pc_wr(pc_cci[0], PC_CCI_IRQ_MASK_0,
++	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u
++	    | PC_BIT(24) | 0x18000ee6u | 0x60ee6000u);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	printf("PANDORA CAMERA: w11 DIAG timing: SCL=%#x SDA0=%#x MISC=%#x\n",
++	    pc_rd(pc_cci[0], PC_CCI_SCL_CTL(m)),
++	    pc_rd(pc_cci[0], PC_CCI_SDA_CTL_0(m)),
++	    pc_rd(pc_cci[0], PC_CCI_MISC_CTL(m)));
++
++	/* --- Test A: minimal REPORT-only --- */
++	printf("PANDORA CAMERA: w11 TEST A: REPORT-only on M%u\n", m);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++
++	cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++	printf("PANDORA CAMERA: w11 A cur_word_cnt=%u (expect 1)\n", cur);
++	printf("PANDORA CAMERA: w11 A cur_cmd=%#x\n",
++	    pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), cur);
++	exec_cnt = pc_rd(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0));
++	printf("PANDORA CAMERA: w11 A exec_word_cnt readback=%u\n", exec_cnt);
++
++	qs_val = 1u << (m * 2u + 0u);
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, qs_val);
++	printf("PANDORA CAMERA: w11 A QUEUE_START w=%#x rb=%#x\n",
++	    qs_val, pc_rd(pc_cci[0], PC_CCI_QUEUE_START));
++
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w11 A IRQ now=%#x\n", v);
++	pc_sleep(2);
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w11 A IRQ +2ms=%#x cur_cmd=%#x\n",
++	    v, pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
++
++	{
++		int ret = pc_cci_wait_irq(pc_cci[0], 1u << (4u + m * 12u));
++		printf("PANDORA CAMERA: w11 A wait_irq ret=%d\n", ret);
++		if (ret == 0)
++			printf("PANDORA CAMERA: w11 A report_status=%#x\n",
++			    pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, 0)));
++	}
++
++	/* Reset between tests */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++	pc_sleep(1);
++
++	/* --- Test B: SET_PARAM+WRITE+REPORT --- */
++	printf("PANDORA CAMERA: w11 TEST B: SET_PARAM+WRITE+REPORT on M%u\n", m);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_SET_PARAM | (0x20u << 4));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++
++	cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++	printf("PANDORA CAMERA: w11 B cur_word_cnt=%u (expect 3)\n", cur);
++	printf("PANDORA CAMERA: w11 B cur_cmd=%#x\n",
++	    pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), cur);
++	qs_val = 1u << (m * 2u + 0u);
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, qs_val);
++	printf("PANDORA CAMERA: w11 B QUEUE_START w=%#x rb=%#x\n",
++	    qs_val, pc_rd(pc_cci[0], PC_CCI_QUEUE_START));
++
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w11 B IRQ now=%#x\n", v);
++	pc_sleep(2);
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w11 B IRQ +2ms=%#x cur_cmd=%#x\n",
++	    v, pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
++
++	{
++		int ret = pc_cci_wait_irq(pc_cci[0], 1u << (4u + m * 12u));
++		printf("PANDORA CAMERA: w11 B wait_irq ret=%d\n", ret);
++		if (ret == 0)
++			printf("PANDORA CAMERA: w11 B report_status=%#x\n",
++			    pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, 0)));
++	}
++
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) & ~PC_CBCR_ENABLE);
++	printf("PANDORA CAMERA: C-2b-w11 result: queue diag done\n");
++}
++
 +static void
 +pc_w9_power_probe(void)
 +{
@@ -1635,7 +1780,7 @@ index 0000000..fa419f7
 +	 * clk_rcg2_shared_set_rate handshake, then rolls the RCG back. No PLL/RCG M/N
 +	 * register is touched; it does NOT gate the w1 verdict. */
 +	if (gdsc_up && branch_up) {
-+		pc_w9_power_probe();
++		pc_w11_queue_diag();
 +	}
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
