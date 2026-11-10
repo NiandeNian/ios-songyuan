@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..4e62edd
+index 0000000..0f678b4
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
 @@ -0,0 +1,2380 @@
@@ -1759,48 +1759,48 @@ index 0000000..4e62edd
 +		printf("PANDORA CAMERA: w21 MCLK: enable BDISTMCLKCC PLL0 + 24MHz\n");
 +		{
 +			/* PLL0 registers at BDISTM base + 0x0 */
-+			uint32_t pll = pc_bdistm; /* PLL0 offset = 0 */
++			/* w21 FIX: use pc_bdistm directly (vm_offset_t), NOT uint32_t truncation */
 +			/* Dump PLL0 state before */
 +			printf("PANDORA CAMERA: w21 PLL0 BEFORE mode=%#x opmode=%#x state=%#x status=%#x\n",
-+			    pc_rd(pll, 0x00), pc_rd(pll, 0x04), pc_rd(pll, 0x08), pc_rd(pll, 0x0c));
++			    pc_rd(pc_bdistm, 0x00), pc_rd(pc_bdistm, 0x04), pc_rd(pc_bdistm, 0x08), pc_rd(pc_bdistm, 0x0c));
 +
 +			/* Step 1: CONFIG_CTL registers */
-+			pc_wr(pll, 0x20, 0x12000000u);
-+			pc_wr(pll, 0x24, 0x00890263u);
-+			pc_wr(pll, 0x28, 0x1af04237u);
-+			pc_wr(pll, 0x2c, 0x00000000u);
++			pc_wr(pc_bdistm, 0x20, 0x12000000u);
++			pc_wr(pc_bdistm, 0x24, 0x00890263u);
++			pc_wr(pc_bdistm, 0x28, 0x1af04237u);
++			pc_wr(pc_bdistm, 0x2c, 0x00000000u);
 +
 +			/* Step 2: L = 0x32 (VCO = 50 * 19.2 = 960MHz) */
-+			pc_wr(pll, 0x10, 0x32u);
++			pc_wr(pc_bdistm, 0x10, 0x32u);
 +			/* Step 3: ALPHA = 0 */
-+			pc_wr(pll, 0x14, 0x0u);
++			pc_wr(pc_bdistm, 0x14, 0x0u);
 +
 +			/* Step 4: USER_CTL — enable OUT_EVEN (bit 1) */
-+			pc_wr(pll, 0x18, 0x2u);
++			pc_wr(pc_bdistm, 0x18, 0x2u);
 +
 +			/* Step 5: MODE — set PLL_OUTCTRL (bit 0) */
-+			pc_wr(pll, 0x00, 0x1u);
++			pc_wr(pc_bdistm, 0x00, 0x1u);
 +			pc_sleep(1);
 +
 +			/* Step 6: OPMODE — set PLL_RUN (bit 0) */
-+			pc_wr(pll, 0x04, 0x1u);
++			pc_wr(pc_bdistm, 0x04, 0x1u);
 +
 +			/* Step 7: Wait for lock */
 +			{
 +				unsigned li;
 +				for (li = 0; li < 100; li++) {
-+					uint32_t st = pc_rd(pll, 0x0c);
++					uint32_t st = pc_rd(pc_bdistm, 0x0c);
 +					if (st & 0x1u) /* LOCK bit */
 +						break;
 +					pc_sleep(1);
 +				}
 +				printf("PANDORA CAMERA: w21 PLL0 lock wait %u, status=%#x\n",
-+				    li, pc_rd(pll, 0x0c));
++				    li, pc_rd(pc_bdistm, 0x0c));
 +			}
 +			printf("PANDORA CAMERA: w21 PLL0 AFTER  mode=%#x opmode=%#x state=%#x status=%#x\n",
-+			    pc_rd(pll, 0x00), pc_rd(pll, 0x04), pc_rd(pll, 0x08), pc_rd(pll, 0x0c));
++			    pc_rd(pc_bdistm, 0x00), pc_rd(pc_bdistm, 0x04), pc_rd(pc_bdistm, 0x08), pc_rd(pc_bdistm, 0x0c));
 +			printf("PANDORA CAMERA: w21 PLL0 l=%#x alpha=%#x user_ctl=%#x\n",
-+			    pc_rd(pll, 0x10), pc_rd(pll, 0x14), pc_rd(pll, 0x18));
++			    pc_rd(pc_bdistm, 0x10), pc_rd(pc_bdistm, 0x14), pc_rd(pc_bdistm, 0x18));
 +
 +			/* Configure MCLK RCG for 24MHz from PLL0_OUT_EVEN */
 +			/* Integer mode: SRC_SEL=3 (PLL0_OUT_EVEN), SRC_DIV=20 (480/20=24 or 960/20=48) */
