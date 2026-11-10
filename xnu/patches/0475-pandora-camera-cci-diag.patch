@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..49ed25a
+index 0000000..45eb2f7
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1915 @@
+@@ -0,0 +1,2085 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1524,6 +1524,176 @@ index 0000000..49ed25a
 +	printf("PANDORA CAMERA: C-2b-w11 result: queue diag done\n");
 +}
 +
++/*
++ * C-2b-w12: powered CCI queue diagnostic. Power up the sensor first (w9
++ * sequence), then run w11-style queue tests. Also reads I2C SDA/SCL GPIO
++ * pin states before and during the transaction.
++ */
++static void
++pc_w12_powered_diag(void)
++{
++	uint32_t v, cur, qs_val;
++	unsigned m = 1;
++
++	if (pc_cci[0] == 0) {
++		printf("PANDORA CAMERA: w12 CCI not mapped, skip\n");
++		return;
++	}
++
++	/* CCI0 branch on */
++	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) | PC_CBCR_ENABLE);
++	if (pc_wait_branch_on("w12", PC_CCI0_CBCR) != 0) {
++		printf("PANDORA CAMERA: w12 branch did NOT come up; abort\n");
++		return;
++	}
++
++	/* CCI reset + clear */
++	pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++	{
++		uint32_t rst_st = 0;
++		for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++			rst_st = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++			if (rst_st & PC_BIT(24))
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA CAMERA: w12 CCI reset done (status=%#x)\n", rst_st);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, rst_st);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	}
++
++	/* Timing */
++	{
++		static const uint32_t timings[][5] = {
++			{ 78u << 16 | 114u, 28u << 16 | 28u, 10u << 16 | 77u, 118u, 0x161u },
++		};
++		for (unsigned mm = 0; mm < 2; mm++) {
++			pc_wr(pc_cci[0], PC_CCI_SCL_CTL(mm), timings[0][0]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(mm), timings[0][1]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(mm), timings[0][2]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(mm), timings[0][3]);
++			pc_wr(pc_cci[0], PC_CCI_MISC_CTL(mm), timings[0][4]);
++		}
++	}
++	pc_wr(pc_cci[0], PC_CCI_IRQ_MASK_0,
++	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u
++	    | PC_BIT(24) | 0x18000ee6u | 0x60ee6000u);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	/* Power up wide sensor (same as w9) */
++	printf("PANDORA CAMERA: w12 RPMh: L5M_E1 1200mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
++	pandora_rpmh_resource("L5M_E1", 0, 1200);
++	pandora_rpmh_resource("L5M_E1", 4, 1);
++	pandora_rpmh_resource("B1B_E0", 0, 3400);
++	pandora_rpmh_resource("B1B_E0", 4, 1);
++	pandora_rpmh_resource("B2B_E0", 0, 2704);
++	pandora_rpmh_resource("B2B_E0", 4, 1);
++	pc_sleep(1);
++
++	printf("PANDORA CAMERA: w12 GPIO: 107=high (wide pwr), 116=high (afvdd)\n");
++	pc_gpio_set(107, 0, 0, 2, 1);
++	pc_gpio_set(116, 0, 0, 2, 1);
++	pc_sleep(1);
++
++	printf("PANDORA CAMERA: w12 GPIO 106=low (reset assert)\n");
++	pc_gpio_set(106, 0, 0, 2, 0);
++	pc_sleep(10);
++
++	printf("PANDORA CAMERA: w12 GPIO 89=cam_mclk (func=1, 8mA)\n");
++	pc_gpio_set(89, 1, 0, 8, -1);
++	pc_sleep(5);
++
++	/* Read I2C SDA/SCL pin state via TLMM GPIO config+in */
++	/* CCI0 I2C pins: SDA=gpio5, SCL=gpio4 (from vendor DT) */
++	printf("PANDORA CAMERA: w12 I2C pin state (before xfer):\n");
++	printf("PANDORA CAMERA: w12   gpio5 SDA cfg=%#x in=%#x\n",
++	    pc_rd(pc_tlmm, 0x0005u * 0x1000u), pc_rd(pc_tlmm, 0x0005u * 0x1000u + 0x004u));
++	printf("PANDORA CAMERA: w12   gpio4 SCL cfg=%#x in=%#x\n",
++	    pc_rd(pc_tlmm, 0x0004u * 0x1000u), pc_rd(pc_tlmm, 0x0004u * 0x1000u + 0x004u));
++
++	/* Test A: REPORT-only (verify engine works with power) */
++	printf("PANDORA CAMERA: w12 TEST A: REPORT-only on M%u (powered)\n", m);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++	cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++	printf("PANDORA CAMERA: w12 A cur_word_cnt=%u\n", cur);
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), cur);
++	qs_val = 1u << (m * 2u + 0u);
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, qs_val);
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w12 A IRQ now=%#x\n", v);
++	{
++		int ret = pc_cci_wait_irq(pc_cci[0], 1u << (4u + m * 12u));
++		printf("PANDORA CAMERA: w12 A wait_irq ret=%d\n", ret);
++	}
++
++	/* Reset between tests */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++	pc_sleep(1);
++
++	/* Test B: full SET_PARAM+WRITE+REPORT (powered) */
++	printf("PANDORA CAMERA: w12 TEST B: SET_PARAM+WRITE+REPORT on M%u (powered)\n", m);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_SET_PARAM | (0x20u << 4));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++
++	cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++	printf("PANDORA CAMERA: w12 B cur_word_cnt=%u\n", cur);
++
++	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), cur);
++	qs_val = 1u << (m * 2u + 0u);
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, qs_val);
++
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w12 B IRQ now=%#x\n", v);
++	pc_sleep(2);
++	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	printf("PANDORA CAMERA: w12 B IRQ +2ms=%#x cur_cmd=%#x\n",
++	    v, pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
++
++	/* Read I2C pins during transfer */
++	printf("PANDORA CAMERA: w12 I2C pin state (during xfer):\n");
++	printf("PANDORA CAMERA: w12   gpio5 SDA in=%#x\n",
++	    pc_rd(pc_tlmm, 0x0005u * 0x1000u + 0x004u));
++	printf("PANDORA CAMERA: w12   gpio4 SCL in=%#x\n",
++	    pc_rd(pc_tlmm, 0x0004u * 0x1000u + 0x004u));
++
++	{
++		int ret = pc_cci_wait_irq(pc_cci[0], 1u << (4u + m * 12u));
++		printf("PANDORA CAMERA: w12 B wait_irq ret=%d status=%#x\n",
++		    ret, pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0));
++		if (ret == 0)
++			printf("PANDORA CAMERA: w12 B report_status=%#x\n",
++			    pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, 0)));
++	}
++
++	/* Rollback */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	printf("PANDORA CAMERA: w12 rollback: MCLK off -> reset high -> GPIO off -> RPMh off\n");
++	pc_gpio_set(89, 0, 0, 2, -1);
++	pc_gpio_set(106, 0, 0, 2, 1);
++	pc_gpio_set(107, 0, 0, 2, 0);
++	pc_gpio_set(116, 0, 0, 2, 0);
++	pandora_rpmh_resource("L5M_E1", 4, 0);
++	pandora_rpmh_resource("B1B_E0", 4, 0);
++	pandora_rpmh_resource("B2B_E0", 4, 0);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) & ~PC_CBCR_ENABLE);
++	printf("PANDORA CAMERA: C-2b-w12 result: powered diag done\n");
++}
++
 +static void
 +pc_w9_power_probe(void)
 +{
@@ -1780,7 +1950,7 @@ index 0000000..49ed25a
 +	 * clk_rcg2_shared_set_rate handshake, then rolls the RCG back. No PLL/RCG M/N
 +	 * register is touched; it does NOT gate the w1 verdict. */
 +	if (gdsc_up && branch_up) {
-+		pc_w11_queue_diag();
++		pc_w12_powered_diag();
 +	}
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
