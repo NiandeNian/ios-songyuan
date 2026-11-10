@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..cf79a24
+index 0000000..e782a8f
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2416 @@
+@@ -0,0 +1,2514 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1379,6 +1379,94 @@ index 0000000..cf79a24
 +	pc_wr(pc_tlmm, PC_GPIO(n), ctl);
 +}
 +
++/* C-2b-w23: bit-bang I2C on the TLMM pads, bypassing the CCI controller.
++ * Ten rounds of register-level fixes (reset, pinmux, timing, MCLK, voltages,
++ * PLL0, tele GPIOs) all took effect but the controller still reports NACK on
++ * every address. NACK only means "no device drove SDA low on the 9th clock".
++ * So drive SDA/SCL as open-drain GPIOs and look for an ACK directly on the
++ * wire: if a slave ACKs here the fault is CCI configuration; if none does,
++ * the fault is sensor power / clock / pin mapping (or the pads are not the
++ * ones the sensor is wired to). Read-only towards the sensor: address byte
++ * plus STOP, no register writes. */
++static void
++pc_bb_set(unsigned n, int high)
++{
++	/* high = release the pad (input + internal pull-up); low = drive 0 */
++	if (high)
++		pc_gpio_set(n, 0, 3, 2, -1); /* func=0 GPIO, no OE, pull-up */
++	else
++		pc_gpio_set(n, 0, 0, 2, 0);  /* func=0 GPIO, OE, output low */
++}
++
++static unsigned
++pc_bb_scan(unsigned sda, unsigned scl, const char *tag)
++{
++	unsigned hits = 0;
++	uint32_t in;
++
++	pc_bb_set(sda, 1);
++	pc_bb_set(scl, 1);
++	pc_sleep(2);
++	printf("PANDORA CAMERA: w23 BITBANG %s idle SDA=%#x SCL=%#x\n", tag,
++	    pc_rd(pc_tlmm, PC_GPIO(sda) + 4), pc_rd(pc_tlmm, PC_GPIO(scl) + 4));
++
++	/* prove the pads are really under our control before scanning */
++	pc_bb_set(sda, 0);
++	pc_sleep(1);
++	in = pc_rd(pc_tlmm, PC_GPIO(sda) + 4);
++	pc_bb_set(sda, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: w23 BITBANG %s drive-test: SDA low in=%#x, "
++	    "released in=%#x (expect 0 then 1)\n", tag, in,
++	    pc_rd(pc_tlmm, PC_GPIO(sda) + 4));
++
++	for (unsigned a = 0x08u; a <= 0x77u; a++) {
++		uint8_t byte = (uint8_t)(a << 1); /* write direction */
++		uint32_t ack_bit;
++
++		/* START: SDA falls while SCL is high */
++		pc_bb_set(sda, 0);
++		pc_sleep(1);
++		pc_bb_set(scl, 0);
++		pc_sleep(1);
++
++		for (int i = 7; i >= 0; i--) {
++			pc_bb_set(sda, (byte >> i) & 1u);
++			pc_sleep(1);
++			pc_bb_set(scl, 1);
++			pc_sleep(1);
++			pc_bb_set(scl, 0);
++			pc_sleep(1);
++		}
++
++		/* 9th clock: sample SDA. Low = some slave ACKed. */
++		pc_bb_set(sda, 1);
++		pc_sleep(1);
++		pc_bb_set(scl, 1);
++		pc_sleep(1);
++		ack_bit = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
++		pc_bb_set(scl, 0);
++		pc_sleep(1);
++
++		/* STOP */
++		pc_bb_set(sda, 0);
++		pc_sleep(1);
++		pc_bb_set(scl, 1);
++		pc_sleep(1);
++		pc_bb_set(sda, 1);
++		pc_sleep(1);
++
++		if (ack_bit == 0) {
++			printf("PANDORA CAMERA: w23 BITBANG %s addr=%#x -> ACK (device on bus!)\n",
++			    tag, a);
++			hits++;
++		}
++	}
++	printf("PANDORA CAMERA: w23 BITBANG %s done: %u ACK hits in 0x08..0x77\n",
++	    tag, hits);
++	return hits;
++}
++
 +/* C-2b-w9: sensor power-up + chip-ID (Path A continuation). */
 +/*
 + * C-2b-w11: CCI queue diagnostic. Verifies register writes take effect and
@@ -2002,6 +2090,16 @@ index 0000000..cf79a24
 +			}
 +		}
 +	}
++
++	/* 7b. w23 decisive diagnostic: bypass the CCI controller entirely.
++	 * Disable the CCI0 branch so it stops driving the pads, then bit-bang
++	 * the two known CCI0 masters (M1=111/112 wide, M0=109/110 tele) while
++	 * both sensors are still powered and clocked. */
++	printf("PANDORA CAMERA: w23: disabling CCI0 branch for GPIO bit-bang\n");
++	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) & ~PC_CBCR_ENABLE);
++	pc_sleep(5);
++	(void)pc_bb_scan(111, 112, "CCI0_M1(wide 111/112)");
++	(void)pc_bb_scan(109, 110, "CCI0_M0(tele 109/110)");
 +
 +	/* 8. Rollback: restore pinmux, power off */
 +	printf("PANDORA CAMERA: w13 rollback: restore pinmux -> MCLK off -> reset high -> GPIO off -> RPMh off\n");
