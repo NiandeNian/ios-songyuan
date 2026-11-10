@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..e782a8f
+index 0000000..8227e4c
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2514 @@
+@@ -0,0 +1,2552 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1398,73 +1398,100 @@ index 0000000..e782a8f
 +		pc_gpio_set(n, 0, 0, 2, 0);  /* func=0 GPIO, OE, output low */
 +}
 +
-+static unsigned
-+pc_bb_scan(unsigned sda, unsigned scl, const char *tag)
++/* C-2b-w24: verify whether w23's scattered ACKs are real devices.
++ * w23 saw 10 ACKs but they included reserved address 0x0c, the DT sensor
++ * addresses (0x20 wide / 0x5a tele) were absent, and 0x10 ACKed under GPIO
++ * while the CCI controller reported NACK for the same address. Decide with:
++ *   (1) a no-START control: release SDA, toggle SCL 9x, SDA must stay high;
++ *   (2) pre/post sampling around the 9th SCL rising edge -- a real slave
++ *       drives SDA low only after the clock edge (pre=1, post=0), whereas a
++ *       slow pull-up shows pre=0 already;
++ *   (3) three full sweeps: a real device ACKs at the same address every time.
++ * Longer settle times than w23 (3 ms) to rule out rise-time artifacts. */
++static void
++pc_bb_probe(unsigned sda, unsigned scl, const char *tag,
++    const uint8_t *addrs, unsigned naddrs)
 +{
-+	unsigned hits = 0;
-+	uint32_t in;
++	unsigned round;
 +
 +	pc_bb_set(sda, 1);
 +	pc_bb_set(scl, 1);
-+	pc_sleep(2);
-+	printf("PANDORA CAMERA: w23 BITBANG %s idle SDA=%#x SCL=%#x\n", tag,
++	pc_sleep(5);
++	printf("PANDORA CAMERA: w24 %s idle SDA=%#x SCL=%#x\n", tag,
 +	    pc_rd(pc_tlmm, PC_GPIO(sda) + 4), pc_rd(pc_tlmm, PC_GPIO(scl) + 4));
 +
-+	/* prove the pads are really under our control before scanning */
-+	pc_bb_set(sda, 0);
-+	pc_sleep(1);
-+	in = pc_rd(pc_tlmm, PC_GPIO(sda) + 4);
-+	pc_bb_set(sda, 1);
-+	pc_sleep(1);
-+	printf("PANDORA CAMERA: w23 BITBANG %s drive-test: SDA low in=%#x, "
-+	    "released in=%#x (expect 0 then 1)\n", tag, in,
-+	    pc_rd(pc_tlmm, PC_GPIO(sda) + 4));
-+
-+	for (unsigned a = 0x08u; a <= 0x77u; a++) {
-+		uint8_t byte = (uint8_t)(a << 1); /* write direction */
-+		uint32_t ack_bit;
-+
-+		/* START: SDA falls while SCL is high */
-+		pc_bb_set(sda, 0);
-+		pc_sleep(1);
-+		pc_bb_set(scl, 0);
-+		pc_sleep(1);
-+
-+		for (int i = 7; i >= 0; i--) {
-+			pc_bb_set(sda, (byte >> i) & 1u);
-+			pc_sleep(1);
-+			pc_bb_set(scl, 1);
-+			pc_sleep(1);
++	/* Control A: no START, no address, SDA released for 9 clocks.
++	 * SDA must stay high the whole time. Any low here means the bus is
++	 * floating / weakly pulled and every following "ACK" is bogus. */
++	{
++		unsigned lows = 0;
++		for (unsigned i = 0; i < 9; i++) {
 +			pc_bb_set(scl, 0);
-+			pc_sleep(1);
++			pc_sleep(3);
++			pc_bb_set(scl, 1);
++			pc_sleep(3);
++			if ((pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u) == 0)
++				lows++;
 +		}
-+
-+		/* 9th clock: sample SDA. Low = some slave ACKed. */
-+		pc_bb_set(sda, 1);
-+		pc_sleep(1);
-+		pc_bb_set(scl, 1);
-+		pc_sleep(1);
-+		ack_bit = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
 +		pc_bb_set(scl, 0);
-+		pc_sleep(1);
-+
-+		/* STOP */
-+		pc_bb_set(sda, 0);
-+		pc_sleep(1);
-+		pc_bb_set(scl, 1);
-+		pc_sleep(1);
-+		pc_bb_set(sda, 1);
-+		pc_sleep(1);
-+
-+		if (ack_bit == 0) {
-+			printf("PANDORA CAMERA: w23 BITBANG %s addr=%#x -> ACK (device on bus!)\n",
-+			    tag, a);
-+			hits++;
-+		}
++		pc_sleep(3);
++		printf("PANDORA CAMERA: w24 %s CONTROL(no START): %u/9 low samples "
++		    "(expect 0)\n", tag, lows);
 +	}
-+	printf("PANDORA CAMERA: w23 BITBANG %s done: %u ACK hits in 0x08..0x77\n",
-+	    tag, hits);
-+	return hits;
++
++	for (round = 0; round < 3; round++) {
++		unsigned hits = 0, pre_low = 0;
++		for (unsigned ai = 0; ai < naddrs; ai++) {
++			unsigned a = addrs[ai];
++			uint8_t byte = (uint8_t)(a << 1); /* write direction */
++			uint32_t pre, post;
++
++			/* START: SDA falls while SCL is high */
++			pc_bb_set(sda, 0);
++			pc_sleep(3);
++			pc_bb_set(scl, 0);
++			pc_sleep(3);
++
++			for (int i = 7; i >= 0; i--) {
++				pc_bb_set(sda, (byte >> i) & 1u);
++				pc_sleep(3);
++				pc_bb_set(scl, 1);
++				pc_sleep(3);
++				pc_bb_set(scl, 0);
++				pc_sleep(3);
++			}
++
++			/* 9th clock: release SDA, let the pull-up settle, then
++			 * sample before and after the SCL rising edge. */
++			pc_bb_set(sda, 1);
++			pc_sleep(3);
++			pre = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
++			pc_bb_set(scl, 1);
++			pc_sleep(3);
++			post = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
++			pc_bb_set(scl, 0);
++			pc_sleep(3);
++
++			/* STOP */
++			pc_bb_set(sda, 0);
++			pc_sleep(3);
++			pc_bb_set(scl, 1);
++			pc_sleep(3);
++			pc_bb_set(sda, 1);
++			pc_sleep(3);
++
++			if (pre == 0)
++				pre_low++;
++			if (post == 0) {
++				hits++;
++				printf("PANDORA CAMERA: w24 %s r%u addr=%#x post=0 "
++				    "pre=%u %s\n", tag, round, a, pre,
++				    pre == 1 ? "REAL_ACK" : "PULLUP_FAIL");
++			}
++		}
++		printf("PANDORA CAMERA: w24 %s round %u done: %u post=0 hits, "
++		    "%u pre=0 (pull-up failures)\n", tag, round, hits, pre_low);
++	}
 +}
 +
 +/* C-2b-w9: sensor power-up + chip-ID (Path A continuation). */
@@ -2091,15 +2118,26 @@ index 0000000..e782a8f
 +		}
 +	}
 +
-+	/* 7b. w23 decisive diagnostic: bypass the CCI controller entirely.
-+	 * Disable the CCI0 branch so it stops driving the pads, then bit-bang
-+	 * the two known CCI0 masters (M1=111/112 wide, M0=109/110 tele) while
-+	 * both sensors are still powered and clocked. */
-+	printf("PANDORA CAMERA: w23: disabling CCI0 branch for GPIO bit-bang\n");
++	/* 7b. w24: verify w23's scattered ACKs are real devices (3 rounds +
++	 * pre/post sampling + no-START control). Both sensors still powered. */
++	printf("PANDORA CAMERA: w24: disabling CCI0 branch for GPIO bit-bang\n");
 +	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) & ~PC_CBCR_ENABLE);
 +	pc_sleep(5);
-+	(void)pc_bb_scan(111, 112, "CCI0_M1(wide 111/112)");
-+	(void)pc_bb_scan(109, 110, "CCI0_M0(tele 109/110)");
++	/* w23 hits on each bus + DT sensor addresses + low/high controls.
++	 * Deliberately small: a full 0x08..0x77 sweep x 3 rounds at 3 ms per
++	 * edge would stall early boot for ~60 s and risk the watchdog. */
++	static const uint8_t m1_addrs[] = {
++		0x0cu, 0x10u, 0x20u, 0x21u, 0x51u, 0x59u, /* w23 M1 hits + DT wide */
++		0x08u, 0x77u,                              /* controls */
++	};
++	static const uint8_t m0_addrs[] = {
++		0x2du, 0x33u, 0x54u, 0x59u, 0x5cu, 0x5au, /* w23 M0 hits + DT tele */
++		0x08u, 0x77u,                              /* controls */
++	};
++	pc_bb_probe(111, 112, "CCI0_M1(wide 111/112)", m1_addrs,
++	    sizeof(m1_addrs) / sizeof(m1_addrs[0]));
++	pc_bb_probe(109, 110, "CCI0_M0(tele 109/110)", m0_addrs,
++	    sizeof(m0_addrs) / sizeof(m0_addrs[0]));
 +
 +	/* 8. Rollback: restore pinmux, power off */
 +	printf("PANDORA CAMERA: w13 rollback: restore pinmux -> MCLK off -> reset high -> GPIO off -> RPMh off\n");
