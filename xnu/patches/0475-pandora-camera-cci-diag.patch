@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..cdc0d99
+index 0000000..e0b2bc4
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1054 @@
+@@ -0,0 +1,1071 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -303,6 +303,7 @@ index 0000000..cdc0d99
 +#define PC_CFG_MODE_MASK       0x00003000u
 +#define PC_CFG_HW_CLK_CTRL     0x00100000u
 +#define PC_CMD_UPDATE          0x00000001u
++#define PC_CMD_ROOT_EN         0x00000002u
 +
 +
 +/* Bounded polls: pc_sleep() is millisecond-granular, so 20 x 1 ms is a
@@ -713,7 +714,11 @@ index 0000000..cdc0d99
 +	    (unsigned)(cfg_before & PC_CFG_SRC_DIV_MASK),
 +	    (cfg_before & PC_CFG_HW_CLK_CTRL) ? "yes" : "no");
 +
-+	/* 2. force-enable root + branch on (HW_CLK_CTRL un-parks root). */
++	/* 2. branch on (running clock to observe), then FORCE-ENABLE root via
++	 *    CMD_ROOT_EN. HW_CLK_CTRL branch-on alone un-parks the root (clock
++	 *    runs) but does NOT make CMD_UPDATE latch -- the RCG needs CMD_ROOT_EN
++	 *    set, exactly like Linux clk_rcg2_shared_set_rate's clk_rcg2_set_force_enable.
++	 *    Without it CMD_UPDATE times out and the new source is never applied. */
 +	pc_step("w5 CCI0 branch", PC_CAMCC_PA + PC_CCI0_CBCR);
 +	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before | PC_CBCR_ENABLE);
 +	if (pc_wait_branch_on("w5", PC_CCI0_CBCR) != 0) {
@@ -722,10 +727,19 @@ index 0000000..cdc0d99
 +		pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
 +		return;
 +	}
-+	printf("PANDORA CAMERA: C-2b-w5 root after branch-on cmd_rcgr=%#x root_off=%s "
-+	    "(HW_CLK_CTRL un-parked root)\n",
-+	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR),
-+	    (pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_ROOT_OFF) ? "yes" : "no");
++	pc_step("w5 force-enable root", PC_CAMCC_PA + PC_CCI0_CMD_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_ROOT_EN);
++	bool root_on = false;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_ROOT_OFF)) {
++			root_on = true;
++			break;
++		}
++		pc_sleep(1);
++	}
++	printf("PANDORA CAMERA: C-2b-w5 root force-enabled=%s cmd_rcgr=%#x\n",
++	    root_on ? "yes" : "NO", pc_rd(pc_camcc, PC_CCI0_CMD_RCGR));
 +
 +	/* 3. compute new CFG_RCGR: SRC_SEL=2, SRC_DIV=16, keep HW_CLK_CTRL, MODE=0. */
 +	cfg_new = (cfg_before &
@@ -750,22 +764,28 @@ index 0000000..cdc0d99
 +	}
 +	printf("PANDORA CAMERA: C-2b-w5 update_config ret=%d\n", upd_ret);
 +
-+	/* 5. read back after. */
++	/* 5. read back after. SWITCHED requires BOTH the new SRC_SEL in CFG_RCGR AND
++	 *    the hardware having ACKed CMD_UPDATE (cmd_update_clear). A register write
++	 *    alone is NOT proof -- if CMD_UPDATE is still set the RCG never latched
++	 *    the new source. */
 +	cmd_after  = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
 +	cfg_after  = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
 +	cbcr_after = pc_rd(pc_camcc, PC_CCI0_CBCR);
-+	switched = ((cfg_after & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT) == 2u;
++	bool update_acked = !(cmd_after & PC_CMD_UPDATE);
++	switched = (((cfg_after & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT) == 2u)
++	    && update_acked;
 +	printf("PANDORA CAMERA: C-2b-w5 after: cbcr=%#x cmd_rcgr=%#x cfg_rcgr=%#x "
-+	    "src_sel=%u src_div=%u clk_off=%s cmd_update_clear=%s -> %s\n",
++	    "src_sel=%u src_div=%u clk_off=%s update_acked=%s -> %s\n",
 +	    cbcr_after, cmd_after, cfg_after,
 +	    (unsigned)((cfg_after & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT),
 +	    (unsigned)(cfg_after & PC_CFG_SRC_DIV_MASK),
 +	    (cbcr_after & PC_CBCR_CLK_OFF) ? "yes" : "no",
-+	    (cmd_after & PC_CMD_UPDATE) ? "no" : "yes",
++	    update_acked ? "yes" : "no",
 +	    switched ? "SWITCHED" : "NOT SWITCHED");
 +	pc_w3_controller("w5-switched");
 +
-+	/* 6. roll back in reverse: restore CFG, CMD_UPDATE+poll, branch off. */
++	/* 6. roll back in reverse: restore CFG, CMD_UPDATE+poll, CLEAR force-enable,
++	 *    branch off -> HW_CLK_CTRL re-parks the root. */
 +	pc_step("w5 rollback", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
 +	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_before);
 +	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
@@ -778,7 +798,10 @@ index 0000000..cdc0d99
 +		pc_sleep(1);
 +		rb_upd_ret = ETIMEDOUT;
 +	}
-+	/* branch off -> HW_CLK_CTRL re-parks the root (w3 proved this). */
++	/* clear force-enable (CMD_ROOT_EN), then branch off. Without clearing
++	 * CMD_ROOT_EN the root would stay force-enabled after the probe. */
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & ~PC_CMD_ROOT_EN);
 +	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
 +	cmd_restored = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
 +	cfg_restored = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
@@ -797,16 +820,10 @@ index 0000000..cdc0d99
 +		                   : "PARTIAL (switch ok, rollback incomplete)");
 +	} else {
 +		printf("PANDORA CAMERA: C-2b-w5 result: source NOT switched; "
-+		    "rollback=%s\n", restored_clean ? "CLEAN" : "LEFTOVER");
++		    "update_acked=%s rollback=%s\n",
++		    update_acked ? "yes" : "no", restored_clean ? "CLEAN" : "LEFTOVER");
 +	}
 +}
-+
-+/* C-2b-w1: the first MMIO write in this file. It enables TITAN_TOP GDSC and
-+ * two AHB branches, proves each with a bounded status poll, prints the A/B
-+ * values, then restores all three registers in reverse order. It does not
-+ * vote a rail, touch a GPIO, write an RCG, enable a CCI branch or issue an
-+ * I2C transaction. Every failure is printed as a failure and still rolls
-+ * back; a missing status bit is never turned into success. */
 +static void
 +pc_w1_bringup(void)
 +{
