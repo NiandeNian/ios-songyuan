@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..ea5ddff
+index 0000000..5a98326
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2865 @@
+@@ -0,0 +1,2878 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1507,7 +1507,7 @@ index 0000000..ea5ddff
 + * gated; here we enable the PLL first. CMD_UPDATE timeout rolls CFG back and
 + * continues on XO instead of aborting.
 + */
-+static void
++static int
 +pc_cci_clk_37mhz(void)
 +{
 +	uint32_t cfg0, cmd, st, mode0, opmode0;
@@ -1554,7 +1554,7 @@ index 0000000..ea5ddff
 +		pc_wr(pc_camcc, 0x04, opmode0);
 +		printf("PANDORA CAMERA: w28 PLL0 NOT LOCKED -> restored mode=%#x opmode=%#x, skip RCG switch\n",
 +		    mode0, opmode0);
-+		return;
++		return 0;
 +	}
 +
 +	/* SRC_SEL=2 (PLL0_OUT_EVEN), SRC_DIV=16, HW_CLK_CTRL BIT(20) */
@@ -1573,6 +1573,7 @@ index 0000000..ea5ddff
 +		pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg0);
 +	pc_wr(pc_camcc, PC_CCI0_CBCR,
 +	    pc_rd(pc_camcc, PC_CCI0_CBCR) | PC_CBCR_ENABLE);
++	return (cmd & 0x1u) ? 0 : 1; /* 1 = CCI core is now 37.5 MHz */
 +}
 +
 +/* C-2b-w25: trace the physical pads while the CCI controller runs a
@@ -2096,6 +2097,7 @@ index 0000000..ea5ddff
 +{
 +	uint32_t v, cur, ctl;
 +	unsigned m = 1; /* CCI0 M1 = wide, slave 0x20 */
++	int clk37 = 0;  /* set by pc_cci_clk_37mhz(); selects the timing table */
 +	static const uint8_t cci0_m0[] = {109, 110}; /* SDA, SCL */
 +	static const uint8_t cci0_m1[] = {111, 112}; /* SDA, SCL */
 +
@@ -2246,8 +2248,9 @@ index 0000000..ea5ddff
 +		pc_sleep(50);
 +	}
 +
-+	/* w28: align CCI core clock with the working Android config. */
-+	pc_cci_clk_37mhz();
++	/* w28c: align CCI core clock AND the I2C timing with the working
++	 * Android configuration (both must match or SCL/tsu/thd go wrong). */
++	clk37 = pc_cci_clk_37mhz();
 +
 +	/* 4. PINMUX FIX: configure CCI0 I2C pins to CCI I2C function */
 +	/* TLMM layout: bits[1:0]=pull, bits[5:2]=func, bits[7:6]=drv, bit[9]=oe */
@@ -2272,18 +2275,28 @@ index 0000000..ea5ddff
 +		    pc_rd(pc_tlmm, PC_GPIO(cci0_m1[i])));
 +	}
 +
-+	/* 5. CCI timing (19.2 MHz Standard) */
++	/* 5. CCI timing: MUST match the core clock actually running.
++	 * Upstream hw_params[19.2MHz][STD] vs hw_params[37.5MHz][STD].
++	 * DT has no clock-frequency property -> I2C_MODE_STANDARD. */
 +	{
-+		static const uint32_t timings[][5] = {
++		static const uint32_t tim_19m[][5] = {
 +			{ 78u << 16 | 114u, 28u << 16 | 28u, 10u << 16 | 77u, 118u, 0x161u },
 +		};
++		static const uint32_t tim_37m[][5] = {
++			{ 201u << 16 | 174u, 204u << 16 | 231u, 22u << 16 | 162u, 227u, 0x163u },
++		};
++		const uint32_t (*t)[5] = clk37 ? tim_37m : tim_19m;
 +		for (unsigned mm = 0; mm < 2; mm++) {
-+			pc_wr(pc_cci[0], PC_CCI_SCL_CTL(mm), timings[0][0]);
-+			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(mm), timings[0][1]);
-+			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(mm), timings[0][2]);
-+			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(mm), timings[0][3]);
-+			pc_wr(pc_cci[0], PC_CCI_MISC_CTL(mm), timings[0][4]);
++			pc_wr(pc_cci[0], PC_CCI_SCL_CTL(mm), t[0][0]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(mm), t[0][1]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(mm), t[0][2]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(mm), t[0][3]);
++			pc_wr(pc_cci[0], PC_CCI_MISC_CTL(mm), t[0][4]);
 +		}
++		printf("PANDORA CAMERA: w28c timing %s: scl=%#x sda0=%#x sda1=%#x "
++		    "sda2=%#x misc=%#x\n",
++		    clk37 ? "37.5MHz STD" : "19.2MHz STD",
++		    t[0][0], t[0][1], t[0][2], t[0][3], t[0][4]);
 +	}
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_MASK_0,
 +	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u
