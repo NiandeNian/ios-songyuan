@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..22ea465
+index 0000000..820799e
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
 @@ -0,0 +1,2322 @@
@@ -1747,8 +1747,8 @@ index 0000000..22ea465
 +		printf("PANDORA CAMERA: w13 RPMh: L5M_E1 1200mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
 +
 +		/* GPIO power enables */
-+		pc_gpio_set(107, 1, 0, 8, 1); /* wide pwr */
-+		pc_gpio_set(116, 1, 0, 8, 1); /* afvdd */
++		pc_gpio_set(107, 0, 0, 8, 1); /* wide pwr, func=0 GPIO */
++		pc_gpio_set(116, 0, 0, 8, 1); /* afvdd, func=0 GPIO */
 +		printf("PANDORA CAMERA: w13 GPIO: 107=high (wide pwr), 116=high (afvdd)\n");
 +
 +		/* Reset assert */
