@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..e0b2bc4
+index 0000000..15b82f6
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1071 @@
+@@ -0,0 +1,1286 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -89,6 +89,11 @@ index 0000000..e0b2bc4
 + *       CFG_RCGR (SRC_SEL=2 + SRC_DIV=16, HW_CLK_CTRL kept) and CMD_RCGR
 + *       CMD_UPDATE, polls, then rolls the RCG back in reverse and re-parks the
 + *       root. It still writes no PLL, no RCG M/N, no rail/GPIO/CCI transaction.
++ *     - C-2b-w6 diagnoses w5's CMD_UPDATE non-ack. It writes the same CCI0
++ *       RCG registers (CFG_RCGR / CMD_RCGR / CBCR) to test four hypotheses
++ *       (explicit CMD_UPDATE clear, CMD_UPDATE without HW_CLK_CTRL, branch
++ *       off->on reload, PLL0 output-enable dump) and rolls back in reverse.
++ *       It still writes no PLL, no RCG M/N, no rail/GPIO/CCI transaction.
 + *   Mode 2 is identical to mode 1 for now: per-sensor address + power
 + *   bring-up is gated on vendor data the board DT does not carry. Do not
 + *   "extend" this driver further without filling those unknowns first.
@@ -690,7 +695,7 @@ index 0000000..e0b2bc4
 + * No PLL register, RCG M/N, rail, GPIO or CCI queue word is touched. Every
 + * failure is printed and still rolls back; a missing status bit is never
 + * turned into success. */
-+static void
++static void __unused
 +pc_w5_rcg_switch(void)
 +{
 +	uint32_t cbcr_before, cmd_before, cfg_before;
@@ -824,6 +829,216 @@ index 0000000..e0b2bc4
 +		    update_acked ? "yes" : "no", restored_clean ? "CLEAN" : "LEFTOVER");
 +	}
 +}
++
++/* C-2b-w6: diagnose the CMD_UPDATE non-ack seen in w5 (update_config ret=60,
++ * ETIMEDOUT). Four hypotheses, one boot, CCI0 RCG registers only -- no PLL,
++ * no RCG M/N/D, no rail/GPIO/CCI transaction:
++ *
++ *   Phase A: reproduce w5 exactly (branch-on + CMD_ROOT_EN force-enable +
++ *            write CFG_RCGR SRC_SEL=2/SRC_DIV=16/HW_CLK_CTRL + CMD_UPDATE).
++ *   Phase B (H2): if CMD_UPDATE is stuck, write 0 explicitly to clear it.
++ *            Does the bit clear, or is it frozen hardware state?
++ *   Phase C (H5): CMD_UPDATE again with CFG_HW_CLK_CTRL cleared. Is the
++ *            update refused *because* bit 20 is set?
++ *   Phase D (H1/H4): restore HW_CLK_CTRL CFG, then branch off->on. Does the
++ *            mux reload without CMD_UPDATE? Then retry CMD_UPDATE once more
++ *            (maybe the reload unblocks it).
++ *   Phase E (H3): read-only PLL0 dump (USER_CTL/USER_CTL_U/STATE/STATUS) --
++ *            is PLL0_OUT_EVEN output gated even though the PLL is running?
++ *   Phase F: rollback. Restore CFG, CMD_UPDATE + poll, explicit 0-clear if
++ *            frozen, clear CMD_ROOT_EN, branch off -> HW_CLK_CTRL re-parks
++ *            the root. CLEAN = ROOT_OFF set + CMD_UPDATE/CMD_ROOT_EN clear +
++ *            CFG restored (this is the state w3 checks as 0x80000000).
++ */
++static void
++pc_w6_update_diag(void)
++{
++	uint32_t cbcr_before, cmd_before, cfg_before;
++	uint32_t cfg_new, v;
++	bool update_acked = false;
++	bool h2_clear_worked = false;
++	bool h5_acked = false;
++	bool h1_clock_ran = false;
++	bool h1d2_acked = false;
++	int upd_ret;
++
++	if (!pc_camcc) {
++		printf("PANDORA CAMERA: C-2b-w6 skipped (camcc unmapped)\n");
++		return;
++	}
++	cbcr_before = pc_rd(pc_camcc, PC_CCI0_CBCR);
++	cmd_before  = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_before  = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	printf("PANDORA CAMERA: C-2b-w6 diag before: cbcr=%#x cmd_rcgr=%#x "
++	    "cfg_rcgr=%#x root_off=%s src_sel=%u src_div=%u hw_clk_ctrl=%s\n",
++	    cbcr_before, cmd_before, cfg_before,
++	    (cmd_before & PC_CMD_ROOT_OFF) ? "yes" : "no",
++	    (unsigned)((cfg_before & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT),
++	    (unsigned)(cfg_before & PC_CFG_SRC_DIV_MASK),
++	    (cfg_before & PC_CFG_HW_CLK_CTRL) ? "yes" : "no");
++
++	cfg_new = (cfg_before &
++	    ~(PC_CFG_SRC_SEL_MASK | PC_CFG_SRC_DIV_MASK | PC_CFG_MODE_MASK |
++	      PC_CFG_HW_CLK_CTRL)) |
++	    (2u << PC_CFG_SRC_SEL_SHIFT) | (16u << 0) | PC_CFG_HW_CLK_CTRL;
++
++	/* Phase A: reproduce w5. */
++	pc_step("w6 branch on", PC_CAMCC_PA + PC_CCI0_CBCR);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before | PC_CBCR_ENABLE);
++	if (pc_wait_branch_on("w6", PC_CCI0_CBCR) != 0) {
++		printf("PANDORA CAMERA: C-2b-w6 branch did NOT come up; abort "
++		    "(no CFG write issued)\n");
++		pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++		return;
++	}
++	pc_step("w6 force-enable root", PC_CAMCC_PA + PC_CCI0_CMD_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_ROOT_EN);
++	printf("PANDORA CAMERA: C-2b-w6 A force-enable cmd_rcgr=%#x\n",
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR));
++	pc_step("w6 A CFG write", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_new);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_UPDATE);
++	upd_ret = ETIMEDOUT;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_UPDATE)) {
++			upd_ret = 0;
++			break;
++		}
++		pc_sleep(1);
++	}
++	v = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	update_acked = !(v & PC_CMD_UPDATE);
++	printf("PANDORA CAMERA: C-2b-w6 A reproduce: update_config ret=%d "
++	    "cmd_rcgr=%#x cfg_rcgr=%#x update_acked=%s\n", upd_ret, v,
++	    pc_rd(pc_camcc, PC_CCI0_CFG_RCGR), update_acked ? "yes" : "no");
++
++	/* Phase B (H2): explicit 0-write to clear a stuck CMD_UPDATE. */
++	if (!update_acked) {
++		pc_step("w6 B H2 explicit clear", PC_CAMCC_PA + PC_CCI0_CMD_RCGR);
++		pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, v & ~PC_CMD_UPDATE);
++		v = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++		h2_clear_worked = !(v & PC_CMD_UPDATE);
++		printf("PANDORA CAMERA: C-2b-w6 B H2 explicit CMD_UPDATE clear: "
++		    "cmd_rcgr=%#x h2_clear_worked=%s\n", v,
++		    h2_clear_worked ? "yes" : "no");
++	}
++
++	/* Phase C (H5): CMD_UPDATE with HW_CLK_CTRL cleared in CFG. */
++	pc_step("w6 C H5 cfg w/o HW_CLK_CTRL", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_new & ~PC_CFG_HW_CLK_CTRL);
++	printf("PANDORA CAMERA: C-2b-w6 C H5 writing cfg_rcgr=%#x "
++	    "(HW_CLK_CTRL cleared)\n", cfg_new & ~PC_CFG_HW_CLK_CTRL);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_UPDATE);
++	upd_ret = ETIMEDOUT;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_UPDATE)) {
++			upd_ret = 0;
++			break;
++		}
++		pc_sleep(1);
++	}
++	v = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	h5_acked = !(v & PC_CMD_UPDATE);
++	printf("PANDORA CAMERA: C-2b-w6 C H5 update w/o HW_CLK_CTRL: ret=%d "
++	    "cmd_rcgr=%#x cfg_rcgr=%#x h5_acked=%s\n", upd_ret, v,
++	    pc_rd(pc_camcc, PC_CCI0_CFG_RCGR), h5_acked ? "yes" : "no");
++	if (!h5_acked) {
++		pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, v & ~PC_CMD_UPDATE);
++		printf("PANDORA CAMERA: C-2b-w6 C H5 explicit clear -> %#x\n",
++		    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR));
++	}
++
++	/* Phase D (H1/H4): branch off->on with HW_CLK_CTRL CFG restored. */
++	pc_step("w6 D H1 cfg restore", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_new);
++	printf("PANDORA CAMERA: C-2b-w6 D H1/H4 branch off->on with cfg=%#x\n",
++	    cfg_new);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);                 /* off */
++	pc_sleep(1);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before | PC_CBCR_ENABLE); /* on */
++	h1_clock_ran = (pc_wait_branch_on("w6-h1", PC_CCI0_CBCR) == 0);
++	printf("PANDORA CAMERA: C-2b-w6 D H1/H4 branch_reload: clock_running=%s "
++	    "cmd_rcgr=%#x cfg_rcgr=%#x cbcr=%#x\n",
++	    h1_clock_ran ? "yes" : "no", pc_rd(pc_camcc, PC_CCI0_CMD_RCGR),
++	    pc_rd(pc_camcc, PC_CCI0_CFG_RCGR), pc_rd(pc_camcc, PC_CCI0_CBCR));
++	/* D2: retry CMD_UPDATE once after the reload. */
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_UPDATE);
++	upd_ret = ETIMEDOUT;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_UPDATE)) {
++			upd_ret = 0;
++			break;
++		}
++		pc_sleep(1);
++	}
++	v = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	h1d2_acked = !(v & PC_CMD_UPDATE);
++	printf("PANDORA CAMERA: C-2b-w6 D2 CMD_UPDATE after reload: ret=%d "
++	    "cmd_rcgr=%#x h1d2_acked=%s\n", upd_ret, v,
++	    h1d2_acked ? "yes" : "no");
++	if (!h1d2_acked) {
++		pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, v & ~PC_CMD_UPDATE);
++	}
++
++	/* Phase E (H3): read-only PLL0 output-enable dump. */
++	printf("PANDORA CAMERA: C-2b-w6 E H3 PLL0 dump (read-only): mode=%#x "
++	    "state=%#x status=%#x l_val=%#x user_ctl=%#x user_ctl_u=%#x\n",
++	    pc_rd(pc_camcc, PC_PLL0_MODE), pc_rd(pc_camcc, PC_PLL0_STATE),
++	    pc_rd(pc_camcc, PC_PLL0_STATUS), pc_rd(pc_camcc, PC_PLL0_L_VAL),
++	    pc_rd(pc_camcc, PC_PLL0_USER_CTL),
++	    pc_rd(pc_camcc, PC_PLL0_USER_CTL_U));
++	pc_w3_controller("w6-diag");
++
++	/* Phase F: rollback to the idle parked state (w3's 0x80000000). */
++	pc_step("w6 rollback", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_before);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_UPDATE);
++	upd_ret = ETIMEDOUT;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_UPDATE)) {
++			upd_ret = 0;
++			break;
++		}
++		pc_sleep(1);
++	}
++	v = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	if (v & PC_CMD_UPDATE) {
++		pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, v & ~PC_CMD_UPDATE);
++		printf("PANDORA CAMERA: C-2b-w6 rollback: CMD_UPDATE frozen, "
++		    "explicit clear -> %#x\n", pc_rd(pc_camcc, PC_CCI0_CMD_RCGR));
++	}
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & ~PC_CMD_ROOT_EN);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++	v = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_new = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);   /* reuse as cfg_restored */
++	{
++		bool root_reparked = (v & PC_CMD_ROOT_OFF) != 0;
++		bool cmd_clear = !(v & (PC_CMD_UPDATE | PC_CMD_ROOT_EN));
++		bool clean = root_reparked && cmd_clear && (cfg_new == cfg_before);
++		printf("PANDORA CAMERA: C-2b-w6 cleanup: cmd_rcgr=%#x (entry=%#x) "
++		    "cfg_rcgr=%#x (entry=%#x) root_reparked=%s cmd_bits_clear=%s "
++		    "rb_update=%d -> %s\n",
++		    v, cmd_before, cfg_new, cfg_before,
++		    root_reparked ? "yes" : "no", cmd_clear ? "yes" : "no",
++		    upd_ret, clean ? "CLEAN" : "LEFTOVER (probe changed CCI0 RCG state)");
++		printf("PANDORA CAMERA: C-2b-w6 result: A_update_acked=%s "
++		    "B_h2_explicit_clear=%s C_h5_acked_no_hwctl=%s "
++		    "D_branch_reload_clock=%s D2_update_after_reload=%s "
++		    "rollback=%s\n",
++		    update_acked ? "yes" : "no",
++		    h2_clear_worked ? "yes" : "no",
++		    h5_acked ? "yes" : "no",
++		    h1_clock_ran ? "yes" : "no",
++		    h1d2_acked ? "yes" : "no",
++		    clean ? "CLEAN" : "LEFTOVER");
++	}
++}
 +static void
 +pc_w1_bringup(void)
 +{
@@ -936,7 +1151,7 @@ index 0000000..e0b2bc4
 +	 * clk_rcg2_shared_set_rate handshake, then rolls the RCG back. No PLL/RCG M/N
 +	 * register is touched; it does NOT gate the w1 verdict. */
 +	if (gdsc_up && branch_up) {
-+		pc_w5_rcg_switch();
++		pc_w6_update_diag();
 +	}
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
