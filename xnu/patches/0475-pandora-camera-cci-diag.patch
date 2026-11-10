@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..a8d685b
+index 0000000..4a26856
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2717 @@
+@@ -0,0 +1,2770 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1573,6 +1573,61 @@ index 0000000..a8d685b
 + * not in the address byte or sensor power. Compare two transaction shapes
 + * on identical addresses in a single boot.
 + */
++/* C-2b-w27: w26 proved a CCI NACK halts the engine -- after the first
++ * NACK every later transaction timed out (irq=0) and CUR_WORD_CNT kept
++ * accumulating (3,4,6,9,12,15). The w16..w25 scan loops only cleared IRQ
++ * between addresses, never reset the engine, so those "7 addresses all
++ * NACK" results were NOT independent probes. Reset before EVERY transaction.
++ */
++static void
++pc_cci_reset_engine(void)
++{
++	uint32_t st = 0;
++	unsigned i;
++
++	pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++	for (i = 0; i < 20; i++) {
++		st = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++		if (st & PC_BIT(24)) /* RST_DONE_ACK */
++			break;
++		pc_sleep(1);
++	}
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++}
++
++/* Pure 1-byte WRITE address probe. No READ, so it cannot be polluted by
++ * the READ-stage NACK. Returns 1 if the queue completed without a NACK. */
++static unsigned
++pc_cci_write_probe(unsigned m, uint8_t slave)
++{
++	uint32_t irq = 0, exec;
++	uint32_t rep = 1u << (4u + m * 12u);   /* Q0 REPORT: M1 = BIT(16) */
++	uint32_t nack = 1u << (27u + m * 2u);  /* Q0 NACK:   M1 = BIT(29) */
++	unsigned i;
++
++	pc_cci_reset_engine();
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    pc_cci_load_word(PC_CCI_I2C_WRITE | (1u << 4), 0x00u, 0x00u, 0x00u));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++	exec = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), exec);
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, 1u << (m * 2u));
++	for (i = 0; i < 60; i++) {
++		irq = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++		if (irq & (rep | nack))
++			break;
++		pc_sleep(1);
++	}
++	if (!(irq & nack))
++		printf("PANDORA CAMERA: w27 WRITE-PROBE M%u addr=%#x -> ACK "
++		    "exec=%u polls=%u irq=%#x\n", m, slave, exec, i, irq);
++	return (irq & nack) ? 0u : 1u;
++}
++
 +static void
 +pc_cci_txn_ab(unsigned m, uint8_t slave)
 +{
@@ -1585,8 +1640,7 @@ index 0000000..a8d685b
 +	nack_q1 = nack_q0 << 1u;           /* M1_Q1_NACK   = BIT(30) */
 +
 +	/* A: minimal 1-byte WRITE on Q0 (identical to w25 pad trace) */
-+	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_cci_reset_engine();
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
@@ -1608,8 +1662,7 @@ index 0000000..a8d685b
 +	    ((irq & rep_q0) ? "DONE_NO_NACK" : "TIMEOUT"));
 +
 +	/* B: upstream cci_i2c_read() shape - SET_PARAM + READ + REPORT on Q1 */
-+	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_cci_reset_engine();
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
 +	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
@@ -2164,20 +2217,20 @@ index 0000000..a8d685b
 +
 +	pc_sleep(100);
 +
-+	/* w26: side-by-side transaction-shape comparison on identical pads.
-+	 * Runs after the CCI reset so both queues start empty. */
++	/* w27: one A/B control, then a full address sweep with a clean engine
++	 * before EVERY transaction. First reliable address-layer measurement
++	 * in the C-2b series (w16..w25 never reset between addresses). */
++	pc_cci_txn_ab(m, 0x10u);
 +	{
-+		static const uint8_t ab_addrs[] = {
-+			0x10u, 0x20u, 0x59u, 0x5au, /* w23 hit + DT wide/tele */
-+			0x08u, 0x77u,               /* controls */
-+		};
-+		for (unsigned bi = 0; bi < sizeof(ab_addrs) / sizeof(ab_addrs[0]); bi++)
-+			pc_cci_txn_ab(m, ab_addrs[bi]);
-+		pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
-+		pc_sleep(2);
-+		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
-+		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++		unsigned acks = 0;
++		printf("PANDORA CAMERA: w27 WRITE-PROBE sweep 0x08..0x77 on M%u "
++		    "(DT wide=0x20 tele=0x5a)\n", m);
++		for (unsigned a = 0x08u; a <= 0x77u; a++)
++			acks += pc_cci_write_probe(m, (uint8_t)a);
++		printf("PANDORA CAMERA: w27 WRITE-PROBE total=%u ACK addresses "
++		    "out of 112\n", acks);
 +	}
++	pc_cci_reset_engine();
 +
 +	static const uint8_t scan_addrs[] = { 0x20u, 0x34u, 0x36u, 0x1au, 0x10u, 0x3au, 0x6au };
 +	for (unsigned ai = 0; ai < sizeof(scan_addrs); ai++) {
