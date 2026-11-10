@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..15b82f6
+index 0000000..2193a1f
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1286 @@
+@@ -0,0 +1,1573 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -94,6 +94,12 @@ index 0000000..15b82f6
 + *       (explicit CMD_UPDATE clear, CMD_UPDATE without HW_CLK_CTRL, branch
 + *       off->on reload, PLL0 output-enable dump) and rolls back in reverse.
 + *       It still writes no PLL, no RCG M/N, no rail/GPIO/CCI transaction.
++ *     - C-2b-w7 (Path A) probes the I2C bus on the existing XO/div1 clock.
++ *       It writes the CCI0 branch CBCR, CCI timing registers (19.2 MHz
++ *       Standard), CCI queue/IRQ registers, and issues chip-ID reads to the
++ *       two CCI0 sensors. It restores timing and rolls back. It still writes
++ *       no PLL, no RCG M/N, no rail/GPIO. This is the zero-risk path: no
++ *       PLL output enable is attempted until w7 proves the bus works.
 + *   Mode 2 is identical to mode 1 for now: per-sensor address + power
 + *   bring-up is gated on vendor data the board DT does not carry. Do not
 + *   "extend" this driver further without filling those unknowns first.
@@ -850,7 +856,7 @@ index 0000000..15b82f6
 + *            the root. CLEAN = ROOT_OFF set + CMD_UPDATE/CMD_ROOT_EN clear +
 + *            CFG restored (this is the state w3 checks as 0x80000000).
 + */
-+static void
++static void __unused
 +pc_w6_update_diag(void)
 +{
 +	uint32_t cbcr_before, cmd_before, cfg_before;
@@ -1039,6 +1045,287 @@ index 0000000..15b82f6
 +		    clean ? "CLEAN" : "LEFTOVER");
 +	}
 +}
++
++/* C-2b-w7 (Path A): I2C bus probe on the XO/div1 CCI0 clock. No PLL write.
++ *
++ * Rationale (see CAMERA_C2B_RCG_CCI_INPUTS.md §6.1): the 37.5 MHz
++ * PLL0_OUT_EVEN source is gated off (PLL0 outputs disabled), so the RCG
++ * source switch cannot succeed yet. Instead of touching the PLL, use the
++ * CCI clock that is already running (XO/div1, 19.2 MHz) with the upstream
++ * driver's own 19.2 MHz timing table, and attempt chip-ID reads.
++ *
++ * Writes ONLY: CCI0 branch CBCR (as w2), CCI0 timing registers
++ * (SCL/SDA/MISC_CTL for M0 and M1), CCI queue/IRQ/RESET registers,
++ * then restores everything in reverse. No PLL / RCG / rail / GPIO /
++ * sensor register write beyond the chip-ID read itself.
++ *
++ * Targets (from CAMERA_C2B_VENDOR_SENSOR_INPUTS.md):
++ *   CCI0 M0 (master 0): tele s5khpe   slave 0x5a  expect 0x1b7e
++ *   CCI0 M1 (master 1): wide ovx10500u slave 0x20 expect 0x5058
++ * Chip-ID register assumed 0x0000 (16-bit, common convention; s5kjn5
++ * upstream driver confirms CCI_REG16(0x0000)).
++ */
++#define PC_CCI_RESET_CMD        0x004u
++#define PC_CCI_RESET_CMD_MASK   0x0f73f3f7u
++#define PC_CCI_QUEUE_START      0x008u
++#define PC_CCI_HALT_REQ         0x034u
++#define PC_CCI_SCL_CTL(m)       (0x100u + 0x100u * (m))
++#define PC_CCI_SDA_CTL_0(m)     (0x104u + 0x100u * (m))
++#define PC_CCI_SDA_CTL_1(m)     (0x108u + 0x100u * (m))
++#define PC_CCI_SDA_CTL_2(m)     (0x10cu + 0x100u * (m))
++#define PC_CCI_MISC_CTL(m)      (0x110u + 0x100u * (m))
++#define PC_CCI_READ_DATA(m)     (0x118u + 0x100u * (m))
++#define PC_CCI_READ_BUF_LEVEL(m) (0x11cu + 0x100u * (m))
++#define PC_CCI_Qn_EXEC_WORD_CNT(m, q) (0x300u + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_Qn_CUR_WORD_CNT(m, q)  (0x304u + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_Qn_REPORT_STATUS(m, q) (0x30cu + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_Qn_LOAD_DATA(m, q)     (0x310u + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_IRQ_MASK_0        0xc04u
++#define PC_CCI_IRQ_STATUS_0      0xc0cu
++
++#define PC_CCI_I2C_SET_PARAM    1u
++#define PC_CCI_I2C_REPORT       8u
++#define PC_CCI_I2C_WRITE        9u
++#define PC_CCI_I2C_READ         10u
++#define PC_CCI_I2C_REPORT_IRQ_EN 0x100u
++
++/* 19.2 MHz Standard-mode timing (i2c-qcom-cci.c cci_hw_params[19.2][STD]). */
++#define PC_T_THIGH   78u
++#define PC_T_TLOW    114u
++#define PC_T_SSU_STO 28u
++#define PC_T_SSU_STA 28u
++#define PC_T_THD_DAT 10u
++#define PC_T_THD_STA 77u
++#define PC_T_TBUF    118u
++#define PC_T_TRDHLD  6u
++#define PC_T_TSP     1u
++
++static uint32_t
++pc_cci_load_word(uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3)
++{
++	return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
++}
++
++/* Wait for a CCI IRQ status bit (bounded poll). Returns 0 on success. */
++static int
++pc_cci_wait_irq(vm_offset_t cci, uint32_t mask)
++{
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		uint32_t s = pc_rd(cci, PC_CCI_IRQ_STATUS_0);
++		if (s & mask) {
++			/* clear by writing 1 to the status bit */
++			pc_wr(cci, PC_CCI_IRQ_STATUS_0, s & mask);
++			return 0;
++		}
++		pc_sleep(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* Issue a 2-byte register read (reg 0x0000) on the given CCI master.
++ * Uses QUEUE_0 for the register-address write, QUEUE_1 for the data read.
++ * Returns 0 on success and stores the 16-bit big-endian value in *out. */
++static int
++pc_cci_read_reg16(vm_offset_t cci, unsigned master, uint8_t slave,
++    uint16_t *out)
++{
++	uint32_t v, cur, buf;
++	int ret;
++	unsigned words;
++
++	/* --- write: set register address 0x0000 (2 bytes) --- */
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
++	/* WRITE cmd + 2 data bytes (0x00,0x00) packed into one word */
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++	    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
++	/* REPORT with IRQ */
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++
++	cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 0));
++	printf("PANDORA CAMERA: w7 M%u write cur_words=%u slave=%#x\n",
++	    master, cur, slave);
++	if (cur == 0 || cur > 32u) {
++		printf("PANDORA CAMERA: w7 M%u write queue empty/overflow\n", master);
++		return EINVAL;
++	}
++	pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 0), cur);
++	pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 0u));
++	ret = pc_cci_wait_irq(cci, 1u << (master * 2u + 4u));  /* Qn_REPORT */
++	if (ret != 0) {
++		printf("PANDORA CAMERA: w7 M%u write IRQ timeout (status=%#x)\n",
++		    master, pc_rd(cci, PC_CCI_IRQ_STATUS_0));
++		return ret;
++	}
++	v = pc_rd(cci, PC_CCI_Qn_REPORT_STATUS(master, 0));
++	printf("PANDORA CAMERA: w7 M%u write report_status=%#x\n", master, v);
++
++	/* --- read: 2 bytes from current register pointer --- */
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
++	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
++	    PC_CCI_I2C_READ | (2u << 4));
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++
++	cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 1));
++	printf("PANDORA CAMERA: w7 M%u read cur_words=%u\n", master, cur);
++	if (cur == 0 || cur > 32u) {
++		printf("PANDORA CAMERA: w7 M%u read queue empty/overflow\n", master);
++		return EINVAL;
++	}
++	pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 1), cur);
++	pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 1u));
++	ret = pc_cci_wait_irq(cci, 1u << (master * 2u + 8u));  /* Qn_REPORT */
++	if (ret != 0) {
++		printf("PANDORA CAMERA: w7 M%u read IRQ timeout (status=%#x)\n",
++		    master, pc_rd(cci, PC_CCI_IRQ_STATUS_0));
++		return ret;
++	}
++	v = pc_rd(cci, PC_CCI_Qn_REPORT_STATUS(master, 1));
++	words = pc_rd(cci, PC_CCI_READ_BUF_LEVEL(master));
++	buf = words ? pc_rd(cci, PC_CCI_READ_DATA(master)) : 0;
++	printf("PANDORA CAMERA: w7 M%u read report_status=%#x buf_level=%u "
++	    "read_data=%#x\n", master, v, words, buf);
++	/* read_data layout: first byte is status, following bytes are payload */
++	if (words >= 1) {
++		*out = (uint16_t)(((buf >> 8) & 0xffu) << 8) | (uint16_t)((buf >> 16) & 0xffu);
++		/* bytes: [0]=status,[1]=first data,[2]=second data in little-endian word */
++		*out = (uint16_t)((buf >> 8) & 0xffu) | (uint16_t)(((buf >> 16) & 0xffu) << 8);
++		return 0;
++	}
++	return EIO;
++}
++
++static void
++pc_w7_i2c_probe(void)
++{
++	uint32_t cbcr_before, cmd_before, cfg_before;
++	uint32_t scl0, sda0_0, sda1_0, sda2_0, misc0;
++	uint32_t scl1, sda0_1, sda1_1, sda2_1, misc1;
++	uint16_t id;
++	int ret;
++	bool branch_up = false;
++
++	if (!pc_camcc || !pc_cci[0]) {
++		printf("PANDORA CAMERA: C-2b-w7 skipped (camcc or cci unmapped)\n");
++		return;
++	}
++	cbcr_before = pc_rd(pc_camcc, PC_CCI0_CBCR);
++	cmd_before  = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_before  = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	printf("PANDORA CAMERA: C-2b-w7 I2C probe (XO/div1 timing, no PLL write) "
++	    "before: cbcr=%#x cmd_rcgr=%#x cfg_rcgr=%#x\n",
++	    cbcr_before, cmd_before, cfg_before);
++
++	/* 1. branch on */
++	pc_step("w7 CCI0 branch", PC_CAMCC_PA + PC_CCI0_CBCR);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before | PC_CBCR_ENABLE);
++	branch_up = (pc_wait_branch_on("w7", PC_CCI0_CBCR) == 0);
++	if (!branch_up) {
++		printf("PANDORA CAMERA: C-2b-w7 branch did NOT come up; abort\n");
++		pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++		return;
++	}
++
++	/* 2. save original timing */
++	scl0   = pc_rd(pc_cci[0], PC_CCI_SCL_CTL(0));
++	sda0_0 = pc_rd(pc_cci[0], PC_CCI_SDA_CTL_0(0));
++	sda1_0 = pc_rd(pc_cci[0], PC_CCI_SDA_CTL_1(0));
++	sda2_0 = pc_rd(pc_cci[0], PC_CCI_SDA_CTL_2(0));
++	misc0  = pc_rd(pc_cci[0], PC_CCI_MISC_CTL(0));
++	scl1   = pc_rd(pc_cci[0], PC_CCI_SCL_CTL(1));
++	sda0_1 = pc_rd(pc_cci[0], PC_CCI_SDA_CTL_0(1));
++	sda1_1 = pc_rd(pc_cci[0], PC_CCI_SDA_CTL_1(1));
++	sda2_1 = pc_rd(pc_cci[0], PC_CCI_SDA_CTL_2(1));
++	misc1  = pc_rd(pc_cci[0], PC_CCI_MISC_CTL(1));
++	printf("PANDORA CAMERA: w7 timing before: M0 scl=%#x sda0=%#x sda1=%#x "
++	    "sda2=%#x misc=%#x\n", scl0, sda0_0, sda1_0, sda2_0, misc0);
++	printf("PANDORA CAMERA: w7 timing before: M1 scl=%#x sda0=%#x sda1=%#x "
++	    "sda2=%#x misc=%#x\n", scl1, sda0_1, sda1_1, sda2_1, misc1);
++
++	/* 3. write 19.2 MHz Standard timing to M0 and M1 */
++	pc_step("w7 timing write", PC_CCI_PA(0) + PC_CCI_SCL_CTL(0));
++	for (unsigned m = 0; m < 2; m++) {
++		pc_wr(pc_cci[0], PC_CCI_SCL_CTL(m),
++		    PC_T_THIGH << 16 | PC_T_TLOW);
++		pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(m),
++		    PC_T_SSU_STO << 16 | PC_T_SSU_STA);
++		pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(m),
++		    PC_T_THD_DAT << 16 | PC_T_THD_STA);
++		pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(m), PC_T_TBUF);
++		pc_wr(pc_cci[0], PC_CCI_MISC_CTL(m),
++		    0x100u | PC_T_TRDHLD << 4 | PC_T_TSP);  /* SCL_STRETCH_EN */
++	}
++	printf("PANDORA CAMERA: w7 timing written: scl=%#x sda0=%#x sda1=%#x "
++	    "sda2=%#x misc=%#x (19.2MHz Standard)\n",
++	    PC_T_THIGH << 16 | PC_T_TLOW, PC_T_SSU_STO << 16 | PC_T_SSU_STA,
++	    PC_T_THD_DAT << 16 | PC_T_THD_STA, PC_T_TBUF,
++	    0x100u | PC_T_TRDHLD << 4 | PC_T_TSP);
++
++	/* 4. enable report IRQs */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_MASK_0,
++	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u);
++	/* clear stale status */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_STATUS_0, 0xffffffffu);
++
++	/* 5. try chip-ID reads */
++	{
++		static const struct {
++			unsigned master;
++			uint8_t slave;
++			uint16_t expect;
++			const char *name;
++		} tgts[] = {
++			{ 0, 0x5a, 0x1b7e, "tele s5khpe" },
++			{ 1, 0x20, 0x5058, "wide ovx10500u" },
++		};
++		for (unsigned t = 0; t < sizeof(tgts) / sizeof(tgts[0]); t++) {
++			printf("PANDORA CAMERA: w7 try M%u slave=%#x (%s) "
++			    "expect=%#x\n", tgts[t].master, tgts[t].slave,
++			    tgts[t].name, tgts[t].expect);
++			id = 0;
++			ret = pc_cci_read_reg16(pc_cci[0], tgts[t].master,
++			    tgts[t].slave, &id);
++			if (ret == 0 && id == tgts[t].expect) {
++				printf("PANDORA CAMERA: w7 M%u %s -> CHIP ID MATCH "
++				    "(%#x)\n", tgts[t].master, tgts[t].name, id);
++			} else if (ret == 0) {
++				printf("PANDORA CAMERA: w7 M%u %s -> chip_id=%#x "
++				    "(expect %#x) MISMATCH\n", tgts[t].master,
++				    tgts[t].name, id, tgts[t].expect);
++			} else {
++				printf("PANDORA CAMERA: w7 M%u %s -> no response "
++				    "(ret=%d) NACK/timeout\n", tgts[t].master,
++				    tgts[t].name, ret);
++			}
++		}
++	}
++
++	/* 6. restore timing */
++	pc_step("w7 timing restore", PC_CCI_PA(0) + PC_CCI_SCL_CTL(0));
++	pc_wr(pc_cci[0], PC_CCI_SCL_CTL(0), scl0);
++	pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(0), sda0_0);
++	pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(0), sda1_0);
++	pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(0), sda2_0);
++	pc_wr(pc_cci[0], PC_CCI_MISC_CTL(0), misc0);
++	pc_wr(pc_cci[0], PC_CCI_SCL_CTL(1), scl1);
++	pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(1), sda0_1);
++	pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(1), sda1_1);
++	pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(1), sda2_1);
++	pc_wr(pc_cci[0], PC_CCI_MISC_CTL(1), misc1);
++
++	/* 7. branch off */
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++	cmd_before = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_before = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	printf("PANDORA CAMERA: C-2b-w7 cleanup: cbcr=%#x cmd_rcgr=%#x "
++	    "cfg_rcgr=%#x (RCG untouched by w7)\n",
++	    pc_rd(pc_camcc, PC_CCI0_CBCR), cmd_before, cfg_before);
++	printf("PANDORA CAMERA: C-2b-w7 result: branch_up=yes "
++	    "(timing + I2C queue probe done, no PLL write)\n");
++}
 +static void
 +pc_w1_bringup(void)
 +{
@@ -1151,7 +1438,7 @@ index 0000000..15b82f6
 +	 * clk_rcg2_shared_set_rate handshake, then rolls the RCG back. No PLL/RCG M/N
 +	 * register is touched; it does NOT gate the w1 verdict. */
 +	if (gdsc_up && branch_up) {
-+		pc_w6_update_diag();
++		pc_w7_i2c_probe();
 +	}
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
