@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..1c3b8c0
+index 0000000..cec747e
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2778 @@
+@@ -0,0 +1,2854 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1500,6 +1500,70 @@ index 0000000..1c3b8c0
 +	}
 +}
 +
++/* C-2b-w28: bring CAMCC PLL0 up per upstream camcc-kaanapali.c
++ * cam_cc_pll0_config, then switch the CCI0 RCG from XO/19.2MHz to
++ * PLL0_OUT_EVEN/16 = 37.5MHz. That is what the working Android camera uses
++ * (clk_summary measured 37500000). w5 failed only because PLL0 outputs were
++ * gated; here we enable the PLL first. CMD_UPDATE timeout rolls CFG back and
++ * continues on XO instead of aborting.
++ */
++static void
++pc_cci_clk_37mhz(void)
++{
++	uint32_t cfg0, cmd, st;
++	unsigned i;
++
++	cfg0 = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	printf("PANDORA CAMERA: w28 CCI0 BEFORE cfg=%#x cmd=%#x cbcr=%#x\n",
++	    cfg0, pc_rd(pc_camcc, PC_CCI0_CMD_RCGR),
++	    pc_rd(pc_camcc, PC_CCI0_CBCR));
++	printf("PANDORA CAMERA: w28 PLL0 BEFORE mode=%#x opmode=%#x status=%#x "
++	    "l=%#x alpha=%#x user=%#x cfgctl=%#x
++",
++	    pc_rd(pc_camcc, 0x00), pc_rd(pc_camcc, 0x04), pc_rd(pc_camcc, 0x0c),
++	    pc_rd(pc_camcc, 0x10), pc_rd(pc_camcc, 0x14), pc_rd(pc_camcc, 0x18),
++	    pc_rd(pc_camcc, 0x20));
++
++	/* cam_cc_pll0_config: 1200 MHz, TAYCAN_EKO_T register offsets */
++	pc_wr(pc_camcc, 0x20, 0x25c400e7u);
++	pc_wr(pc_camcc, 0x24, 0x0a8062e0u);
++	pc_wr(pc_camcc, 0x28, 0xf51dea20u);
++	pc_wr(pc_camcc, 0x10, 0x3eu);
++	pc_wr(pc_camcc, 0x14, 0x8000u);
++	pc_wr(pc_camcc, 0x18, 0x8408u);
++	pc_wr(pc_camcc, 0x1c, 0x2u);
++	pc_wr(pc_camcc, 0x00, 0x1u);   /* MODE: PLL_OUTCTRL */
++	pc_wr(pc_camcc, 0x04, 0x1u);   /* OPMODE: PLL_RUN */
++	for (i = 0; i < 100; i++) {
++		st = pc_rd(pc_camcc, 0x0c);
++		if (st & PC_BIT(31))
++			break;
++		pc_sleep(1);
++	}
++	printf("PANDORA CAMERA: w28 PLL0 AFTER mode=%#x opmode=%#x status=%#x "
++	    "user=%#x polls=%u locked=%s
++",
++	    pc_rd(pc_camcc, 0x00), pc_rd(pc_camcc, 0x04), st,
++	    pc_rd(pc_camcc, 0x18), i, (st & PC_BIT(31)) ? "YES" : "NO");
++
++	/* SRC_SEL=2 (PLL0_OUT_EVEN), SRC_DIV=16, HW_CLK_CTRL BIT(20) */
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, 0x00100210u);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, 0x3u);
++	for (i = 0; i < 100; i++) {
++		cmd = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++		if (!(cmd & 0x1u))
++			break;
++		pc_sleep(1);
++	}
++	printf("PANDORA CAMERA: w28 CCI0 AFTER cfg=%#x cmd=%#x polls=%u -> %s\n",
++	    pc_rd(pc_camcc, PC_CCI0_CFG_RCGR), cmd, i,
++	    (cmd & 0x1u) ? "NOT_SWITCHED(CFG rolled back)" : "SWITCHED_37P5MHZ");
++	if (cmd & 0x1u)
++		pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg0);
++	pc_wr(pc_camcc, PC_CCI0_CBCR,
++	    pc_rd(pc_camcc, PC_CCI0_CBCR) | PC_CBCR_ENABLE);
++}
++
 +/* C-2b-w25: trace the physical pads while the CCI controller runs a
 + * transaction. GPIO bit-bang reaches devices on gpio109-112, yet the CCI
 + * controller reports NACK on every address for 12 rounds. If CCI is really
@@ -2064,6 +2128,15 @@ index 0000000..1c3b8c0
 +			printf("PANDORA CAMERA: w22 RPMh ret: L5M(%d,%d) B1B(%d,%d) B2B(%d,%d)\n",
 +			    r1, r2, r3, r4, r5, r6);
 +		}
++		/* w28: RPMh MODE vote (offset 8). Android debugfs: bob1 mode=8
++		 * (REGULATOR_MODE_FAST -> PMIC5 BOB PWM=7); LDO HPM=7. */
++		{
++			int m1 = pandora_rpmh_resource("L5M_E1", 8, 7);
++			int m2 = pandora_rpmh_resource("B1B_E0", 8, 7);
++			int m3 = pandora_rpmh_resource("B2B_E0", 8, 7);
++			printf("PANDORA CAMERA: w28 RPMh MODE ret: L5M=%d B1B=%d B2B=%d\n",
++			    m1, m2, m3);
++		}
 +		printf("PANDORA CAMERA: w13 RPMh: L5M_E1 1800mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
 +
 +		/* GPIO power enables */
@@ -2162,6 +2235,9 @@ index 0000000..1c3b8c0
 +		pc_sleep(50);
 +	}
 +
++	/* w28: align CCI core clock with the working Android config. */
++	pc_cci_clk_37mhz();
++
 +	/* 4. PINMUX FIX: configure CCI0 I2C pins to CCI I2C function */
 +	/* TLMM layout: bits[1:0]=pull, bits[5:2]=func, bits[7:6]=drv, bit[9]=oe */
 +	/* CCI I2C function = 1 (cci_i2c_sdaN/sclN) */
@@ -2170,8 +2246,8 @@ index 0000000..1c3b8c0
 +		/* M0 pins */
 +		ctl = pc_rd(pc_tlmm, PC_GPIO(cci0_m0[i]));
 +		printf("PANDORA CAMERA: w13   gpio%u BEFORE ctl=%#x\n", cci0_m0[i], ctl);
-+		/* Set: func=1 (CCI I2C), pull-up=3, drv=3 (8mA), oe=0 (hw drives) */
-+		ctl = (ctl & ~0x3ffu) | 0x3u | (1u << 2) | (3u << 6);
++		/* w28: DT nezha_cci_*_active/config = bias-disable + 2mA. */
++		ctl = (ctl & ~0x3ffu) | (1u << 2);
 +		pc_wr(pc_tlmm, PC_GPIO(cci0_m0[i]), ctl);
 +		printf("PANDORA CAMERA: w13   gpio%u AFTER  ctl=%#x\n", cci0_m0[i],
 +		    pc_rd(pc_tlmm, PC_GPIO(cci0_m0[i])));
@@ -2179,7 +2255,7 @@ index 0000000..1c3b8c0
 +		/* M1 pins */
 +		ctl = pc_rd(pc_tlmm, PC_GPIO(cci0_m1[i]));
 +		printf("PANDORA CAMERA: w13   gpio%u BEFORE ctl=%#x\n", cci0_m1[i], ctl);
-+		ctl = (ctl & ~0x3ffu) | 0x3u | (1u << 2) | (3u << 6);
++		ctl = (ctl & ~0x3ffu) | (1u << 2);
 +		pc_wr(pc_tlmm, PC_GPIO(cci0_m1[i]), ctl);
 +		printf("PANDORA CAMERA: w13   gpio%u AFTER  ctl=%#x\n", cci0_m1[i],
 +		    pc_rd(pc_tlmm, PC_GPIO(cci0_m1[i])));
@@ -2240,7 +2316,7 @@ index 0000000..1c3b8c0
 +	}
 +	pc_cci_reset_engine();
 +
-+	static const uint8_t scan_addrs[] = { 0x20u, 0x34u, 0x36u, 0x1au, 0x10u, 0x3au, 0x6au };
++	static const uint8_t scan_addrs[] = { 0x20u, 0x34u, 0x36u, 0x1au, 0x10u, 0x3au, 0x6au, 0x7au };
 +	for (unsigned ai = 0; ai < sizeof(scan_addrs); ai++) {
 +		uint8_t slave = scan_addrs[ai];
 +		printf("PANDORA CAMERA: w13 SCAN addr=%#x on M1\n", slave);
