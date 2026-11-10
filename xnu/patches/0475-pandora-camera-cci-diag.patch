@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..0f678b4
+index 0000000..cf79a24
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2380 @@
+@@ -0,0 +1,2416 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1737,18 +1737,26 @@ index 0000000..0f678b4
 +
 +	/* 3. Power up sensor (same as w12/w9) */
 +	{
-+		/* RPMh rails */
-+		pandora_rpmh_resource("L5M_E1", 0, 1800);
-+		pandora_rpmh_resource("L5M_E1", 4, 1);
-+		pandora_rpmh_resource("B1B_E0", 0, 3400);
-+		pandora_rpmh_resource("B1B_E0", 4, 1);
-+		pandora_rpmh_resource("B2B_E0", 0, 2704);
-+		pandora_rpmh_resource("B2B_E0", 4, 1);
++		/* RPMh rails — w22: check return values */
++		{
++			int r1 = pandora_rpmh_resource("L5M_E1", 0, 1800);
++			int r2 = pandora_rpmh_resource("L5M_E1", 4, 1);
++			int r3 = pandora_rpmh_resource("B1B_E0", 0, 3400);
++			int r4 = pandora_rpmh_resource("B1B_E0", 4, 1);
++			int r5 = pandora_rpmh_resource("B2B_E0", 0, 2704);
++			int r6 = pandora_rpmh_resource("B2B_E0", 4, 1);
++			printf("PANDORA CAMERA: w22 RPMh ret: L5M(%d,%d) B1B(%d,%d) B2B(%d,%d)\n",
++			    r1, r2, r3, r4, r5, r6);
++		}
 +		printf("PANDORA CAMERA: w13 RPMh: L5M_E1 1800mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
 +
 +		/* GPIO power enables */
 +		pc_gpio_set(107, 0, 0, 8, 1); /* wide pwr, func=0 GPIO */
 +		pc_gpio_set(116, 0, 0, 8, 1); /* afvdd, func=0 GPIO */
++		/* w22: readback verify */
++		printf("PANDORA CAMERA: w22 GPIO readback: 107 ctl=%#x in=%#x  116 ctl=%#x in=%#x\n",
++		    pc_rd(pc_tlmm, PC_GPIO(107)), pc_rd(pc_tlmm, PC_GPIO(107) + 0x4),
++		    pc_rd(pc_tlmm, PC_GPIO(116)), pc_rd(pc_tlmm, PC_GPIO(116) + 0x4));
 +		printf("PANDORA CAMERA: w13 GPIO: 107=high (wide pwr), 116=high (afvdd)\n");
 +
 +		/* w21: MCLK BEFORE reset — enable BDISTMCLKCC PLL0 + 24MHz */
@@ -1775,8 +1783,9 @@ index 0000000..0f678b4
 +			/* Step 3: ALPHA = 0 */
 +			pc_wr(pc_bdistm, 0x14, 0x0u);
 +
-+			/* Step 4: USER_CTL — enable OUT_EVEN (bit 1) */
-+			pc_wr(pc_bdistm, 0x18, 0x2u);
++			/* Step 4: USER_CTL — enable ALL outputs (OUT_EVEN|OUT_ODD|OUT_MAIN) */
++			/* w22 FIX: was 0x2 (only BIT(1)=OUT_ODD), OUT_EVEN was gated! */
++			pc_wr(pc_bdistm, 0x18, 0x7u);
 +
 +			/* Step 5: MODE — set PLL_OUTCTRL (bit 0) */
 +			pc_wr(pc_bdistm, 0x00, 0x1u);
@@ -1786,20 +1795,21 @@ index 0000000..0f678b4
 +			pc_wr(pc_bdistm, 0x04, 0x1u);
 +
 +			/* Step 7: Wait for lock */
++			/* w22 FIX: lock bit is BIT(31) (PLL_LOCK_DET), not BIT(0) */
 +			{
 +				unsigned li;
 +				for (li = 0; li < 100; li++) {
 +					uint32_t st = pc_rd(pc_bdistm, 0x0c);
-+					if (st & 0x1u) /* LOCK bit */
++					if (st & 0x80000000u) /* PLL_LOCK_DET BIT(31) */
 +						break;
 +					pc_sleep(1);
 +				}
-+				printf("PANDORA CAMERA: w21 PLL0 lock wait %u, status=%#x\n",
++				printf("PANDORA CAMERA: w22 PLL0 lock wait %u, status=%#x\n",
 +				    li, pc_rd(pc_bdistm, 0x0c));
 +			}
-+			printf("PANDORA CAMERA: w21 PLL0 AFTER  mode=%#x opmode=%#x state=%#x status=%#x\n",
++			printf("PANDORA CAMERA: w22 PLL0 AFTER  mode=%#x opmode=%#x state=%#x status=%#x\n",
 +			    pc_rd(pc_bdistm, 0x00), pc_rd(pc_bdistm, 0x04), pc_rd(pc_bdistm, 0x08), pc_rd(pc_bdistm, 0x0c));
-+			printf("PANDORA CAMERA: w21 PLL0 l=%#x alpha=%#x user_ctl=%#x\n",
++			printf("PANDORA CAMERA: w22 PLL0 l=%#x alpha=%#x user_ctl=%#x\n",
 +			    pc_rd(pc_bdistm, 0x10), pc_rd(pc_bdistm, 0x14), pc_rd(pc_bdistm, 0x18));
 +
 +			/* Configure MCLK RCG for 24MHz from PLL0_OUT_EVEN */
@@ -1819,7 +1829,7 @@ index 0000000..0f678b4
 +				/* Branch CBCR: enable BIT(0) */
 +				pc_wr(pc_bdistm, rcg + 0x18, 0x1u);
 +				pc_sleep(1);
-+				printf("PANDORA CAMERA: w21 mclk%u cfg=%#x cmd=%#x cbcr=%#x\n",
++				printf("PANDORA CAMERA: w22 mclk%u cfg=%#x cmd=%#x cbcr=%#x\n",
 +				    mi, pc_rd(pc_bdistm, rcg + 4), pc_rd(pc_bdistm, rcg),
 +				    pc_rd(pc_bdistm, rcg + 0x18));
 +			}
@@ -1933,6 +1943,27 @@ index 0000000..0f678b4
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +	}
++	/* w22: Tele sensor (sensor3) has DIFFERENT GPIOs than wide!
++	 * DT: mclk=gpio92 rst=gpio105 vana=GPIO113 vdig=GPIO113
++	 *     vio=L5M_E1 vaf=L5N_E1 3.3V custom1=L3N_E1 */
++	printf("PANDORA CAMERA: w22 TELE: powering sensor3 (mclk=gpio92, rst=gpio105, vana=GPIO113)\n");
++	pandora_rpmh_resource("L5N_E1", 0, 3300); /* tele vaf 3.3V */
++	pandora_rpmh_resource("L5N_E1", 4, 1);
++	pandora_rpmh_resource("L3N_E1", 0, 1800); /* tele custom1 */
++	pandora_rpmh_resource("L3N_E1", 4, 1);
++	pc_gpio_set(113, 0, 0, 8, 1); /* tele vana+vdig */
++	printf("PANDORA CAMERA: w22 TELE: GPIO 113=high (vana+vdig), RPMh L5N_E1 3300mV, L3N_E1 1800mV\n");
++	/* tele MCLK on gpio92 */
++	pc_gpio_set(92, 1, 0, 8, 1); /* cam_mclk func=1 */
++	printf("PANDORA CAMERA: w22 TELE: GPIO 92=cam_mclk (func=1, 8mA)\n");
++	/* tele reset: gpio105 */
++	pc_gpio_set(105, 0, 0, 2, 0); /* reset assert */
++	printf("PANDORA CAMERA: w22 TELE: GPIO 105=low (reset assert)\n");
++	pc_sleep(10);
++	pc_gpio_set(105, 0, 0, 2, 1); /* reset release */
++	printf("PANDORA CAMERA: w22 TELE: GPIO 105=high (reset release)\n");
++	pc_sleep(50);
++
 +	/* Also try M0 (tele, slave 0x5a, expect 0x1b7e) with combined transaction */
 +	printf("PANDORA CAMERA: w17 TEST: combined SET_PARAM+WRITE+READ+REPORT on M0 (tele)\n");
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
@@ -1978,15 +2009,20 @@ index 0000000..0f678b4
 +		pc_wr(pc_tlmm, PC_GPIO(cci0_m0[i]), 0x1u); /* restore to GPIO pull-down */
 +		pc_wr(pc_tlmm, PC_GPIO(cci0_m1[i]), 0x1u);
 +	}
-+	pc_gpio_set(89, 0, 0, 2, 0);   /* MCLK off */
-+	pc_gpio_set(106, 0, 0, 2, 1);  /* reset high */
++	pc_gpio_set(89, 0, 0, 2, 0);   /* wide MCLK off */
++	pc_gpio_set(92, 0, 0, 2, 0);   /* tele MCLK off (w22) */
++	pc_gpio_set(106, 0, 0, 2, 1);  /* wide reset high */
++	pc_gpio_set(105, 0, 0, 2, 1);  /* tele reset high (w22) */
 +	pc_gpio_set(107, 0, 0, 2, 0);  /* wide pwr off */
 +	pc_gpio_set(116, 0, 0, 2, 0);  /* afvdd off */
++	pc_gpio_set(113, 0, 0, 2, 0);  /* tele vana+vdig off (w22) */
 +	pandora_rpmh_resource("L5M_E1", 4, 0);
 +	pandora_rpmh_resource("B1B_E0", 4, 0);
 +	pandora_rpmh_resource("B2B_E0", 4, 0);
++	pandora_rpmh_resource("L5N_E1", 4, 0); /* tele vaf (w22) */
++	pandora_rpmh_resource("L3N_E1", 4, 0); /* tele custom1 (w22) */
 +	pc_wr(pc_camcc, PC_CCI0_CBCR, pc_rd(pc_camcc, PC_CCI0_CBCR) & ~PC_CBCR_ENABLE);
-+	printf("PANDORA CAMERA: C-2b-w13 result: pinmux+powered I2C done (see above)\n");
++	printf("PANDORA CAMERA: C-2b-w22 result: pinmux+powered I2C done (see above)\n");
 +}
 +
 +static void
