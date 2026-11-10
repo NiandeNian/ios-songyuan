@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..8227e4c
+index 0000000..e6ce9da
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2552 @@
+@@ -0,0 +1,2642 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1444,7 +1444,7 @@ index 0000000..8227e4c
 +		for (unsigned ai = 0; ai < naddrs; ai++) {
 +			unsigned a = addrs[ai];
 +			uint8_t byte = (uint8_t)(a << 1); /* write direction */
-+			uint32_t pre, post;
++			uint32_t pre, post, data = 0, bus_free;
 +
 +			/* START: SDA falls while SCL is high */
 +			pc_bb_set(sda, 0);
@@ -1461,8 +1461,10 @@ index 0000000..8227e4c
 +				pc_sleep(3);
 +			}
 +
-+			/* 9th clock: release SDA, let the pull-up settle, then
-+			 * sample before and after the SCL rising edge. */
++			/* 9th clock (ACK). NOTE: a real slave starts driving SDA low
++			 * right after the 8th falling edge, i.e. BEFORE the 9th rising
++			 * edge -- so pre=0 is the NORMAL electrical signature of an
++			 * ACK, not a pull-up failure. w24 mislabelled this. */
 +			pc_bb_set(sda, 1);
 +			pc_sleep(3);
 +			pre = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
@@ -1472,6 +1474,16 @@ index 0000000..8227e4c
 +			pc_bb_set(scl, 0);
 +			pc_sleep(3);
 +
++			/* Read one data byte: a real device drives varying bits here,
++			 * whereas a stuck-low / weak-pull bus stays at 0 for all 8. */
++			for (int i = 7; i >= 0; i--) {
++				pc_bb_set(scl, 1);
++				pc_sleep(3);
++				data |= (pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u) << i;
++				pc_bb_set(scl, 0);
++				pc_sleep(3);
++			}
++
 +			/* STOP */
 +			pc_bb_set(sda, 0);
 +			pc_sleep(3);
@@ -1479,19 +1491,87 @@ index 0000000..8227e4c
 +			pc_sleep(3);
 +			pc_bb_set(sda, 1);
 +			pc_sleep(3);
++			bus_free = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
 +
 +			if (pre == 0)
 +				pre_low++;
 +			if (post == 0) {
 +				hits++;
-+				printf("PANDORA CAMERA: w24 %s r%u addr=%#x post=0 "
-+				    "pre=%u %s\n", tag, round, a, pre,
-+				    pre == 1 ? "REAL_ACK" : "PULLUP_FAIL");
++				printf("PANDORA CAMERA: w25 %s r%u addr=%#x post=0 pre=%u "
++				    "data=%#x bus_free=%u %s\n", tag, round, a, pre,
++				    data, bus_free,
++				    (bus_free == 1 && data != 0u) ? "REAL_DEVICE" :
++				    "STUCK_LOW");
 +			}
 +		}
-+		printf("PANDORA CAMERA: w24 %s round %u done: %u post=0 hits, "
-+		    "%u pre=0 (pull-up failures)\n", tag, round, hits, pre_low);
++		printf("PANDORA CAMERA: w25 %s round %u done: %u post=0 hits, "
++		    "%u pre=0 (normal for ACK)\n", tag, round, hits, pre_low);
 +	}
++}
++
++/* C-2b-w25: trace the physical pads while the CCI controller runs a
++ * transaction. GPIO bit-bang reaches devices on gpio109-112, yet the CCI
++ * controller reports NACK on every address for 12 rounds. If CCI is really
++ * wired to these pads (func=1), SDA/SCL must toggle during a transaction.
++ * If they stay static, either func=1 is not the CCI0 I2C mux value or the
++ * CCI core clock never started -- that would explain the discrepancy without
++ * blaming sensor power. TLMM GPIO_IN reflects the pad level regardless of
++ * the pin's function select, so this is a valid observation. */
++static void
++pc_cci_pad_trace(unsigned m, uint8_t slave)
++{
++	uint32_t sda = (m == 0) ? 109u : 111u;
++	uint32_t scl = (m == 0) ? 110u : 112u;
++	unsigned i;
++	uint32_t ps = 2, pc = 2, s, c, exec;
++	unsigned base_lo = 0, base_tog = 0;
++	unsigned run_sda_lo = 0, run_scl_lo = 0, run_sda_tog = 0, run_scl_tog = 0;
++
++	/* Baseline: bus idle, no transaction. */
++	ps = pc = 2;
++	for (i = 0; i < 2048; i++) {
++		s = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
++		c = pc_rd(pc_tlmm, PC_GPIO(scl) + 4) & 1u;
++		if (c == 0) base_lo++;
++		if (ps != 2 && s != ps) base_tog++;
++		if (pc != 2 && c != pc) base_tog++;
++		ps = s; pc = c;
++	}
++	printf("PANDORA CAMERA: w25 PAD TRACE baseline M%u: scl_low=%u "
++	    "toggles=%u (expect 0/0)\n", m, base_lo, base_tog);
++
++	/* Queue a minimal one-byte WRITE to <slave> and watch the wires. */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    pc_cci_load_word(PC_CCI_I2C_WRITE | (1u << 4), 0x00u, 0x00u, 0x00u));
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++	exec = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), exec);
++
++	ps = pc = 2;
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, 1u << (m * 2u + 0u));
++	for (i = 0; i < 4096; i++) {
++		s = pc_rd(pc_tlmm, PC_GPIO(sda) + 4) & 1u;
++		c = pc_rd(pc_tlmm, PC_GPIO(scl) + 4) & 1u;
++		if (s == 0) run_sda_lo++;
++		if (c == 0) run_scl_lo++;
++		if (ps != 2 && s != ps) run_sda_tog++;
++		if (pc != 2 && c != pc) run_scl_tog++;
++		ps = s; pc = c;
++	}
++	printf("PANDORA CAMERA: w25 PAD TRACE active M%u addr=%#x: "
++	    "sda_low=%u scl_low=%u sda_tog=%u scl_tog=%u irq=%#x\n",
++	    m, slave, run_sda_lo, run_scl_lo, run_sda_tog, run_scl_tog,
++	    pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0));
++	printf("PANDORA CAMERA: w25 PAD TRACE verdict: %s\n",
++	    (run_scl_tog > 2 || run_sda_tog > 2) ?
++	    "CCI IS DRIVING THESE PADS" : "CCI NOT DRIVING THESE PADS (mux/clock)");
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +}
 +
 +/* C-2b-w9: sensor power-up + chip-ID (Path A continuation). */
@@ -2010,6 +2090,16 @@ index 0000000..8227e4c
 +	    pc_rd(pc_tlmm, PC_GPIO(112)), pc_rd(pc_tlmm, PC_GPIO(112) + 4));
 +
 +	/* 7. Multi-address I2C scan on M1 (wide) */
++	/* w25: trace the pads while CCI runs one transaction, before the scan.
++	 * pinmux is func=1 (CCI) and CCI0 branch is on at this point. */
++	pc_cci_pad_trace(m, 0x10u); /* 0x10 = a w23/w24 bit-bang ACK address */
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++	pc_sleep(2);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
 +	printf("PANDORA CAMERA: w13 extra settle delay 100ms\n");
 +
 +	pc_sleep(100);
