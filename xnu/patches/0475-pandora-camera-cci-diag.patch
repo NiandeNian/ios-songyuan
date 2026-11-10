@@ -31,9 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
+index 0000000..cdc0d99
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,1054 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -77,12 +78,17 @@ new file mode 100644
 + *       RCG state and must be reported as such, not hidden by restored=yes.
 + *   NO:
 + *     - It never votes RPMh rails, never drives the GPIO regulators, never
-+ *       clocks the sensors, never writes an RCG / rate / PLL, never issues a
++ *       clocks the sensors, never writes a PLL, never writes RCG M/N/D registers, never issues a
 + *       CCI transaction, never touches CSIPHY / CSID / IFE, never reserves
 + *       SMMU, never unmaps camera regions.
-+ *     - C-2b-w2 is the ONLY exception to "never enables a CCI branch": it
++ *     - C-2b-w2 is the FIRST exception to "never enables a CCI branch": it
 + *       writes CCI0 CBCR (0x21268) BIT(0), polls CLK_OFF, prints the A/B and
 + *       restores the exact pre-write value. No I2C transaction follows.
++ *     - C-2b-w5 is the FIRST exception to "never writes an RCG": it switches
++ *       the CCI0 RCG source from XO to PLL0_OUT_EVEN/16 (37.5 MHz) by writing
++ *       CFG_RCGR (SRC_SEL=2 + SRC_DIV=16, HW_CLK_CTRL kept) and CMD_RCGR
++ *       CMD_UPDATE, polls, then rolls the RCG back in reverse and re-parks the
++ *       root. It still writes no PLL, no RCG M/N, no rail/GPIO/CCI transaction.
 + *   Mode 2 is identical to mode 1 for now: per-sensor address + power
 + *   bring-up is gated on vendor data the board DT does not carry. Do not
 + *   "extend" this driver further without filling those unknowns first.
@@ -277,6 +283,27 @@ new file mode 100644
 +#define PC_PLL0_CONFIG_CTL_U1     0x028u
 +#define PC_PLL0_TEST_CTL          0x02cu
 +#define PC_PLL0_TEST_CTL_U        0x030u
++
++/* C-2b-w5: CCI0 RCG source-switch bit layout, from cached clk-rcg2.c
++ * (lines 27-43). CFG_RCGR = camcc+0x21254, CMD_RCGR = camcc+0x21250.
++ *   CFG_SRC_SEL    [10:8]  (parent_map index; 2 = P_CAM_CC_PLL0_OUT_EVEN)
++ *   CFG_SRC_DIV    [7:0]    (pre_div; hid_width=5 -> mask 0x1f; freq_tbl div=16)
++ *   CFG_MODE       [13:12]  (0 = single-edge / integer)
++ *   CFG_HW_CLK_CTRL [20]    (already set in the running register)
++ *   CMD_UPDATE     [0]      (write 1, poll until the hardware clears it)
++ * cam_cc_cci_0_clk_src: parent_map_1 index 2 = P_CAM_CC_PLL0_OUT_EVEN;
++ * freq_tbl F(37500000, PLL0_OUT_EVEN, 16, 0, 0) -> 600 MHz / 16 = 37.5 MHz.
++ * Force-enable = enabling the CCI0 branch CBCR: HW_CLK_CTRL un-parks the root
++ * (CMD_ROOT_OFF clears), exactly as w2/w3 observed -- no separate PLL or
++ * CMD_ROOT_EN write. See CAMERA_C2BW4_RESULT.md and cached clk-rcg2.c
++ * update_config() (CMD_UPDATE + poll CMD_UPDATE clear). */
++#define PC_CFG_SRC_SEL_MASK    0x00000700u
++#define PC_CFG_SRC_SEL_SHIFT   8u
++#define PC_CFG_SRC_DIV_MASK    0x0000001fu
++#define PC_CFG_MODE_MASK       0x00003000u
++#define PC_CFG_HW_CLK_CTRL     0x00100000u
++#define PC_CMD_UPDATE          0x00000001u
++
 +
 +/* Bounded polls: pc_sleep() is millisecond-granular, so 20 x 1 ms is a
 + * deliberately generous bound (upstream uses 2 ms for GDSC and 200 us for a
@@ -643,6 +670,137 @@ new file mode 100644
 +	return ret == 0;
 +}
 +
++/* C-2b-w5: switch the CCI0 RCG source from XO (SRC_SEL=0) to
++ * PLL0_OUT_EVEN/16 (37.5 MHz) using the cached clk_rcg2_shared_set_rate
++ * handshake, then roll it back. Runs while the parent TITAN_TOP GDSC and the
++ * AHB branches are already up (called from pc_w1_bringup after w2).
++ *
++ * Sequence (cached clk-rcg2.c update_config / clk_rcg2_configure):
++ *   1. snapshot CMD_RCGR/CFG_RCGR/CBCR before.
++ *   2. force-enable root + branch on: write CCI0 CBCR BIT(0), poll CLK_OFF
++ *      clear. HW_CLK_CTRL un-parks the root (CMD_ROOT_OFF clears) -- proven in
++ *      w2/w3, so this IS the force-enable; no separate CMD_ROOT_EN write.
++ *   3. write CFG_RCGR with SRC_SEL=2 (PLL0_OUT_EVEN), SRC_DIV=16, keep
++ *      HW_CLK_CTRL, MODE=0.
++ *   4. commit: write CMD_RCGR CMD_UPDATE, poll CMD_UPDATE until it clears.
++ *   5. read back CFG_RCGR/CMD_RCGR/CBCR; report whether SRC_SEL switched.
++ *   6. roll back in reverse: restore CFG, CMD_UPDATE+poll, then branch off
++ *      (root re-parks, as w3 proved), verify CMD_RCGR+CFG_RCGR restored.
++ * No PLL register, RCG M/N, rail, GPIO or CCI queue word is touched. Every
++ * failure is printed and still rolls back; a missing status bit is never
++ * turned into success. */
++static void
++pc_w5_rcg_switch(void)
++{
++	uint32_t cbcr_before, cmd_before, cfg_before;
++	uint32_t cfg_new, cmd_after, cfg_after, cbcr_after;
++	uint32_t cmd_restored, cfg_restored;
++	int upd_ret = 0, rb_upd_ret = 0;
++	bool switched = false, root_reparked = false, restored_clean = false;
++
++	if (!pc_camcc) {
++		printf("PANDORA CAMERA: C-2b-w5 skipped (camcc unmapped)\n");
++		return;
++	}
++	cbcr_before = pc_rd(pc_camcc, PC_CCI0_CBCR);
++	cmd_before  = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_before  = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	printf("PANDORA CAMERA: C-2b-w5 RCG switch before: cbcr=%#x cmd_rcgr=%#x "
++	    "cfg_rcgr=%#x root_off=%s src_sel=%u src_div=%u hw_clk_ctrl=%s\n",
++	    cbcr_before, cmd_before, cfg_before,
++	    (cmd_before & PC_CMD_ROOT_OFF) ? "yes" : "no",
++	    (unsigned)((cfg_before & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT),
++	    (unsigned)(cfg_before & PC_CFG_SRC_DIV_MASK),
++	    (cfg_before & PC_CFG_HW_CLK_CTRL) ? "yes" : "no");
++
++	/* 2. force-enable root + branch on (HW_CLK_CTRL un-parks root). */
++	pc_step("w5 CCI0 branch", PC_CAMCC_PA + PC_CCI0_CBCR);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before | PC_CBCR_ENABLE);
++	if (pc_wait_branch_on("w5", PC_CCI0_CBCR) != 0) {
++		printf("PANDORA CAMERA: C-2b-w5 branch did NOT come up; aborting "
++		    "switch (no CFG write issued)\n");
++		pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++		return;
++	}
++	printf("PANDORA CAMERA: C-2b-w5 root after branch-on cmd_rcgr=%#x root_off=%s "
++	    "(HW_CLK_CTRL un-parked root)\n",
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR),
++	    (pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_ROOT_OFF) ? "yes" : "no");
++
++	/* 3. compute new CFG_RCGR: SRC_SEL=2, SRC_DIV=16, keep HW_CLK_CTRL, MODE=0. */
++	cfg_new = (cfg_before &
++	    ~(PC_CFG_SRC_SEL_MASK | PC_CFG_SRC_DIV_MASK | PC_CFG_MODE_MASK |
++	      PC_CFG_HW_CLK_CTRL)) |
++	    (2u << PC_CFG_SRC_SEL_SHIFT) | (16u << 0) | PC_CFG_HW_CLK_CTRL;
++	printf("PANDORA CAMERA: C-2b-w5 writing cfg_rcgr=%#x (SRC_SEL=2 PLL0_OUT_EVEN, "
++	    "SRC_DIV=16, HW_CLK_CTRL kept, MODE=0)\n", cfg_new);
++	pc_step("w5 CFG_RCGR", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_new);
++
++	/* 4. commit: CMD_UPDATE + poll CMD_UPDATE clear (update_config). */
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_UPDATE);
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_UPDATE)) {
++			upd_ret = 0;
++			break;
++		}
++		pc_sleep(1);
++		upd_ret = ETIMEDOUT;
++	}
++	printf("PANDORA CAMERA: C-2b-w5 update_config ret=%d\n", upd_ret);
++
++	/* 5. read back after. */
++	cmd_after  = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_after  = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	cbcr_after = pc_rd(pc_camcc, PC_CCI0_CBCR);
++	switched = ((cfg_after & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT) == 2u;
++	printf("PANDORA CAMERA: C-2b-w5 after: cbcr=%#x cmd_rcgr=%#x cfg_rcgr=%#x "
++	    "src_sel=%u src_div=%u clk_off=%s cmd_update_clear=%s -> %s\n",
++	    cbcr_after, cmd_after, cfg_after,
++	    (unsigned)((cfg_after & PC_CFG_SRC_SEL_MASK) >> PC_CFG_SRC_SEL_SHIFT),
++	    (unsigned)(cfg_after & PC_CFG_SRC_DIV_MASK),
++	    (cbcr_after & PC_CBCR_CLK_OFF) ? "yes" : "no",
++	    (cmd_after & PC_CMD_UPDATE) ? "no" : "yes",
++	    switched ? "SWITCHED" : "NOT SWITCHED");
++	pc_w3_controller("w5-switched");
++
++	/* 6. roll back in reverse: restore CFG, CMD_UPDATE+poll, branch off. */
++	pc_step("w5 rollback", PC_CAMCC_PA + PC_CCI0_CFG_RCGR);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, cfg_before);
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR,
++	    pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) | PC_CMD_UPDATE);
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (!(pc_rd(pc_camcc, PC_CCI0_CMD_RCGR) & PC_CMD_UPDATE)) {
++			rb_upd_ret = 0;
++			break;
++		}
++		pc_sleep(1);
++		rb_upd_ret = ETIMEDOUT;
++	}
++	/* branch off -> HW_CLK_CTRL re-parks the root (w3 proved this). */
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++	cmd_restored = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_restored = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	root_reparked = (cmd_restored & PC_CMD_ROOT_OFF) != 0;
++	restored_clean = (cmd_restored == cmd_before) &&
++	    (cfg_restored == cfg_before);
++	printf("PANDORA CAMERA: C-2b-w5 cleanup: cmd_rcgr=%#x (before=%#x) "
++	    "cfg_rcgr=%#x (before=%#x) root_reparked=%s rb_update=%d -> %s\n",
++	    cmd_restored, cmd_before, cfg_restored, cfg_before,
++	    root_reparked ? "yes" : "no", rb_upd_ret,
++	    restored_clean ? "CLEAN" : "LEFTOVER (probe changed CCI0 RCG state)");
++	if (switched) {
++		printf("PANDORA CAMERA: C-2b-w5 result: branch_up=yes source_switched=yes "
++		    "rollback=%s -> %s\n", restored_clean ? "CLEAN" : "LEFTOVER",
++		    restored_clean ? "PASS (runtime proof PLL0 usable w/o sw enable)"
++		                   : "PARTIAL (switch ok, rollback incomplete)");
++	} else {
++		printf("PANDORA CAMERA: C-2b-w5 result: source NOT switched; "
++		    "rollback=%s\n", restored_clean ? "CLEAN" : "LEFTOVER");
++	}
++}
++
 +/* C-2b-w1: the first MMIO write in this file. It enables TITAN_TOP GDSC and
 + * two AHB branches, proves each with a bounded status poll, prints the A/B
 + * values, then restores all three registers in reverse order. It does not
@@ -754,6 +912,14 @@ new file mode 100644
 +		    w2_up ? "BRANCH ON" : "BRANCH NOT ON");
 +	} else {
 +		printf("PANDORA CAMERA: C-2b-w2 skipped (GDSC or CAM_TOP_AHB not up)\n");
++	}
++
++	/* C-2b-w5 runs while the GDSC is still up (same gate as w2). It switches
++	 * the CCI0 RCG source from XO to PLL0_OUT_EVEN/16 (37.5 MHz) via the cached
++	 * clk_rcg2_shared_set_rate handshake, then rolls the RCG back. No PLL/RCG M/N
++	 * register is touched; it does NOT gate the w1 verdict. */
++	if (gdsc_up && branch_up) {
++		pc_w5_rcg_switch();
 +	}
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
