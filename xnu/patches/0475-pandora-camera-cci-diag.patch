@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..53ac740
+index 0000000..b56c7d9
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2341 @@
+@@ -0,0 +1,2334 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1751,33 +1751,16 @@ index 0000000..53ac740
 +		pc_gpio_set(116, 0, 0, 8, 1); /* afvdd, func=0 GPIO */
 +		printf("PANDORA CAMERA: w13 GPIO: 107=high (wide pwr), 116=high (afvdd)\n");
 +
-+		/* Reset assert */
-+		pc_gpio_set(106, 0, 0, 2, 0);
-+		printf("PANDORA CAMERA: w13 GPIO 106=low (reset assert)\n");
-+		pc_sleep(10);
-+
-+		/* Reset release - sensor needs reset deasserted to boot! */
-+		pc_gpio_set(106, 0, 0, 2, 1);  /* reset release (high) */
-+		printf("PANDORA CAMERA: w13 GPIO 106=high (reset release)\n");
-+
-+		pc_sleep(50);
-+
-+		/* MCLK enable */
++		/* w20: MCLK BEFORE reset — sensor state machine needs clock at reset release */
 +		pc_gpio_set(89, 1, 0, 8, 1); /* cam_mclk func=1 */
-+		printf("PANDORA CAMERA: w13 GPIO 89=cam_mclk (func=1, 8mA)\n");
-+		pc_sleep(5);
++		printf("PANDORA CAMERA: w20 GPIO 89=cam_mclk (func=1, 8mA)\n");
 +
-+		/* w18: Enable BDISTMCLKCC MCLK source (XO 19.2MHz, no PLL needed) */
-+		/* HW_CLK_CTRL mode: set CFG_RCGR + branch CBCR is enough */
-+		printf("PANDORA CAMERA: w18 MCLK: enabling BDISTMCLKCC mclk0/2/3/4 (XO 19.2MHz)\n");
++		/* w20: Enable BDISTMCLKCC MCLK source (XO 19.2MHz) BEFORE reset */
++		printf("PANDORA CAMERA: w20 MCLK: enabling BDISTMCLKCC mclk0/2/3/4 (XO 19.2MHz)\n");
 +		{
 +			static const uint32_t mclk_rcg[] = { 0x4000, 0x401c, 0x4038, 0x4054 };
 +			for (unsigned mi = 0; mi < 4; mi++) {
 +				uint32_t rcg = mclk_rcg[mi];
-+				uint32_t cfg = pc_rd(pc_bdistm, rcg + 4);
-+				uint32_t cmd = pc_rd(pc_bdistm, rcg);
-+				printf("PANDORA CAMERA: w18 mclk%u BEFORE cfg=%#x cmd=%#x cbcr=%#x\n",
-+				    mi, cfg, cmd, pc_rd(pc_bdistm, rcg + 0x18));
 +				/* CFG_RCGR: SRC_SEL=0 (XO), SRC_DIV=0, MODE=0, HW_CLK_CTRL BIT(20) */
 +				pc_wr(pc_bdistm, rcg + 4, 0x00100000u);
 +				/* CMD_RCGR: clear ROOT_OFF, set ROOT_EN|UPDATE */
@@ -1790,11 +1773,21 @@ index 0000000..53ac740
 +				/* Branch CBCR: enable BIT(0) */
 +				pc_wr(pc_bdistm, rcg + 0x18, 0x1u);
 +				pc_sleep(1);
-+				printf("PANDORA CAMERA: w18 mclk%u AFTER  cfg=%#x cmd=%#x cbcr=%#x\n",
++				printf("PANDORA CAMERA: w20 mclk%u cfg=%#x cmd=%#x cbcr=%#x\n",
 +				    mi, pc_rd(pc_bdistm, rcg + 4), pc_rd(pc_bdistm, rcg),
 +				    pc_rd(pc_bdistm, rcg + 0x18));
 +			}
 +		}
++
++		/* Reset assert (MCLK already running) */
++		pc_gpio_set(106, 0, 0, 2, 0);
++		printf("PANDORA CAMERA: w20 GPIO 106=low (reset assert, MCLK already on)\n");
++		pc_sleep(10);
++
++		/* Reset release - sensor boots with MCLK running */
++		pc_gpio_set(106, 0, 0, 2, 1);
++		printf("PANDORA CAMERA: w20 GPIO 106=high (reset release)\n");
++		pc_sleep(50);
 +	}
 +
 +	/* 4. PINMUX FIX: configure CCI0 I2C pins to CCI I2C function */
