@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..820799e
+index 0000000..1d991e6
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2322 @@
+@@ -0,0 +1,2311 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1828,40 +1828,33 @@ index 0000000..820799e
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +
-+		/* Q0: SET_PARAM + WRITE reg 0x0000 + REPORT */
++		/* w17 combined transaction: SET_PARAM + WRITE reg 0x0000 + READ 2b + REPORT */
++		/* WRITE+READ in same Q0 => CCI generates REPEATED_START (no STOP between) */
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +		    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +		    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
-+		    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
-+
-+		/* Q1: SET_PARAM + READ 2 bytes + REPORT */
-+		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
-+		    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
-+		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
 +		    PC_CCI_I2C_READ | (2u << 4));
-+		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
++		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +		    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
 +
 +		cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
 +		pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), cur);
-+		cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 1));
-+		pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 1), cur);
-+		pc_wr(pc_cci[0], PC_CCI_QUEUE_START, (1u << (m * 2u + 0u)) | (1u << (m * 2u + 1u)));
++		pc_wr(pc_cci[0], PC_CCI_QUEUE_START, (1u << (m * 2u + 0u)));
 +
 +		pc_sleep(10);
 +		v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
-+		printf("PANDORA CAMERA: w13 SCAN addr=%#x IRQ=%#x cur_cmd=%#x\n",
-+		    slave, v, pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 1)));
++		printf("PANDORA CAMERA: w17 SCAN addr=%#x IRQ=%#x cur_cmd=%#x\n",
++		    slave, v, pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
 +
 +		if (v & 0x40000000u) {
-+			printf("PANDORA CAMERA: w13 SCAN addr=%#x -> NACK\n", slave);
-+		} else if (v & (1u << (8u + m * 12u))) {
++			printf("PANDORA CAMERA: w17 SCAN addr=%#x -> NACK\n", slave);
++		} else if (v & (1u << (4u + m * 12u))) {
 +			uint32_t rd0 = pc_rd(pc_cci[0], PC_CCI_READ_DATA(m));
-+			printf("PANDORA CAMERA: w13 SCAN addr=%#x -> ACK! read_data=%#x\n", slave, rd0);
++			printf("PANDORA CAMERA: w17 SCAN addr=%#x -> ACK! read_data=%#x\n", slave, rd0);
 +		} else {
-+			printf("PANDORA CAMERA: w13 SCAN addr=%#x -> other IRQ=%#x\n", slave, v);
++			printf("PANDORA CAMERA: w17 SCAN addr=%#x -> other IRQ=%#x\n", slave, v);
 +		}
 +
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
@@ -1871,8 +1864,8 @@ index 0000000..820799e
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +	}
-+	/* Also try M0 (tele, slave 0x5a, expect 0x1b7e) */
-+	printf("PANDORA CAMERA: w13 TEST: SET_PARAM+WRITE+READ+REPORT on M0 (tele)\n");
++	/* Also try M0 (tele, slave 0x5a, expect 0x1b7e) with combined transaction */
++	printf("PANDORA CAMERA: w17 TEST: combined SET_PARAM+WRITE+READ+REPORT on M0 (tele)\n");
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +	m = 0;
@@ -1880,35 +1873,31 @@ index 0000000..820799e
 +	    PC_CCI_I2C_SET_PARAM | ((uint32_t)0x5au << 4));
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +	    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
-+	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
-+	    PC_CCI_I2C_SET_PARAM | ((uint32_t)0x5au << 4));
-+	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +	    PC_CCI_I2C_READ | (2u << 4));
-+	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
++	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
 +	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0),
 +	    pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0)));
-+	pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 1),
-+	    pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 1)));
-+	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, (1u << (m * 2u + 0u)) | (1u << (m * 2u + 1u)));
++	pc_wr(pc_cci[0], PC_CCI_QUEUE_START, (1u << (m * 2u + 0u)));
 +	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
-+	printf("PANDORA CAMERA: w13 M0 IRQ now=%#x\n", v);
++	printf("PANDORA CAMERA: w17 M0 IRQ now=%#x\n", v);
 +	pc_sleep(5);
 +	v = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
-+	printf("PANDORA CAMERA: w13 M0 IRQ +5ms=%#x cur_cmd=%#x\n", v,
++	printf("PANDORA CAMERA: w17 M0 IRQ +5ms=%#x cur_cmd=%#x\n", v,
 +	    pc_rd(pc_cci[0], PC_CCI_Qn_CUR_CMD(m, 0)));
 +	{
-+		int ret = pc_cci_wait_irq(pc_cci[0], 1u << (8u + m * 12u));
-+		printf("PANDORA CAMERA: w13 M0 wait_irq ret=%d status=%#x\n", ret,
++		int ret = pc_cci_wait_irq(pc_cci[0], 1u << (4u + m * 12u));
++		printf("PANDORA CAMERA: w17 M0 wait_irq ret=%d status=%#x\n", ret,
 +		    pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0));
 +		if (ret == 0) {
 +			uint32_t rd0 = pc_rd(pc_cci[0], PC_CCI_READ_DATA(m));
-+			printf("PANDORA CAMERA: w13 M0 report_status=%#x read_data=%#x\n",
-+			    pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, 1)), rd0);
++			printf("PANDORA CAMERA: w17 M0 report_status=%#x read_data=%#x\n",
++			    pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, 0)), rd0);
 +			if ((rd0 & 0xffff) == 0x1b7eu) {
-+				printf("PANDORA CAMERA: w13 CHIP ID MATCH (tele s5khpe = 0x1b7e)\n");
++				printf("PANDORA CAMERA: w17 CHIP ID MATCH (tele s5khpe = 0x1b7e)\n");
 +			} else {
-+				printf("PANDORA CAMERA: w13 M0 CHIP ID MISMATCH (got %#x, expect 0x1b7e)\n",
++				printf("PANDORA CAMERA: w17 M0 CHIP ID MISMATCH (got %#x, expect 0x1b7e)\n",
 +				    rd0 & 0xffff);
 +			}
 +		}
