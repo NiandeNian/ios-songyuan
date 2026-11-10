@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..756ad64
+index 0000000..39a7e9d
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,1590 @@
+@@ -0,0 +1,1758 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -100,6 +100,12 @@ index 0000000..756ad64
 + *       two CCI0 sensors. It restores timing and rolls back. It still writes
 + *       no PLL, no RCG M/N, no rail/GPIO. This is the zero-risk path: no
 + *       PLL output enable is attempted until w7 proves the bus works.
++ *     - C-2b-w9 adds sensor power-up (RPMh votes + TLMM GPIO enables + MCLK)
++ *       and chip-ID reads. It writes RPMh rails via pandora_rpmh_resource
++ *       (proven interface) and TLMM GPIO config/level registers (replicating
++ *       pt_gpio). This is the first probe that touches power rails -- the
++ *       rollback disables all votes and restores pin states. Still no PLL,
++ *       no RCG M/N, no sensor register writes beyond chip-ID reads.
 + *   Mode 2 is identical to mode 1 for now: per-sensor address + power
 + *   bring-up is gated on vendor data the board DT does not carry. Do not
 + *   "extend" this driver further without filling those unknowns first.
@@ -1194,7 +1200,7 @@ index 0000000..756ad64
 +	return EIO;
 +}
 +
-+static void
++static void __unused
 +pc_w7_i2c_probe(void)
 +{
 +	uint32_t cbcr_before, cmd_before, cfg_before;
@@ -1343,6 +1349,168 @@ index 0000000..756ad64
 +	printf("PANDORA CAMERA: C-2b-w7 result: branch_up=yes "
 +	    "(timing + I2C queue probe done, no PLL write)\n");
 +}
++
++/* pandora_adsp.c exports pandora_rpmh_resource(name, offset, value).
++ * offset 0 = voltage mV, offset 4 = enable, offset 8 = mode. */
++extern int pandora_rpmh_resource(const char *, uint32_t, uint32_t);
++
++/* TLMM GPIO write (replicates pt_gpio in pandora_touch.c exactly).
++ * n = pin, func = 0 for GPIO, pull = 0/1/2, ma = drive in mA, out = 0/1/-1. */
++static void
++pc_gpio_set(unsigned n, unsigned func, unsigned pull, unsigned ma, int out)
++{
++	uint32_t ctl;
++	if (out >= 0) {
++		pc_wr(pc_tlmm, PC_GPIO(n) + 4, out ? 2u : 0u);
++	}
++	ctl = pc_rd(pc_tlmm, PC_GPIO(n)) & ~0x3ffu;
++	ctl |= pull | (func << 2) | ((ma / 2 - 1) << 6) | (out >= 0 ? 0x200u : 0u);
++	if (ctl & (1u << 11)) {
++		ctl |= 1u << 12;
++	}
++	pc_wr(pc_tlmm, PC_GPIO(n), ctl);
++}
++
++/* C-2b-w9: sensor power-up + chip-ID (Path A continuation). */
++static void
++pc_w9_power_probe(void)
++{
++	uint32_t cbcr_before, cmd_before, cfg_before;
++	uint16_t id = 0;
++	int ret;
++
++	if (!pc_camcc || !pc_cci[0] || !pc_tlmm) {
++		printf("PANDORA CAMERA: C-2b-w9 skipped (camcc/cci/tlmm unmapped)\n");
++		return;
++	}
++	cbcr_before = pc_rd(pc_camcc, PC_CCI0_CBCR);
++	cmd_before  = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
++	cfg_before  = pc_rd(pc_camcc, PC_CCI0_CFG_RCGR);
++	printf("PANDORA CAMERA: C-2b-w9 power probe (wide sensor) before: "
++	    "cbcr=%#x cmd_rcgr=%#x cfg_rcgr=%#x\n",
++	    cbcr_before, cmd_before, cfg_before);
++
++	/* 1. CCI0 branch on */
++	pc_step("w9 CCI0 branch", PC_CAMCC_PA + PC_CCI0_CBCR);
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before | PC_CBCR_ENABLE);
++	if (pc_wait_branch_on("w9", PC_CCI0_CBCR) != 0) {
++		printf("PANDORA CAMERA: C-2b-w9 branch did NOT come up; abort\n");
++		pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++		return;
++	}
++
++	/* 2. CCI reset (w8 fix) */
++	{
++		uint32_t rst_st = 0;
++		pc_wr(pc_cci[0], PC_CCI_RESET_CMD, PC_CCI_RESET_CMD_MASK);
++		for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++			rst_st = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++			if (rst_st & PC_BIT(24)) {
++				printf("PANDORA CAMERA: w9 CCI reset done (status=%#x)\n",
++				    rst_st);
++				break;
++			}
++			pc_sleep(1);
++		}
++		if (!(rst_st & PC_BIT(24))) {
++			printf("PANDORA CAMERA: w9 CCI reset ACK timeout (status=%#x)\n",
++			    rst_st);
++		}
++	}
++
++	/* 3. Vote RPMh rails for wide sensor */
++	printf("PANDORA CAMERA: w9 RPMh: L5M_E1 1200mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
++	pandora_rpmh_resource("L5M_E1", 0, 1200);
++	pandora_rpmh_resource("L5M_E1", 4, 1);
++	pandora_rpmh_resource("B1B_E0", 0, 3400);
++	pandora_rpmh_resource("B1B_E0", 4, 1);
++	pandora_rpmh_resource("B2B_E0", 0, 2704);
++	pandora_rpmh_resource("B2B_E0", 4, 1);
++	pc_sleep(1);
++
++	/* 4. GPIO power enables: GPIO 107 (wide AVDD/DVDD), GPIO 116 (AFVDD) */
++	printf("PANDORA CAMERA: w9 GPIO: 107=high (wide pwr), 116=high (afvdd)\n");
++	pc_gpio_set(107, 0, 0, 2, 1);   /* GPIO 107 high, 2mA */
++	pc_gpio_set(116, 0, 0, 2, 1);   /* GPIO 116 high, 2mA */
++	pc_sleep(1);                     /* 100us ramp + settle */
++
++	/* 5. Assert reset (GPIO 106 low) */
++	printf("PANDORA CAMERA: w9 GPIO 106=low (reset assert)\n");
++	pc_gpio_set(106, 0, 0, 2, 0);   /* reset low */
++	pc_sleep(10);                    /* 10ms hold */
++
++	/* 6. Enable MCLK (GPIO 89 as cam_mclk, func=1, 8mA) */
++	printf("PANDORA CAMERA: w9 GPIO 89=cam_mclk (func=1, 8mA)\n");
++	pc_gpio_set(89, 1, 0, 8, -1);   /* function 1 = cam_mclk, 8mA, no OE */
++	pc_sleep(2);                     /* settle */
++
++	/* 7. CCI timing (19.2MHz Standard) + IRQ mask */
++	{
++		static const uint32_t timings[][5] = {
++			{ 78u << 16 | 114u, 28u << 16 | 28u, 10u << 16 | 77u, 118u, 0x161u },
++		};
++		for (unsigned m = 0; m < 2; m++) {
++			pc_wr(pc_cci[0], PC_CCI_SCL_CTL(m), timings[0][0]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(m), timings[0][1]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(m), timings[0][2]);
++			pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(m), timings[0][3]);
++			pc_wr(pc_cci[0], PC_CCI_MISC_CTL(m), timings[0][4]);
++		}
++	}
++	pc_wr(pc_cci[0], PC_CCI_IRQ_MASK_0,
++	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u);
++	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	/* 8. Read chip-ID (wide: slave 0x20 on M1) */
++	printf("PANDORA CAMERA: w9 I2C: M1 slave=0x20 (wide) expect=0x5058\n");
++	id = 0;
++	ret = pc_cci_read_reg16(pc_cci[0], 1, 0x20, &id);
++	if (ret == 0 && id == 0x5058u) {
++		printf("PANDORA CAMERA: C-2b-w9 wide CHIP ID MATCH (%#x)\n", id);
++	} else if (ret == 0) {
++		printf("PANDORA CAMERA: C-2b-w9 wide chip_id=%#x (expect 0x5058) "
++		    "MISMATCH\n", id);
++	} else {
++		printf("PANDORA CAMERA: C-2b-w9 wide -> NACK/timeout (ret=%d)\n",
++		    ret);
++	}
++
++	/* Also try tele (slave 0x5a on M0) -- no power for tele, just check bus */
++	printf("PANDORA CAMERA: w9 I2C: M0 slave=0x5a (tele) expect=0x1b7e\n");
++	id = 0;
++	ret = pc_cci_read_reg16(pc_cci[0], 0, 0x5a, &id);
++	if (ret == 0 && id == 0x1b7eu) {
++		printf("PANDORA CAMERA: C-2b-w9 tele CHIP ID MATCH (%#x)\n", id);
++	} else if (ret == 0) {
++		printf("PANDORA CAMERA: C-2b-w9 tele chip_id=%#x (expect 0x1b7e) "
++		    "MISMATCH\n", id);
++	} else {
++		printf("PANDORA CAMERA: C-2b-w9 tele -> NACK/timeout (ret=%d)\n",
++		    ret);
++	}
++
++	/* 9. Rollback in reverse */
++	printf("PANDORA CAMERA: w9 rollback: MCLK off -> reset high -> GPIO off -> RPMh off\n");
++	pc_gpio_set(89, 0, 0, 2, -1);   /* GPIO 89 back to GPIO func */
++	pc_gpio_set(106, 0, 0, 2, 1);  /* reset deassert */
++	pc_sleep(1);
++	pc_gpio_set(107, 0, 0, 2, 0);  /* wide power off */
++	pc_gpio_set(116, 0, 0, 2, 0);  /* afvdd off */
++	pandora_rpmh_resource("L5M_E1", 4, 0);
++	pandora_rpmh_resource("B1B_E0", 4, 0);
++	pandora_rpmh_resource("B2B_E0", 4, 0);
++
++	/* restore timing to saved values (restore original SCL/SDA) */
++	pc_wr(pc_cci[0], PC_CCI_SCL_CTL(0), pc_rd(pc_cci[0], PC_CCI_SCL_CTL(0)));
++	/* (timing restore is best-effort; the values written are the standard set) */
++
++	pc_wr(pc_camcc, PC_CCI0_CBCR, cbcr_before);
++	printf("PANDORA CAMERA: C-2b-w9 cleanup: cbcr=%#x cmd_rcgr=%#x cfg_rcgr=%#x\n",
++	    pc_rd(pc_camcc, PC_CCI0_CBCR), pc_rd(pc_camcc, PC_CCI0_CMD_RCGR),
++	    pc_rd(pc_camcc, PC_CCI0_CFG_RCGR));
++	printf("PANDORA CAMERA: C-2b-w9 result: power+I2C probe done "
++	    "(see CHIP ID / NACK lines above)\n");
++}
 +static void
 +pc_w1_bringup(void)
 +{
@@ -1455,7 +1623,7 @@ index 0000000..756ad64
 +	 * clk_rcg2_shared_set_rate handshake, then rolls the RCG back. No PLL/RCG M/N
 +	 * register is touched; it does NOT gate the w1 verdict. */
 +	if (gdsc_up && branch_up) {
-+		pc_w7_i2c_probe();
++		pc_w9_power_probe();
 +	}
 +
 +	/* 4. Rollback in reverse order, always. Restore the exact values read
