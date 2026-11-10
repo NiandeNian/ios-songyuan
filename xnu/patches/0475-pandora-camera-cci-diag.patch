@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..9102084
+index 0000000..53ac740
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
 @@ -0,0 +1,2341 @@
@@ -1581,8 +1581,8 @@ index 0000000..9102084
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +
 +	/* Power up wide sensor (same as w9) */
-+	printf("PANDORA CAMERA: w12 RPMh: L5M_E1 1200mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
-+	pandora_rpmh_resource("L5M_E1", 0, 1200);
++	printf("PANDORA CAMERA: w12 RPMh: L5M_E1 1800mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
++	pandora_rpmh_resource("L5M_E1", 0, 1800);
 +	pandora_rpmh_resource("L5M_E1", 4, 1);
 +	pandora_rpmh_resource("B1B_E0", 0, 3400);
 +	pandora_rpmh_resource("B1B_E0", 4, 1);
@@ -1738,13 +1738,13 @@ index 0000000..9102084
 +	/* 3. Power up sensor (same as w12/w9) */
 +	{
 +		/* RPMh rails */
-+		pandora_rpmh_resource("L5M_E1", 0, 1200);
++		pandora_rpmh_resource("L5M_E1", 0, 1800);
 +		pandora_rpmh_resource("L5M_E1", 4, 1);
 +		pandora_rpmh_resource("B1B_E0", 0, 3400);
 +		pandora_rpmh_resource("B1B_E0", 4, 1);
 +		pandora_rpmh_resource("B2B_E0", 0, 2704);
 +		pandora_rpmh_resource("B2B_E0", 4, 1);
-+		printf("PANDORA CAMERA: w13 RPMh: L5M_E1 1200mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
++		printf("PANDORA CAMERA: w13 RPMh: L5M_E1 1800mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
 +
 +		/* GPIO power enables */
 +		pc_gpio_set(107, 0, 0, 8, 1); /* wide pwr, func=0 GPIO */
@@ -2001,8 +2001,8 @@ index 0000000..9102084
 +	}
 +
 +	/* 3. Vote RPMh rails for wide sensor */
-+	printf("PANDORA CAMERA: w9 RPMh: L5M_E1 1200mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
-+	pandora_rpmh_resource("L5M_E1", 0, 1200);
++	printf("PANDORA CAMERA: w9 RPMh: L5M_E1 1800mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
++	pandora_rpmh_resource("L5M_E1", 0, 1800);
 +	pandora_rpmh_resource("L5M_E1", 4, 1);
 +	pandora_rpmh_resource("B1B_E0", 0, 3400);
 +	pandora_rpmh_resource("B1B_E0", 4, 1);
