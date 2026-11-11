@@ -60,5 +60,9 @@ IRQ GPIO 158、reset GPIO 66、AVDD GPIO **117**、iovdd L4I_E0。
 是在约 60 秒后调用 reboot，但照片没有包含其 PID 1 标记，尚需独立确认。
 RAM 路线不初始化 UFS，因此没有注册 UFS 中的 PSCI 重启回调；新增
 `9001-songyuan-ram-psci-restart.patch` 在平台初始化时安装备用回调。
+修复内核已通过 CI；本轮用户照片明确显示 PID 1、持续的 `init: alive`
+和回调安装标记，ADB 随后确认 Android 完成了新的启动。超时照片的
+内核 UUID `4750da68-a025-3fd3-9fca-a98b93bb32d8` 对应上一版，而本轮
+内核 UUID 为 `15c52bd3-8add-3216-baf5-61bc4b881dfa`。
 
 完整 iOS 用户空间和桌面尚未验证。启动分区备份大小和 SHA-256 已与真机逐一比较。

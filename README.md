@@ -12,9 +12,12 @@ at `a87da37e164f23502d845e86f6686b3aeda08f48`. Upstream history is preserved.
   locked/green 与启动参数不一致，不能用这些属性判断实际解锁状态。
 - 参考仓库使用 `PANDORA` 内核配置；该名称不是本设备已完成适配的证明。
 - 自定义 ARM64 RAM 探针已启动并显示诊断屏幕，用户照片确认 EL1、4K 页和帧缓冲。
-- 真机已运行 XNU 22.6.0，并到达 RAM 测试的文件系统卸载/重启流程；用户照片
-  记录了 `Halt/Restart Timed Out`。照片没有包含 PID 1 的运行标记。
-- 已定位 RAM 启动未注册 PSCI 重启回调的问题，新增补丁正在等待编译和实测。
+- 真机已运行 XNU 22.6.0 的 RAM 用户空间，用户照片确认 PID 1 和持续的
+  `init: alive` 输出，ADB 确认修复后的内核自动返回 Android 并完成新的启动。
+- 上一版的 `Halt/Restart Timed Out` 已定位为 RAM 启动未注册 PSCI 重启回调；
+  修复内核已通过 CI 和本轮真机重启验证。
+- iOS 16.7.16 的 16 GiB HFSX 根镜像已安装到专用固定文件，完整原始存储
+  SHA-256 与源镜像一致，75 个 extents 位置保持不变。
 - 尚未验证完整 iOS 用户空间或桌面启动。
 
 ## 编译
@@ -35,3 +38,9 @@ GitHub Actions 的 `songyuan-xnu-baseline` 工作流先验证继承的 XNU 补�
 测试文件 extents，安装前核对源 SHA-256，安装后核对原始设备 SHA-256 和
 extent 稳定性。日志文件至少需要 4 MiB 环形缓冲加一个 4 KiB 头部块。
 当前使用 8 MiB 专用日志文件。详见 [device/BRINGUP.md](device/BRINGUP.md)。
+
+下载单个内核可使用 `tools/songyuan/fetch_kernel.py --repo OWNER/REPO --run RUN_ID --out DIR`；
+工具只接受成功的 CI，通过 ZIP Range 提取内核并检查 CRC，记录提交和 SHA-256。
+`install_root.py` 使用 ADB sync 暂存并校验源文件，再在 Android 本地读取它写入
+已检查的固定块区，核对写入量、写入哈希、原始存储哈希和 extent 稳定性。
+`read_console.py` 在返回 Android 后读取并解析专用文件中的 `PANDORLG` 控制台日志。

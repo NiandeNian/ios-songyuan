@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import posixpath
+import re
 import shlex
 import subprocess
 import time
@@ -17,11 +19,17 @@ def main():
     p.add_argument('--sha256', required=True)
     p.add_argument('--extents-out', type=Path, required=True)
     p.add_argument('--file', default='/data/local/tmp/unixnu-songyuan/iosroot.img')
+    p.add_argument('--staging-file', help='Ordinary Android file used for verified ADB sync transfer')
     p.add_argument('--yes', action='store_true')
     p.add_argument('image', type=Path)
     args = p.parse_args()
-    if not args.yes or not args.file.startswith('/data/local/tmp/unixnu-songyuan/'):
+    directory = '/data/local/tmp/unixnu-songyuan/'
+    args.file = posixpath.normpath(args.file)
+    staging = posixpath.normpath(args.staging_file or (args.file + '.source'))
+    if not args.yes or not args.file.startswith(directory):
         p.error('Requires --yes and a file inside /data/local/tmp/unixnu-songyuan/')
+    if not staging.startswith(directory) or staging == args.file:
+        p.error('Staging must be a different file inside /data/local/tmp/unixnu-songyuan/')
     image = args.image.resolve()
     size = image.stat().st_size
     with image.open('rb') as f:
@@ -53,19 +61,36 @@ def main():
             digest.update(block)
     if digest.hexdigest() != args.sha256.lower():
         p.error('Image SHA256 does not match')
+    source = shlex.quote(staging)
+    partial = shlex.quote(staging + '.partial')
+    root(f'if test -L {source} || test -L {partial}; then exit 1; fi')
+    existing_size = root(f'if test -f {source}; then stat -c %s {source}; fi').strip()
+    staged = False
+    if existing_size == str(size).encode():
+        print('Checking existing staging image SHA256', flush=True)
+        staged = root(f'sha256sum {source}', timeout=1800).split()[0].decode() == args.sha256.lower()
+    if not staged:
+        # ADB sync transfers files without terminal newline conversion. A long
+        # exec-in stream can lose its input channel, so raw writes read a local
+        # verified file on Android instead of the USB shell's standard input.
+        print('Transferring staging image with ADB sync', flush=True)
+        subprocess.run(adb + ['push', str(image), staging + '.partial'], check=True, timeout=1800)
+        print('Checking transferred image SHA256 on Android', flush=True)
+        transferred = root(f'sha256sum {partial}', timeout=1800).split()[0].decode()
+        if transferred != args.sha256.lower():
+            raise RuntimeError('Staging image hash mismatch; no raw write performed')
+        root(f'mv {partial} {source}; chmod 600 {source}')
+    else:
+        print('Reusing verified staging image', flush=True)
+    if json.loads(root(extent_cmd)) != before:
+        raise RuntimeError('Pinned extents changed during transfer; no raw write performed')
     print('Writing checked pinned extents', flush=True)
     command = f'{pin} rawwrite {quoted_file} /dev/block/by-name/userdata all --yes'
     base = '/data/local/tmp/unixnu-songyuan/install-' + uuid.uuid4().hex
     report, status = base + '.log', base + '.status'
-    remote = (command + ' >' + report + ' 2>&1; code=$?; '
+    remote = (command + ' <' + source + ' >' + report + ' 2>&1; code=$?; '
               'printf "%s" "$code" >' + status)
-    with image.open('rb') as f:
-        # exec-in preserves all input bytes on Windows. shell translates LF
-        # bytes; exec-out never forwards stdin. Remote completion is separate.
-        proc = subprocess.run(adb + ['exec-in', 'su -W -c ' + shlex.quote(remote)], stdin=f,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
-    print((proc.stdout + proc.stderr).decode(errors='replace'), flush=True)
-    proc.check_returncode()
+    root(remote, timeout=1800)
     for _ in range(60):
         finished = root(f'if test -f {status}; then cat {status}; fi').strip()
         if finished:
@@ -73,9 +98,15 @@ def main():
         time.sleep(1)
     else:
         raise RuntimeError('Writer completion not confirmed; do not boot')
-    print(root(f'cat {report}').decode(), flush=True)
+    written_report = root(f'cat {report}').decode()
+    print(written_report, flush=True)
     if finished != b'0':
         raise RuntimeError('Checked raw writer failed; do not boot')
+    written = re.search(r'wrote (\d+) blocks \((\d+) bytes\); sha256 of what was written: ([0-9a-f]{64})',
+                        written_report)
+    if not written or (int(written[1]), int(written[2]), written[3]) != (
+            size // 4096, size, args.sha256.lower()):
+        raise RuntimeError('Writer did not confirm the complete image and hash; do not boot')
     after = json.loads(root(extent_cmd))
     if after != before:
         raise RuntimeError('Pinned extents changed; do not boot the image')
