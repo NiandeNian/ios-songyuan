@@ -23,6 +23,12 @@ def main():
                    help='Private Android MAC capture for MobileGestalt and the identity publisher')
     p.add_argument('--empty-syscfg', action='store_true',
                    help='Publish a header-only guest SysCfg for absent Apple diagnostic hardware')
+    p.add_argument('--cpus', type=int, choices=range(1, 9), default=1,
+                   help='Number of CPUs selected by XNU from the measured eight-core topology')
+    p.add_argument('--amp', action='store_true',
+                   help='Describe six E cores and two P cores; requires a kernel with patch 0320')
+    p.add_argument('--out', type=Path,
+                   help='Separate build output directory for this RAM test')
     p.add_argument('--apple-adt', type=Path)
     p.add_argument('--trust-cache', type=Path, action='append', default=[])
     p.add_argument('--cmdline', default='')
@@ -45,7 +51,7 @@ def main():
         p.error('Guest SysCfg is an iOS userspace diagnostic option')
     root = Path(__file__).resolve().parents[2]
     tools = root / 'tools/songyuan'
-    out = root / ('out/xnu-init' if args.ram_init else 'out/ios')
+    out = args.out.resolve() if args.out else root / ('out/xnu-init' if args.ram_init else 'out/ios')
     out.mkdir(parents=True, exist_ok=True)
     suffix = '.exe' if sys.platform == 'win32' else ''
     tool = lambda name: str(args.llvm_bin.resolve() / (name + suffix))
@@ -62,10 +68,12 @@ def main():
         adt_cmd += ['--wifi-mac-file', args.wifi_mac_file.resolve()]
     if args.empty_syscfg:
         adt_cmd += ['--empty-syscfg']
+    if args.amp:
+        adt_cmd += ['--amp']
     call(adt_cmd)
     rd = 'md0' if args.ram_init else 'ufsroot0'
     files = int(bool(args.fw_extents))
-    board_cmdline = (f'debug=0x8 serial=3 cpus=1 keepsyms=1 -v -noprogress rd={rd} '
+    board_cmdline = (f'debug=0x8 serial=3 cpus={args.cpus} keepsyms=1 -v -noprogress rd={rd} '
                      'songyuan=1 pandora_touch=0 pandora_gpu=0 pandora_adsp=0 '
                      'pandora_gauge=0 pandora_amp=0 pandora_therm=0 pandora_camera=0 '
                      f'pandora_wifi=0 pandora_cpu=0 pandora_files={files}')

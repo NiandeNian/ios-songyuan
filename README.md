@@ -61,9 +61,17 @@ extent 稳定性。日志文件至少需要 4 MiB 环形缓冲加一个 4 KiB �
 `--wifi-mac-file FILE` 将私有 Android MAC 采集结果提供给现有网络身份发布器，
 同时填入 iOS 优先读取的 `/chosen/mac-address-wifi0`；Wi-Fi 数据连接尚未适配。
 
-首次 GUI 观察须留足时间：参考机型记录有约 14 分钟和超过 25 分钟的启动等待，
-其后续诊断将其中一轮归因于 assetsd。上一轮 1800 秒观察已结束；当前实际载荷不含
-`pandora_reboot_after`，沿用 `wdt=-1`，保留根镜像已生成的数据库。
-本轮加入 `/chosen/mac-address-wifi0` 和可选的空 `syscfg-v2-data`，观察设备信息查询
-是否解除等待；日志仍定期写入专用固定文件，读取须待手机返回 Android。
-苹果标志和 `exec SpringBoard` 均不能作为锁屏或桌面成功的证明。
+V8 的 59 次诊断采样确认：1 个 CPU 已初始化，但 QoS 并行能力和工作队列缓存上限
+全部为 0；LaunchServices 偏好队列持续有未执行任务。当前 PANDORA 内核启用 E/P
+调度器，旧 SMP 类型设备树没有被计入 E/P CPU 数量。完整证据见
+[iOS 启动诊断](device/IOS_BOOT_DIAGNOSIS.md)。
+
+`build_payload.py --cpus 8 --amp` 同时选用 8 核并生成 6E+2P 拓扑；`--amp` 需要
+包含补丁 0320 的内核。`--out DIR` 可将各轮镜像分别保存。V9 保留 V8 诊断内核，
+使用本机已核对的 8 个 MPIDR，已通过 RAM 临时启动；用户仍看到苹果标志和进度条，
+8/8 初始化结果、任务调度恢复和桌面仍须由后续日志及画面验证。
+
+当前载荷不含 `pandora_reboot_after`，沿用 `wdt=-1`，保留根镜像已生成的数据库。
+日志定期写入专用固定文件，读取须待手机返回 Android。苹果标志和 `exec SpringBoard`
+均不能作为锁屏或桌面成功的证明。WSL2 已完成本轮载荷与 loader 构建；内核编译的
+工具链限制见 [WSL 构建说明](tools/songyuan/WSL_BUILD.md)。
