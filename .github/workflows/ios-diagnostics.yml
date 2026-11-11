@@ -2,6 +2,7 @@ name: songyuan-ios-diagnostics
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

@@ -10,9 +10,22 @@ name: nezha-relink
 
 on:
   workflow_dispatch:
+    inputs:
+      diagnostics:
+        description: Build the original songyuan iOS lsd diagnostics from its tested CI objects
+        type: boolean
+        default: false
 
 jobs:
+  ios-diagnostics:
+    if: inputs.diagnostics
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/ios-diagnostics.yml
+
   relink:
+    if: ${{ !inputs.diagnostics }}
     runs-on: macos-15-intel
     timeout-minutes: 30
     permissions:
