@@ -20,7 +20,9 @@ def main():
     p.add_argument('--fw-extents', type=Path,
                    help='Verified pinned file pack for the kernel VFS installer')
     p.add_argument('--wifi-mac-file', type=Path,
-                   help='Private Android MAC capture for the existing network identity publisher')
+                   help='Private Android MAC capture for MobileGestalt and the identity publisher')
+    p.add_argument('--empty-syscfg', action='store_true',
+                   help='Publish a header-only guest SysCfg for absent Apple diagnostic hardware')
     p.add_argument('--apple-adt', type=Path)
     p.add_argument('--trust-cache', type=Path, action='append', default=[])
     p.add_argument('--cmdline', default='')
@@ -39,6 +41,8 @@ def main():
         p.error('iOS root boot requires --apple-adt and at least one --trust-cache')
     if args.ram_init and args.fw_extents:
         p.error('The VFS installer requires an iOS root')
+    if args.ram_init and args.empty_syscfg:
+        p.error('Guest SysCfg is an iOS userspace diagnostic option')
     root = Path(__file__).resolve().parents[2]
     tools = root / 'tools/songyuan'
     out = root / ('out/xnu-init' if args.ram_init else 'out/ios')
@@ -56,6 +60,8 @@ def main():
             adt_cmd += ['--' + key.replace('_', '-'), value.resolve()]
     if args.wifi_mac_file:
         adt_cmd += ['--wifi-mac-file', args.wifi_mac_file.resolve()]
+    if args.empty_syscfg:
+        adt_cmd += ['--empty-syscfg']
     call(adt_cmd)
     rd = 'md0' if args.ram_init else 'ufsroot0'
     files = int(bool(args.fw_extents))

@@ -1,5 +1,37 @@
 # songyuan bring-up record
 
+## 2026-11-11: original iOS plan resumed without a timed reset
+
+The sixth test completed its configured 1800-second observation. Its console
+records `pandora_reboot_after=1800 reached, resetting` at 1801.561 seconds,
+and Android completed a new boot at 1849.625 seconds. The user confirmed an
+Apple logo and incomplete progress bar; no lock screen or home screen was
+confirmed before the project was paused.
+
+The user resumed the original iOS 16.7.16 plan with no timed reset. The
+seventh image was accepted by `fastboot boot`, and the user again confirmed
+an Apple logo and progress bar. Its embedded 513-byte command line was
+checked against the built payload: `pandora_reboot_after` is absent and
+`wdt=-1` remains present. The kernel initializes the test-reset duration to
+zero when the argument is absent. A usable GUI and sustained runtime beyond
+the previous 30-minute limit remain unverified.
+
+The same prelinked restart-fixed kernel, three-cache trust module and
+phone-written HFSX root are retained. Preflight confirmed all 75 root, one
+log and four file-pack extents match their saved pinned mappings. The image
+includes the previously prepared direct `/chosen/mac-address-wifi0` input
+and a header-only, zero-entry `/chosen/syscfg-v2-data` container. These are
+intended to avoid the observed MobileGestalt fallback waits; their runtime
+effect requires the new console. Four processes are sampled every 120
+seconds, within the compiled kernel's four-name limit: SpringBoard, lsd,
+MobileGestaltHelper and assetsd. IOKit logging uses the helper's full name.
+
+No Android boot partition was flashed. The test image SHA-256 is
+`4c332fbce689576064eba6f543c09f49b440947a8a95d5d383c9fc13f245ceb0`.
+Launch metadata and exact arguments are saved locally under
+`.local/device/ios-untimed-v7-*`; Apple artifacts and unique identifiers
+remain outside Git. Console collection requires a later return to Android.
+
 ## 2026-11-11: network identity and extended GUI observation
 
 The fifth full-root test published patch 0337's network identity at 0.157
@@ -22,13 +54,22 @@ exported `MGSetAnswer` symbol are not actual function names.
 The newly supplied references are yechenan/data-a-live at
 `6547194c4883efad2f8a42ad46e95874dd5e7576` and yechenan/pudding-ios at
 `1d23efa6f3ff5e2f6a7b63ba61188ac40f5a3dbd`. Their handoff notes report
-14 to more than 25 minutes for the first LaunchServices rebuild. A six-minute
-reset cannot establish that the GUI will never start. The sixth test uses
+14 to more than 25 minutes for first-boot waits. The later pudding status
+record corrects the 835-second case: assetsd, rather than a database rebuild,
+blocked that run. A six-minute reset cannot establish that the GUI will never
+start, and a long delay alone does not prove database work. The sixth test uses
 1800 seconds, snapshots every 120 seconds, and
 `sweetfb_refresh=60 sweetfb_hz=30 sweetiolog=lsd,MobileGestaltHel` to reduce
 display work and observe the outstanding matching calls. Phone-created
 databases are retained between tests; the initial root installation hash
 is not used to reject a root that iOS has subsequently written.
+
+Further inspection of MobileGestalt's Wi-Fi address handler shows that it
+first reads `IODeviceTree:/chosen/mac-address-wifi0`; only when absent does
+it try sdio/wlan/marconi-wifi registry entries and the network-controller
+notification helper. `--wifi-mac-file` now also supplies this direct property,
+using the same validated private Android capture. This ADT change is prepared
+for the following test and has not yet been verified on the phone.
 
 ## 2026-11-11: first iOS-rendered boot screen
 

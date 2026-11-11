@@ -16,7 +16,10 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
   --fw-extents JSON    a pinned firmware pack (tools/mkfwpack.py, patch 0144):
            /chosen pandora-fw-extents + pandora-fw-blocks, same layout.
   --wifi-mac-file FILE a private Android MAC capture (six bytes or colon-separated text),
-           for patch 0337's network identity publisher; this does not enable Wi-Fi transport.
+           for MobileGestalt's /chosen query and patch 0337's identity publisher;
+           this does not enable Wi-Fi transport.
+  --empty-syscfg       an explicit empty guest factory-data container for iOS 16's
+           MobileGestalt; avoids waiting for absent Apple diagnostic hardware.
   --amp                cores 0-5 as the E cluster and 6-7 as the P cluster (kernels with patch 0320
            only; others assert on a second cluster).
   --gpu-pool MIB       carve MIB MiB below the panic log off the RAM given to XNU for the GPU
@@ -139,7 +142,18 @@ def network_identity_props(path):
             raise ValueError('Invalid private MAC capture') from error
     if len(mac) != 6 or mac[0] & 1 or mac == b'\0' * 6:
         raise ValueError('Network identity requires a six-byte nonzero unicast MAC')
-    return [('nezha-wifi-mac', mac)]
+    # iOS 16.7.16 reads /chosen/mac-address-wifi0 before trying sdio/wlan
+    # registry entries and an IONetworkController notification. Supplying
+    # only the publisher's private input still leaves that slow fallback.
+    return [('nezha-wifi-mac', mac), ('mac-address-wifi0', mac)]
+
+
+def empty_syscfg_props():
+    # iOS 16.7.16's reader takes /chosen/syscfg-v2-data before looking for
+    # AppleDiagnosticDataAccessReadOnly. Its SysCfg walker accepts a 24-byte
+    # header with magic 0x53436667 and a zero entry count at offset 0x14.
+    # No factory identifiers or calibration entries are synthesized.
+    return [('syscfg-v2-data', struct.pack('<6I', 0x53436667, 24, 0, 0, 0, 0))]
 
 
 def root_extent_props(path, root_bytes=None):
@@ -442,6 +456,9 @@ if __name__ == '__main__':
     if opt('--wifi-mac-file'):
         props = list(props) + network_identity_props(opt('--wifi-mac-file'))
         print('network identity: private Android MAC capture supplied', file=sys.stderr)
+    if '--empty-syscfg' in sys.argv:
+        props = list(props) + empty_syscfg_props()
+        print('guest SysCfg: empty header-only container supplied', file=sys.stderr)
     pool = int(opt('--gpu-pool'), 0) << 20 if opt('--gpu-pool') else 0
     if pool:
         print(f'gpu pool: {pool >> 20} MiB', file=sys.stderr)

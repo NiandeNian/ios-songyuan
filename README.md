@@ -1,4 +1,4 @@
-# UniXNU-songyuan
+# ios-songyuan
 
 Redmi K100 Pro Max (`songyuan`, SM8850/CANOE) UniXNU bring-up, based on
 [u0er/unixnu-xiaomi17u](https://github.com/u0er/unixnu-xiaomi17u)
@@ -20,7 +20,9 @@ at `a87da37e164f23502d845e86f6686b3aeda08f48`. Upstream history is preserved.
   SHA-256 与源镜像一致，75 个 extents 位置保持不变。
 - 完整 iOS 16.7.16 用户空间已在真机运行：launchd 完成早期启动，
   SpringBoard、backboardd 已执行，连续运行 240 秒后按测试参数返回 Android。
-  随后已显示苹果标志和持续推进的进度条，CPU 绘制链路已运行；桌面仍未完成启动。
+  随后已显示苹果标志和持续推进的进度条，CPU 绘制链路已运行。
+  1800 秒观察已按参数正常重启；现已启动无定时重启测试并再次显示苹果标志和进度条，
+  桌面仍未确认。
 - 完整载荷须合并 OS、Cryptex1 SystemOS、AppOS 三份信任缓存；
   仅 OS 缓存会导致 AMFI 拒绝 dyld shared cache。
 
@@ -57,8 +59,11 @@ extent 稳定性。日志文件至少需要 4 MiB 环形缓冲加一个 4 KiB �
 核对固定映射，仅接受专用 files/fw 测试文件。`prepare_hid_pack.py disable|restore`
 生成远程蓝牙 HID 插件的可恢复重命名操作。
 `--wifi-mac-file FILE` 将私有 Android MAC 采集结果提供给现有网络身份发布器，
-用于解除设备能力查询等待；Wi-Fi 数据连接尚未适配。
+同时填入 iOS 优先读取的 `/chosen/mac-address-wifi0`；Wi-Fi 数据连接尚未适配。
 
-首次 GUI 观察须留足 LaunchServices 重建时间：参考机型实测约 14 分钟，上游
-记录超过 25 分钟。当前用 1800 秒临时启动观察，并保留根镜像已生成的数据库。
+首次 GUI 观察须留足时间：参考机型记录有约 14 分钟和超过 25 分钟的启动等待，
+其后续诊断将其中一轮归因于 assetsd。上一轮 1800 秒观察已结束；当前实际载荷不含
+`pandora_reboot_after`，沿用 `wdt=-1`，保留根镜像已生成的数据库。
+本轮加入 `/chosen/mac-address-wifi0` 和可选的空 `syscfg-v2-data`，观察设备信息查询
+是否解除等待；日志仍定期写入专用固定文件，读取须待手机返回 Android。
 苹果标志和 `exec SpringBoard` 均不能作为锁屏或桌面成功的证明。
