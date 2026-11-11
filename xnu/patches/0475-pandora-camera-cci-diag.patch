@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..5a98326
+index 0000000..ea68f37
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2878 @@
+@@ -0,0 +1,2880 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1529,44 +1529,46 @@ index 0000000..5a98326
 +	pc_wr(pc_camcc, 0x20, 0x25c400e7u);
 +	pc_wr(pc_camcc, 0x24, 0x0a8062e0u);
 +	pc_wr(pc_camcc, 0x28, 0xf51dea20u);
-+	pc_wr(pc_camcc, 0x10, 0x3eu);
++	pc_wr(pc_camcc, 0x10, 0x0044003eu); /* Android running: cal_l<<16 | l=0x3e */
 +	pc_wr(pc_camcc, 0x14, 0x8000u);
-+	pc_wr(pc_camcc, 0x18, 0x8408u);
++	pc_wr(pc_camcc, 0x18, 0x840fu);  /* Android running: PLL_OUT_MASK=0x7 */
 +	pc_wr(pc_camcc, 0x1c, 0x2u);
-+	/* Upstream trion/taycan enable order: OPMODE=RUN -> wait
-+	 * PLL_LOCK_DET(BIT31) -> RMW PLL_MODE.OUTCTRL. Writing 0x1 to MODE
-+	 * would also clear the LOCK_COUNT field (w4 read MODE=0x100). */
++	/* w29: TAYCAN exposes PLL_STATUS_00..31; 0x0c is NOT a single lock
++	 * register, so the w28c BIT(31) poll was reading the wrong object.
++	 * Upstream trion_pll_is_enabled() = OPMODE.RUN && MODE.OUTCTRL.
++	 * Android running: MODE low bits = 0x5 (OUTCTRL|RESET_N), OPMODE=1. */
 +	pc_wr(pc_camcc, 0x04, 0x1u);   /* OPMODE: PLL_RUN */
-+	for (i = 0; i < 100; i++) {
-+		st = pc_rd(pc_camcc, 0x0c);
-+		if (st & PC_BIT(31))
-+			break;
++	for (i = 0; i < 20; i++)
 +		pc_sleep(1);
-+	}
-+	pc_wr(pc_camcc, 0x00, pc_rd(pc_camcc, 0x00) | 0x1u);
-+	printf("PANDORA CAMERA: w28 PLL0 AFTER mode=%#x opmode=%#x status=%#x "
-+	    "user=%#x polls=%u locked=%s\n",
-+	    pc_rd(pc_camcc, 0x00), pc_rd(pc_camcc, 0x04), st,
-+	    pc_rd(pc_camcc, 0x18), i, (st & PC_BIT(31)) ? "YES" : "NO");
-+	if (!(st & PC_BIT(31))) {
-+		/* Never leave a half-configured PLL behind. */
-+		pc_wr(pc_camcc, 0x00, mode0);
-+		pc_wr(pc_camcc, 0x04, opmode0);
-+		printf("PANDORA CAMERA: w28 PLL0 NOT LOCKED -> restored mode=%#x opmode=%#x, skip RCG switch\n",
-+		    mode0, opmode0);
-+		return 0;
++	pc_wr(pc_camcc, 0x00, pc_rd(pc_camcc, 0x00) | 0x5u);
++	st = pc_rd(pc_camcc, 0x0c);
++	{
++		uint32_t mode = pc_rd(pc_camcc, 0x00);
++		uint32_t opmode = pc_rd(pc_camcc, 0x04);
++		printf("PANDORA CAMERA: w29 PLL0 AFTER mode=%#x opmode=%#x state=%#x "
++		    "status=%#x l=%#x user=%#x enabled=%s\n",
++		    mode, opmode, pc_rd(pc_camcc, 0x08), st,
++		    pc_rd(pc_camcc, 0x10), pc_rd(pc_camcc, 0x18),
++		    ((opmode & 0x1u) && (mode & 0x1u)) ? "YES" : "NO");
++		if (!((opmode & 0x1u) && (mode & 0x1u))) {
++			pc_wr(pc_camcc, 0x00, mode0);
++			pc_wr(pc_camcc, 0x04, opmode0);
++			printf("PANDORA CAMERA: w29 PLL0 NOT ENABLED -> restored mode=%#x opmode=%#x\n",
++			    mode0, opmode0);
++			return 0;
++		}
 +	}
 +
 +	/* SRC_SEL=2 (PLL0_OUT_EVEN), SRC_DIV=16, HW_CLK_CTRL BIT(20) */
-+	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, 0x00100210u);
-+	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, 0x3u);
++	pc_wr(pc_camcc, PC_CCI0_CFG_RCGR, 0x0010021fu); /* Android running value */
++	pc_wr(pc_camcc, PC_CCI0_CMD_RCGR, 0x1u); /* UPDATE only; no ROOT_EN left set */
 +	for (i = 0; i < 100; i++) {
 +		cmd = pc_rd(pc_camcc, PC_CCI0_CMD_RCGR);
 +		if (!(cmd & 0x1u))
 +			break;
 +		pc_sleep(1);
 +	}
-+	printf("PANDORA CAMERA: w28 CCI0 AFTER cfg=%#x cmd=%#x polls=%u -> %s\n",
++	printf("PANDORA CAMERA: w29 CCI0 AFTER cfg=%#x cmd=%#x polls=%u -> %s\n",
 +	    pc_rd(pc_camcc, PC_CCI0_CFG_RCGR), cmd, i,
 +	    (cmd & 0x1u) ? "NOT_SWITCHED(CFG rolled back)" : "SWITCHED_37P5MHZ");
 +	if (cmd & 0x1u)
