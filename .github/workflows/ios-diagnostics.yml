@@ -1,0 +1,52 @@
+name: songyuan-ios-diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  relink:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xnu-buildtree
+          run-id: 42942489397
+          github-token: ${{ github.token }}
+          path: .ci/materials
+      - uses: actions/download-artifact@v4
+        with:
+          name: xnu-objects
+          run-id: 42942489397
+          github-token: ${{ github.token }}
+          path: .ci/materials
+      - name: Unpack matching source, headers and native objects
+        run: |
+          mkdir -p .ci/buildtree .ci/objects/obj
+          tar xzf .ci/materials/buildtree.tgz -C .ci/buildtree
+          tar xzf .ci/materials/objects.tgz -C .ci/objects/obj
+          tar xzf .ci/materials/linklibs.tgz -C .ci/objects
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+      - name: Compile lsd diagnostics with the Apple toolchain
+        run: |
+          python3 tools/songyuan/relink_diagnostics_ci.py \
+            --buildtree .ci/buildtree --objects .ci/objects --out .ci/result \
+            --baseline-run 42942489397 \
+            --patch xnu/patches/9002-songyuan-ls-preferences-diag.patch \
+            --source osfmk/arm/pandora_prof.c
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-diagnostic-kernel
+          path: |
+            .ci/result/kernel.development.pandora
+            .ci/result/pandora_prof.o
+            .ci/result/source.json
+            .ci/result/commands.json
+          retention-days: 7

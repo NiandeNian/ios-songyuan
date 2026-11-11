@@ -1,0 +1,167 @@
+--- a/osfmk/arm/pandora_prof.c
++++ b/osfmk/arm/pandora_prof.c
+@@ -32,6 +32,8 @@
+ #include <arm/cpu_data_internal.h>
+ #include <arm/machine_routines.h>
+ #include <mach/arm/thread_status.h>
++#include <mach/machine.h>
++#include <mach/thread_policy_private.h>
+ #include <arm64/proc_reg.h>
+ #include <kdp/kdp_dyld.h>
+ #include <vm/vm_map.h>
+@@ -510,6 +512,128 @@
+ 	return n;
+ }
+ 
++/* 9002: bounded, read-only snapshots. No guest code or queue state is changed.
++ * The preference addresses are specific to 20H392, and require a code signature
++ * match plus this task's dyld slide before they are dereferenced. */
++static bool songyuan_lsdiag;
++
++static bool
++songyuan_lsdiag_userptr(uint64_t p)
++{
++	return p >= 0x10000 && p < 0x8000000000ULL && (p & 7) == 0;
++}
++
++static void
++songyuan_lsdiag_words(vm_map_t map, int pid, const char *kind, uint64_t addr, unsigned words)
++{
++	uint64_t data[32];
++	if (map == VM_MAP_NULL || !songyuan_lsdiag_userptr(addr) || words > 32 || words == 0) {
++		return;
++	}
++	const kern_return_t kr = vm_map_read_user(map, addr, data, words * sizeof(data[0]));
++	if (kr != KERN_SUCCESS) {
++		printf("SONGYUAN LSD MEM %d %s %#llx read=%d\n", pid, kind, addr, kr);
++		return;
++	}
++	for (unsigned i = 0; i < words; i += 4) {
++		char line[224];
++		int n = snprintf(line, sizeof(line), "SONGYUAN LSD MEM %d %s %#llx +%x |", pid, kind, addr, i * 8);
++		for (unsigned j = i; j < words && j < i + 4; j++) {
++			n += snprintf(line + n, sizeof(line) - n, " %016llx", data[j]);
++		}
++		printf("%s\n", line);
++	}
++}
++
++static void
++songyuan_lsdiag_queue(vm_map_t map, int pid, const char *kind, uint64_t addr)
++{
++    uint64_t queue[32];
++    if (!songyuan_lsdiag_userptr(addr) ||
++        vm_map_read_user(map, addr, queue, sizeof(queue)) != KERN_SUCCESS) {
++        return;
++    }
++    songyuan_lsdiag_words(map, pid, kind, addr, 32);
++    char label[80];
++    bzero(label, sizeof(label));
++    if (songyuan_lsdiag_userptr(queue[9]) &&
++        vm_map_read_user(map, queue[9], label, sizeof(label) - 1) == KERN_SUCCESS) {
++        printf("SONGYUAN LSD LABEL %d %s %#llx %s\n", pid, kind, addr, label);
++    }
++    /* The matching exported offsets and queue code establish target=0x18,
++     * head=0x28, tail=0x30, state=0x38, label=0x48. Follow only these three
++     * links once; never recurse through arbitrary pointers. */
++    songyuan_lsdiag_words(map, pid, "queue-target", queue[3], 32);
++    songyuan_lsdiag_words(map, pid, "queue-head", queue[5], 16);
++    if (queue[6] != queue[5]) {
++        songyuan_lsdiag_words(map, pid, "queue-tail", queue[6], 16);
++    }
++}
++
++static void
++songyuan_lsdiag_task(task_t task, vm_map_t map, int pid)
++{
++	printf("SONGYUAN LSD CPU %d avail=%u physical=%u logical=%u max=%d/%d/%d\n", pid,
++	    processor_avail_count, machine_info.physical_cpu, machine_info.logical_cpu,
++	    machine_info.max_cpus, machine_info.physical_cpu_max, machine_info.logical_cpu_max);
++	for (int qos = THREAD_QOS_MAINTENANCE; qos < THREAD_QOS_LAST; qos++) {
++		printf("SONGYUAN LSD QOS %d qos=%d logical=%u physical=%u\n", pid, qos,
++		    qos_max_parallelism(qos, QOS_PARALLELISM_COUNT_LOGICAL), qos_max_parallelism(qos, 0));
++	}
++	struct user64_dyld_all_image_infos infos;
++	if (map == VM_MAP_NULL || task->all_image_info_addr == 0 ||
++	    vm_map_read_user(map, task->all_image_info_addr, &infos, sizeof(infos)) != KERN_SUCCESS ||
++	    infos.sharedCacheSlide > 0x100000000ULL || infos.sharedCacheBaseAddress == 0) {
++		return;
++	}
++	const uint64_t slide = infos.sharedCacheSlide;
++	const uint32_t expected[] = { 0xd10303ff, 0xa90957f6, 0xa90a4ff4, 0xa90b7bfd };
++	uint32_t code[4];
++	if (vm_map_read_user(map, 0x181cd6ed8ULL + slide, code, sizeof(code)) != KERN_SUCCESS ||
++	    memcmp(code, expected, sizeof(code)) != 0) {
++		printf("SONGYUAN LSD ABI %d unsupported prefs signature; no fixed-address reads\n", pid);
++		return;
++	}
++	printf("SONGYUAN LSD ABI %d 20H392 prefs signature matched slide=%#llx\n", pid, slide);
++	uint64_t globals[3];
++	if (vm_map_read_user(map, 0x1dcdd06d8ULL + slide, globals, sizeof(globals)) != KERN_SUCCESS) {
++		return;
++	}
++	songyuan_lsdiag_words(map, pid, "globals", 0x1dcdd06d8ULL + slide, 3);
++	songyuan_lsdiag_words(map, pid, "queue-offsets", 0x18dbb5c10ULL + slide, 8);
++	for (unsigned i = 0; i < 2; i++) {
++		uint64_t object[5];
++		if (!songyuan_lsdiag_userptr(globals[i]) ||
++		    vm_map_read_user(map, globals[i], object, sizeof(object)) != KERN_SUCCESS) {
++			continue;
++		}
++		songyuan_lsdiag_words(map, pid, i == 0 ? "secure-prefs" : "insecure-prefs", globals[i], 5);
++		/* _LSPreferences constructor stores its queue at +0x18 in this ABI. */
++		songyuan_lsdiag_queue(map, pid, i == 0 ? "secure-queue" : "insecure-queue", object[3]);
++	}
++}
++
++static void
++songyuan_lsdiag_regs(vm_map_t map, int pid, thread_t th, const arm_saved_state_t *u)
++{
++	if (u == NULL || !is_saved_state64(u)) {
++		return;
++	}
++	printf("SONGYUAN LSD THREAD %d tid=%llu sp=%#llx fp=%#llx continuation=%p event=%#llx\n",
++	    pid, thread_tid(th), get_saved_state_sp(u), get_saved_state_fp(u), th->continuation,
++	    (unsigned long long)th->wait_event);
++	for (unsigned i = 0; i < 28; i += 4) {
++		printf("SONGYUAN LSD REGS %d tid=%llu x%u | %016llx %016llx %016llx %016llx\n",
++		    pid, thread_tid(th), i, get_saved_state_reg(u, i), get_saved_state_reg(u, i + 1),
++		    get_saved_state_reg(u, i + 2), get_saved_state_reg(u, i + 3));
++	}
++	songyuan_lsdiag_words(map, pid, "user-sp", get_saved_state_sp(u), 32);
++	/* Callee-saved registers preserve dispatch's waiter and target queue in its
++	 * wait path. Record raw bounded data, leaving interpretation to the decoder. */
++	songyuan_lsdiag_words(map, pid, "user-x19", get_saved_state_reg(u, 19), 16);
++	songyuan_lsdiag_words(map, pid, "user-x20", get_saved_state_reg(u, 20), 32);
++}
++
+ static void
+ pstacks_dump(task_t task, const char *name)
+ {
+@@ -529,9 +653,16 @@
+ 	printf("PANDORA STACKS %s[%d]: %u threads, main binary at %#llx\n", name, pid, count,
+ 	    (unsigned long long)task->mach_header_vm_address);
+ 	pprof_images(task);
++	const bool lsdiag = songyuan_lsdiag && strcmp(name, "lsd") == 0;
++	if (lsdiag) {
++		songyuan_lsdiag_task(task, map, pid);
++	}
+ 	for (unsigned i = 0; i < count; i++) {
+ 		th = pstacks_threads[i];
+ 		const arm_saved_state_t *u = get_user_regs(th);
++		if (lsdiag) {
++			songyuan_lsdiag_regs(map, pid, th, u);
++		}
+ 		uint64_t pc = 0, lr = 0, fp = 0;
+ 		if (u != NULL && is_saved_state64(u)) {
+ 			pc = get_saved_state_pc(u);
+@@ -649,6 +780,9 @@
+ void
+ pandora_prof_start(void)
+ {
++	uint32_t lsdiag = 0;
++	PE_parse_boot_argn("songyuan_lsdiag", &lsdiag, sizeof(lsdiag));
++	songyuan_lsdiag = lsdiag == 1;
+ 	pstacks_start();
+ 	char config[64];
+ 	if (!PE_parse_boot_arg_str("pandora_prof", config, sizeof(config)) || config[0] == 0) {
