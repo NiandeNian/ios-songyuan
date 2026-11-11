@@ -40,7 +40,8 @@ jobs:
             --buildtree .ci/buildtree --objects .ci/objects --out .ci/result \
             --baseline-run 42942489397 \
             --patch xnu/patches/9002-songyuan-ls-preferences-diag.patch \
-            --source osfmk/arm/pandora_prof.c
+            --source osfmk/arm/pandora_prof.c \
+            --source bsd/pthread/pthread_workqueue.c
       - uses: actions/upload-artifact@v4
         if: always()
         with:

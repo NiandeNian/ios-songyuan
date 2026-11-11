@@ -9,7 +9,7 @@
  #include <arm64/proc_reg.h>
  #include <kdp/kdp_dyld.h>
  #include <vm/vm_map.h>
-@@ -510,6 +512,128 @@
+@@ -510,6 +512,130 @@
  	return n;
  }
  
@@ -17,6 +17,7 @@
 + * The preference addresses are specific to 20H392, and require a code signature
 + * match plus this task's dyld slide before they are dereferenced. */
 +static bool songyuan_lsdiag;
++extern void songyuan_workq_diag(int pid);
 +
 +static bool
 +songyuan_lsdiag_userptr(uint64_t p)
@@ -62,11 +63,11 @@
 +        printf("SONGYUAN LSD LABEL %d %s %#llx %s\n", pid, kind, addr, label);
 +    }
 +    /* The matching exported offsets and queue code establish target=0x18,
-+     * head=0x28, tail=0x30, state=0x38, label=0x48. Follow only these three
++     * head=0x68, tail=0x30, state=0x38, label=0x48. Follow only these three
 +     * links once; never recurse through arbitrary pointers. */
 +    songyuan_lsdiag_words(map, pid, "queue-target", queue[3], 32);
-+    songyuan_lsdiag_words(map, pid, "queue-head", queue[5], 16);
-+    if (queue[6] != queue[5]) {
++    songyuan_lsdiag_words(map, pid, "queue-head", queue[13], 16);
++    if (queue[6] != queue[13]) {
 +        songyuan_lsdiag_words(map, pid, "queue-tail", queue[6], 16);
 +    }
 +}
@@ -74,6 +75,7 @@
 +static void
 +songyuan_lsdiag_task(task_t task, vm_map_t map, int pid)
 +{
++	songyuan_workq_diag(pid);
 +	printf("SONGYUAN LSD CPU %d avail=%u physical=%u logical=%u max=%d/%d/%d\n", pid,
 +	    processor_avail_count, machine_info.physical_cpu, machine_info.logical_cpu,
 +	    machine_info.max_cpus, machine_info.physical_cpu_max, machine_info.logical_cpu_max);
@@ -138,7 +140,7 @@
  static void
  pstacks_dump(task_t task, const char *name)
  {
-@@ -529,9 +653,16 @@
+@@ -529,9 +655,16 @@
  	printf("PANDORA STACKS %s[%d]: %u threads, main binary at %#llx\n", name, pid, count,
  	    (unsigned long long)task->mach_header_vm_address);
  	pprof_images(task);
@@ -155,7 +157,7 @@
  		uint64_t pc = 0, lr = 0, fp = 0;
  		if (u != NULL && is_saved_state64(u)) {
  			pc = get_saved_state_pc(u);
-@@ -649,6 +780,9 @@
+@@ -649,6 +782,9 @@
  void
  pandora_prof_start(void)
  {
@@ -165,3 +167,34 @@
  	pstacks_start();
  	char config[64];
  	if (!PE_parse_boot_arg_str("pandora_prof", config, sizeof(config)) || config[0] == 0) {
+--- a/bsd/pthread/pthread_workqueue.c
++++ b/bsd/pthread/pthread_workqueue.c
+@@ -4709,6 +4709,28 @@
+ 	return error;
+ }
+ 
++/* 9002: called only by the opt-in lsd snapshot. Reuse the existing
++ * debug API's nonblocking workqueue lock and hold a proc reference. */
++void songyuan_workq_diag(int pid);
++void
++songyuan_workq_diag(int pid)
++{
++    for (thread_qos_t qos = WORKQ_THREAD_QOS_MIN; qos <= WORKQ_THREAD_QOS_MAX; qos++) {
++        printf("SONGYUAN LSD WQMAX %d qos=%d cached=%u\n", pid, qos,
++            wq_max_parallelism[_wq_bucket(qos)]);
++    }
++    proc_t p = proc_find(pid);
++    if (p == PROC_NULL) {
++        printf("SONGYUAN LSD WQ %d proc not found\n", pid);
++        return;
++    }
++    struct proc_workqueueinfo info = { 0 };
++    int error = fill_procworkqueue(p, &info);
++    proc_rele(p);
++    printf("SONGYUAN LSD WQ %d rc=%d threads=%u run=%u blocked=%u flags=%#x\n",
++        pid, error, info.pwq_nthreads, info.pwq_runthreads, info.pwq_blockedthreads, info.pwq_state);
++}
++
+ boolean_t
+ workqueue_get_pwq_exceeded(void *v, boolean_t *exceeded_total,
+     boolean_t *exceeded_constrained)
