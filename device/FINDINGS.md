@@ -29,9 +29,30 @@
 `p1_42_0d_0b_p21`。本机虽然分辨率相同，面板名称不同，不能直接套用其
 触控、电源、亮度、相机、音频和热管理配置。
 
-下一步从本机 FDT 提取内存/保留内存、CPU MPIDR、GIC、面板、触控 GPIO、
-GENI/SPI、调压器和 UFS 配置，作为板级补丁的依据。
+本机 FDT 已提取到 [hardware.json](hardware.json)。实际触控绑定 `fts_ts`，
+`fts_driver_info` 报告 IC ID `0x5883`、FocalTech V4.1、超分辨率坐标
+119999×260799（比例 100），不是 Synaptics。QUP4 SE0 = 0x01a80000，
+IRQ GPIO 158、reset GPIO 66、AVDD GPIO **117**、iovdd L4I_E0。
+参考仓库 GPIO 215 不适用于本机。
 
 ## 启动验证
 
-尚无本机 UEFI、XNU 或 iOS 用户空间启动证据。启动分区备份保存在 `.local/`。
+2026-11-11 的 `songyuan-hello` 临时 RAM 启动已得到用户照片确认：
+
+| 项目 | 探针屏幕值 |
+| --- | --- |
+| 执行级别 | EL1 |
+| Image 加载地址 | 0xC7800000 |
+| FDT | 0xD5C29000，FDT ok |
+| MIDR | 0x512F0021 |
+| MPIDR | 0x80000000（启动 CPU affinity 0） |
+| MMFR0 | 0x2100122100001024 |
+| 页大小 | 16K NO / 4K YES / 64K YES |
+| 物理地址宽度 | 44 bits |
+| CNTFRQ | 19200000 Hz |
+| 帧缓冲 | 0xFC800000、1200×2608、stride 4800 |
+| 色序 | 照片中 red / green / blue / white 正常 |
+| 快速引导 | fastboot product=songyuan、unlocked=yes，Sending/Booting OKAY |
+
+仅确认自定义 ARM64 程序和固件保留屏幕可工作。尚无本机 XNU 或 iOS
+用户空间启动证据。启动分区备份大小和 SHA-256 已与真机逐一比较。

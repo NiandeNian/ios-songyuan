@@ -1,0 +1,28 @@
+name: songyuan-boot-tools
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - shim/hello/**
+      - tools/songyuan/**
+      - .github/workflows/boot-tools.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang lld llvm
+      - name: Cross-build ARM64 RAM probe
+        run: python3 tools/songyuan/build_hello.py --llvm-bin /usr/bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: songyuan-hello
+          path: out/hello/songyuan-hello-boot.img
+          retention-days: 14

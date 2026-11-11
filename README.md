@@ -11,7 +11,8 @@ at `a87da37e164f23502d845e86f6686b3aeda08f48`. Upstream history is preserved.
 - `/proc/bootconfig` 确认 Bootloader **unlocked** / AVB orange；Android 属性报告的
   locked/green 与启动参数不一致，不能用这些属性判断实际解锁状态。
 - 参考仓库使用 `PANDORA` 内核配置；该名称不是本设备已完成适配的证明。
-- 尚未验证本设备上的 UEFI、XNU 或 iOS 用户空间启动。
+- 自定义 ARM64 RAM 探针已启动并显示诊断屏幕，用户照片确认 EL1、4K 页和帧缓冲。
+- 尚未验证本设备上的 XNU 或 iOS 用户空间启动。
 
 ## 编译
 

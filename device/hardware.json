@@ -1,0 +1,2562 @@
+{
+  "source": "live FDT captured 2026-11-11",
+  "nodes": {
+    "/": {
+      "model": [
+        "Qualcomm Technologies, Inc. Songyuan based on SM8850"
+      ],
+      "compatible": [
+        "qcom,canoe-mtp",
+        "qcom,canoe",
+        "qcom,canoep-mtp",
+        "qcom,canoep",
+        "qcom,mtp"
+      ],
+      "qcom,msm-id": [
+        "0x295",
+        "0x20000",
+        "0x294",
+        "0x10000",
+        "0x294",
+        "0x20000",
+        "0x1000294",
+        "0x10000",
+        "0x295",
+        "0x10000",
+        "0x1000295",
+        "0x10000",
+        "0x1000294",
+        "0x20000",
+        "0x1000295",
+        "0x20000"
+      ],
+      "interrupt-parent": [
+        "0x1"
+      ],
+      "#address-cells": [
+        "0x2"
+      ],
+      "#size-cells": [
+        "0x2"
+      ],
+      "qcom,board-id": [
+        "0x8",
+        "0x0"
+      ]
+    },
+    "/memory": {
+      "ddr_mr8": [
+        "0x1a"
+      ],
+      "ddr_mr7": [
+        "0x0"
+      ],
+      "ddr_mr6": [
+        "0x9"
+      ],
+      "ddr_manufacturer_id": [
+        "0x6"
+      ],
+      "ddr_device_type": [
+        "0x8"
+      ],
+      "ufs_ffu_batterystatus": [
+        "0x0"
+      ],
+      "ufs_ffu_bootreason": [
+        "0x20"
+      ],
+      "ddr_size": [
+        "0x10"
+      ],
+      "device_type": [
+        "memory"
+      ],
+      "reg": [
+        "0x0",
+        "0x81960000",
+        "0x0",
+        "0xa0000",
+        "0x0",
+        "0x81a60000",
+        "0x0",
+        "0x1a0000",
+        "0x0",
+        "0x81cf4000",
+        "0x0",
+        "0xc000",
+        "0x0",
+        "0x82478000",
+        "0x0",
+        "0x28000",
+        "0x0",
+        "0xc4800000",
+        "0x0",
+        "0x13000000",
+        "0x0",
+        "0xd7c00000",
+        "0x0",
+        "0x400000",
+        "0x0",
+        "0xd8800000",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xdeca0000",
+        "0x0",
+        "0x2075f800",
+        "0x0",
+        "0xff400000",
+        "0x0",
+        "0x400000",
+        "0x8",
+        "0x80000000",
+        "0x0",
+        "0x2f6fd000",
+        "0x8",
+        "0xb0000000",
+        "0x0",
+        "0x8500000",
+        "0xa",
+        "0x0",
+        "0x2",
+        "0x0",
+        "0x8",
+        "0xc0000000",
+        "0x1",
+        "0x40000000",
+        "0x8",
+        "0xb8700000",
+        "0x0",
+        "0x1e00000",
+        "0x0",
+        "0x82600000",
+        "0x0",
+        "0x100000",
+        "0x0",
+        "0x82800000",
+        "0x0",
+        "0x2200000",
+        "0x0",
+        "0x8a980000",
+        "0x0",
+        "0x80000",
+        "0x0",
+        "0x9959c000",
+        "0x0",
+        "0x64000",
+        "0x0",
+        "0x9ce80000",
+        "0x0",
+        "0x31d0000",
+        "0x0",
+        "0xa0910000",
+        "0x0",
+        "0xa70000",
+        "0x0",
+        "0xa6980000",
+        "0x0",
+        "0x1d450000"
+      ]
+    },
+    "/cpus/cpu@0": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x0"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0x3"
+      ],
+      "power-domains": [
+        "0x4"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x700"
+      ],
+      "dynamic-power-coefficient": [
+        "0xee"
+      ],
+      "clocks": [
+        "0x5",
+        "0x0"
+      ],
+      "next-level-cache": [
+        "0x6"
+      ]
+    },
+    "/cpus/cpu@100": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x100"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0x3"
+      ],
+      "power-domains": [
+        "0x7"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x700"
+      ],
+      "dynamic-power-coefficient": [
+        "0xee"
+      ],
+      "clocks": [
+        "0x5",
+        "0x0"
+      ],
+      "next-level-cache": [
+        "0x6"
+      ]
+    },
+    "/cpus/cpu@200": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x200"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0x3"
+      ],
+      "power-domains": [
+        "0x8"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x700"
+      ],
+      "dynamic-power-coefficient": [
+        "0xee"
+      ],
+      "clocks": [
+        "0x5",
+        "0x0"
+      ],
+      "next-level-cache": [
+        "0x6"
+      ]
+    },
+    "/cpus/cpu@300": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x300"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0x3"
+      ],
+      "power-domains": [
+        "0x9"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x700"
+      ],
+      "dynamic-power-coefficient": [
+        "0xee"
+      ],
+      "clocks": [
+        "0x5",
+        "0x0"
+      ],
+      "next-level-cache": [
+        "0x6"
+      ]
+    },
+    "/cpus/cpu@400": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x400"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0x3"
+      ],
+      "power-domains": [
+        "0xa"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x700"
+      ],
+      "dynamic-power-coefficient": [
+        "0xee"
+      ],
+      "clocks": [
+        "0x5",
+        "0x0"
+      ],
+      "next-level-cache": [
+        "0x6"
+      ]
+    },
+    "/cpus/cpu@500": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x500"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0x3"
+      ],
+      "power-domains": [
+        "0xb"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x700"
+      ],
+      "dynamic-power-coefficient": [
+        "0xee"
+      ],
+      "clocks": [
+        "0x5",
+        "0x0"
+      ],
+      "next-level-cache": [
+        "0x6"
+      ]
+    },
+    "/cpus/cpu@10000": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x10000"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0xc"
+      ],
+      "power-domains": [
+        "0xd"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x766"
+      ],
+      "dynamic-power-coefficient": [
+        "0x24c"
+      ],
+      "clocks": [
+        "0x5",
+        "0x1"
+      ],
+      "next-level-cache": [
+        "0xe"
+      ]
+    },
+    "/cpus/cpu@10100": {
+      "device_type": [
+        "cpu"
+      ],
+      "compatible": [
+        "arm,armv8"
+      ],
+      "reg": [
+        "0x0",
+        "0x10100"
+      ],
+      "enable-method": [
+        "psci"
+      ],
+      "cpu-idle-states": [
+        "0xc"
+      ],
+      "power-domains": [
+        "0xf"
+      ],
+      "power-domain-names": [
+        "psci"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "capacity-dmips-mhz": [
+        "0x766"
+      ],
+      "dynamic-power-coefficient": [
+        "0x24c"
+      ],
+      "clocks": [
+        "0x5",
+        "0x1"
+      ],
+      "next-level-cache": [
+        "0xe"
+      ]
+    },
+    "/reserved-memory/gunyah_hyp_region@80000000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x80000000",
+        "0x0",
+        "0xe00000"
+      ]
+    },
+    "/reserved-memory/reserved_region@80e00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x80e00000",
+        "0x0",
+        "0x400000"
+      ]
+    },
+    "/reserved-memory/cpucp_pdp_region@81200000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x81200000",
+        "0x0",
+        "0x200000"
+      ]
+    },
+    "/reserved-memory/qseecom_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "guarantee": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x1400000"
+      ]
+    },
+    "/reserved-memory/qseecom_ta_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "guarantee": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x1400000"
+      ]
+    },
+    "/reserved-memory/xbl_dtlog_region@81a00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x81a00000",
+        "0x0",
+        "0x60000"
+      ]
+    },
+    "/reserved-memory/aop_image_region@81c00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x81c00000",
+        "0x0",
+        "0x60000"
+      ]
+    },
+    "/reserved-memory/aop_cmd_db_region@81c60000": {
+      "compatible": [
+        "qcom,cmd-db"
+      ],
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x81c60000",
+        "0x0",
+        "0x20000"
+      ]
+    },
+    "/reserved-memory/aop_tme_uefi_merged_region@81c80000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x81c80000",
+        "0x0",
+        "0x74000"
+      ]
+    },
+    "/reserved-memory/smem_region@81d00000": {
+      "compatible": [
+        "qcom,smem"
+      ],
+      "reg": [
+        "0x0",
+        "0x81d00000",
+        "0x0",
+        "0x200000"
+      ],
+      "hwlocks": [
+        "0x18",
+        "0x3"
+      ],
+      "no-map": true
+    },
+    "/reserved-memory/pdp_ns_shared_region@81f00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x81f00000",
+        "0x0",
+        "0x100000"
+      ]
+    },
+    "/reserved-memory/cpucp_scandump_region@82000000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x82000000",
+        "0x0",
+        "0x380000"
+      ]
+    },
+    "/reserved-memory/adsp_mhi_region@82380000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x82380000",
+        "0x0",
+        "0x20000"
+      ]
+    },
+    "/reserved-memory/soccp_sdi_region@823a0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x823a0000",
+        "0x0",
+        "0x40000"
+      ]
+    },
+    "/reserved-memory/pmic_minii_dump_region@823e0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x823e0000",
+        "0x0",
+        "0x80000"
+      ]
+    },
+    "/reserved-memory/qup_fw_region@82460000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x82460000",
+        "0x0",
+        "0x18000"
+      ]
+    },
+    "/reserved-memory/pvm_fw_region@824a0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x824a0000",
+        "0x0",
+        "0x100000"
+      ]
+    },
+    "/reserved-memory/tz_stat_region@82700000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x82700000",
+        "0x0",
+        "0x100000"
+      ]
+    },
+    "/reserved-memory/qdss_apps_region@82800000": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "reg": [
+        "0x0",
+        "0x82800000",
+        "0x0",
+        "0x2000000"
+      ],
+      "reusable": true
+    },
+    "/reserved-memory/dsm_partition_1_region@84a00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x84a00000",
+        "0x0",
+        "0x5500000"
+      ]
+    },
+    "/reserved-memory/dsm_partition_2_region@89f00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x89f00000",
+        "0x0",
+        "0xa80000"
+      ]
+    },
+    "/reserved-memory/mpss_region@8aa00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x8aa00000",
+        "0x0",
+        "0xeb00000"
+      ]
+    },
+    "/reserved-memory/q6_mpss_dtb_region@99500000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x99500000",
+        "0x0",
+        "0x80000"
+      ]
+    },
+    "/reserved-memory/ipa_fw_region@99580000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x99580000",
+        "0x0",
+        "0x10000"
+      ]
+    },
+    "/reserved-memory/ipa_gsi_region@99590000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x99590000",
+        "0x0",
+        "0xa000"
+      ]
+    },
+    "/reserved-memory/gpu_microcode_region@9959a000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x9959a000",
+        "0x0",
+        "0x2000"
+      ]
+    },
+    "/reserved-memory/sp_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x1000000"
+      ]
+    },
+    "/reserved-memory/camera_region@99600000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x99600000",
+        "0x0",
+        "0x800000"
+      ]
+    },
+    "/reserved-memory/camera_2_region@99e00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x99e00000",
+        "0x0",
+        "0x800000"
+      ]
+    },
+    "/reserved-memory/video_region@9a600000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x9a600000",
+        "0x0",
+        "0x800000"
+      ]
+    },
+    "/reserved-memory/cvp_region@9ae00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x9ae00000",
+        "0x0",
+        "0x700000"
+      ]
+    },
+    "/reserved-memory/cdsp_region@9b500000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x9b500000",
+        "0x0",
+        "0x1900000"
+      ]
+    },
+    "/reserved-memory/q6_cdsp_dtb_region@9ce00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x9ce00000",
+        "0x0",
+        "0x80000"
+      ]
+    },
+    "/reserved-memory/dcp_dtb_region@a0050000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xa0050000",
+        "0x0",
+        "0x80000"
+      ]
+    },
+    "/reserved-memory/dcp_region@a00d0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xa00d0000",
+        "0x0",
+        "0x300000"
+      ]
+    },
+    "/reserved-memory/soccp_region@a03d0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xa03d0000",
+        "0x0",
+        "0x500000"
+      ]
+    },
+    "/reserved-memory/soccp_dtb_region@a08d0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xa08d0000",
+        "0x0",
+        "0x40000"
+      ]
+    },
+    "/reserved-memory/q6_adsp_dtb_region@a1380000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xa1380000",
+        "0x0",
+        "0x80000"
+      ]
+    },
+    "/reserved-memory/adspslpi_region@a1400000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xa1400000",
+        "0x0",
+        "0x5580000"
+      ]
+    },
+    "/reserved-memory/hypervisor_extended_heap_region@0xc3dd0000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xc3dd0000",
+        "0x0",
+        "0xa30000"
+      ]
+    },
+    "/reserved-memory/xbl_ramdump_region@d7800000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xd7800000",
+        "0x0",
+        "0x200000"
+      ]
+    },
+    "/reserved-memory/global_sync_region@d7a00000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xd7a00000",
+        "0x0",
+        "0x200000"
+      ]
+    },
+    "/reserved-memory/tz_merged_region@d8000000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xd8000000",
+        "0x0",
+        "0x800000"
+      ]
+    },
+    "/reserved-memory/trust_ui_vm_region@f3800000": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "reg": [
+        "0x0",
+        "0xf3800000",
+        "0x0",
+        "0x5000000"
+      ],
+      "reusable": true,
+      "guarantee": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ]
+    },
+    "/reserved-memory/oem_vm_region@f8800000": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "reg": [
+        "0x0",
+        "0xf8800000",
+        "0x0",
+        "0x3800000"
+      ],
+      "reusable": true,
+      "guarantee": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ]
+    },
+    "/reserved-memory/vm_comm_mem_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x800000"
+      ]
+    },
+    "/reserved-memory/dump_display_region@ff3ff800": {
+      "reg": [
+        "0x0",
+        "0xff3ff800",
+        "0x0",
+        "0x800"
+      ],
+      "no-map": true
+    },
+    "/reserved-memory/ramoops-region": {
+      "compatible": [
+        "ramoops"
+      ],
+      "reg": [
+        "0x0",
+        "0xff400000",
+        "0x0",
+        "0x200000"
+      ],
+      "console-size": [
+        "0x100000"
+      ],
+      "pmsg-size": [
+        "0x100000"
+      ]
+    },
+    "/reserved-memory/llcc_lpi_region@ff800000": {
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0xff800000",
+        "0x0",
+        "0x800000"
+      ]
+    },
+    "/reserved-memory/cdsp_eva_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x400000"
+      ]
+    },
+    "/reserved-memory/non_secure_display_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "reusable": true,
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "size": [
+        "0x0",
+        "0xc800000"
+      ],
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ]
+    },
+    "/reserved-memory/adsp_heap_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0xc00000"
+      ]
+    },
+    "/reserved-memory/qmc_dma_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x1000000"
+      ]
+    },
+    "/reserved-memory/linux,cma": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "size": [
+        "0x0",
+        "0x2400000"
+      ],
+      "linux,cma-default": true
+    },
+    "/reserved-memory/lcp_dare_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "reg": [
+        "0x8",
+        "0x80000000",
+        "0x0",
+        "0x6000000"
+      ],
+      "reusable": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ]
+    },
+    "/reserved-memory/debug_kinfo_region": {
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0xffffffff",
+        "0xffffffff"
+      ],
+      "size": [
+        "0x0",
+        "0x1000"
+      ],
+      "no-map": true
+    },
+    "/reserved-memory/va_md_mem_region": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "reusable": true,
+      "size": [
+        "0x0",
+        "0x1000000"
+      ]
+    },
+    "/reserved-memory/dump_mem_region": {
+      "alloc-ranges": [
+        "0x1",
+        "0x0",
+        "0xfffffffe",
+        "0xffffffff"
+      ],
+      "size": [
+        "0x0",
+        "0x5a77000"
+      ]
+    },
+    "/reserved-memory/fastrpc_far_region": {
+      "iommu-addresses": [
+        "0x68d",
+        "0x0",
+        "0x0",
+        "0x3",
+        "0xffffffff"
+      ]
+    },
+    "/reserved-memory/shm@fc200000": {
+      "compatible": [
+        "shared-dma-pool"
+      ],
+      "reusable": true,
+      "guarantee": true,
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "reg": [
+        "0x0",
+        "0xfc200000",
+        "0x0",
+        "0x400000"
+      ],
+      "gunyah-label": [
+        "0x3"
+      ]
+    },
+    "/reserved-memory/cnss_wlan_region": {
+      "size": [
+        "0x0",
+        "0x2000000"
+      ],
+      "alignment": [
+        "0x0",
+        "0x400000"
+      ],
+      "reusable": true,
+      "alloc-ranges": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0xffffffff"
+      ],
+      "compatible": [
+        "shared-dma-pool"
+      ]
+    },
+    "/reserved-memory/splash_region": {
+      "label": [
+        "cont_splash_region"
+      ],
+      "reg": [
+        "0x0",
+        "0xfc800000",
+        "0x0",
+        "0x2b00000"
+      ]
+    },
+    "/reserved-memory/demura_region_0": {
+      "label": [
+        "demura hfc region 0"
+      ],
+      "reg": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+      ]
+    },
+    "/reserved-memory/demura_region_1": {
+      "label": [
+        "demura hfc region 1"
+      ],
+      "reg": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+      ]
+    },
+    "/soc/interrupt-controller@17000000": {
+      "compatible": [
+        "arm,gic-v3"
+      ],
+      "#interrupt-cells": [
+        "0x3"
+      ],
+      "interrupt-controller": true,
+      "ranges": true,
+      "#redistributor-regions": [
+        "0x1"
+      ],
+      "redistributor-stride": [
+        "0x0",
+        "0x40000"
+      ],
+      "reg": [
+        "0x0",
+        "0x17000000",
+        "0x0",
+        "0x10000",
+        "0x0",
+        "0x17080000",
+        "0x0",
+        "0x200000"
+      ],
+      "interrupts": [
+        "0x1",
+        "0x9",
+        "0x4"
+      ],
+      "#address-cells": [
+        "0x1"
+      ],
+      "#size-cells": [
+        "0x1"
+      ]
+    },
+    "/soc/interrupt-controller@17000000/msi-controller@17040000": {
+      "compatible": [
+        "arm,gic-v3-its"
+      ],
+      "msi-controller": true,
+      "#msi-cells": [
+        "0x1"
+      ],
+      "reg": [
+        "0x17040000",
+        "0x20000"
+      ]
+    },
+    "/soc/ufshc@1d84000": {
+      "compatible": [
+        "qcom,ufshc"
+      ],
+      "reg": [
+        "0x0",
+        "0x1d84000",
+        "0x0",
+        "0x3000",
+        "0x0",
+        "0x1d88000",
+        "0x0",
+        "0x18000",
+        "0x0",
+        "0x1da5000",
+        "0x0",
+        "0x2000",
+        "0x0",
+        "0x1da4000",
+        "0x0",
+        "0x10"
+      ],
+      "reg-names": [
+        "ufs_mem",
+        "ice",
+        "mcq_sqd",
+        "mcq_vs"
+      ],
+      "interrupts": [
+        "0x0",
+        "0x109",
+        "0x4"
+      ],
+      "phys": [
+        "0x8a"
+      ],
+      "phy-names": [
+        "ufsphy"
+      ],
+      "#reset-cells": [
+        "0x1"
+      ],
+      "qcom,ice-use-hwkm": true,
+      "qcom,prime-mask": [
+        "0xc0"
+      ],
+      "qcom,silver-mask": [
+        "0x3f"
+      ],
+      "qcom,cluster-mask": [
+        "0x3f",
+        "0xc0"
+      ],
+      "qcom,esi-affinity-mask": [
+        "0x4",
+        "0x5",
+        "0x3",
+        "0x4",
+        "0x5",
+        "0x3",
+        "0x7",
+        "0x7"
+      ],
+      "power-domains": [
+        "0x47",
+        "0x3"
+      ],
+      "lanes-per-direction": [
+        "0x2"
+      ],
+      "dev-ref-clk-freq": [
+        "0x0"
+      ],
+      "clock-names": [
+        "core_clk",
+        "bus_aggr_clk",
+        "iface_clk",
+        "core_clk_unipro",
+        "core_clk_ice",
+        "ref_clk",
+        "tx_lane0_sync_clk",
+        "rx_lane0_sync_clk",
+        "rx_lane1_sync_clk"
+      ],
+      "clocks": [
+        "0x47",
+        "0x9b",
+        "0x47",
+        "0x1",
+        "0x47",
+        "0x9a",
+        "0x47",
+        "0xaa",
+        "0x47",
+        "0x9e",
+        "0x34",
+        "0x4",
+        "0x47",
+        "0xa8",
+        "0x47",
+        "0xa4",
+        "0x47",
+        "0xa6"
+      ],
+      "operating-points-v2": [
+        "0x8b"
+      ],
+      "interconnects": [
+        "0x35",
+        "0x3a",
+        "0x36",
+        "0x200",
+        "0x6c",
+        "0x2",
+        "0x8c",
+        "0x221"
+      ],
+      "interconnect-names": [
+        "ufs-ddr",
+        "cpu-ufs"
+      ],
+      "depends-on-supply": [
+        "0x6b"
+      ],
+      "iommus": [
+        "0x6b",
+        "0x60",
+        "0x0"
+      ],
+      "qcom,iommu-dma": [
+        "0x66617374",
+        "0x6d617000"
+      ],
+      "qcom,iommu-msi-size": [
+        "0x1000"
+      ],
+      "memory-region": [
+        "0x8d"
+      ],
+      "shared-ice-cfg": [
+        "0x8e"
+      ],
+      "dma-coherent": true,
+      "qcom,bypass-pbl-rst-wa": true,
+      "qcom,max-cpus": [
+        "0x8"
+      ],
+      "qcom,enforce-high-irq-cpus": true,
+      "msi-parent": [
+        "0x8f",
+        "0x60"
+      ],
+      "status": [
+        "ok"
+      ],
+      "vcc-supply": [
+        "0x443"
+      ],
+      "vcc-max-microamp": [
+        "0x124f80"
+      ],
+      "vccq-supply": [
+        "0x44d"
+      ],
+      "vccq-max-microamp": [
+        "0x124f80"
+      ],
+      "qcom,vccq-proxy-vote-supply": [
+        "0x44d"
+      ],
+      "qcom,vccq-proxy-vote-max-microamp": [
+        "0x124f80"
+      ],
+      "qcom,vddp-ref-clk-supply": [
+        "0x456"
+      ],
+      "qcom,vddp-ref-clk-max-microamp": [
+        "0x64"
+      ],
+      "qcom,vccq-parent-supply": [
+        "0x44f"
+      ],
+      "qcom,vccq-parent-max-microamp": [
+        "0x7cc180"
+      ],
+      "reset-gpios": [
+        "0x30",
+        "0xd9",
+        "0x1"
+      ],
+      "resets": [
+        "0x47",
+        "0x19"
+      ],
+      "reset-names": [
+        "rst"
+      ]
+    },
+    "/soc/ufshc@1d84000/qos0": {
+      "vote": [
+        "0x2c"
+      ],
+      "perf": true
+    },
+    "/soc/ufshc@1d84000/qos1": {
+      "vote": [
+        "0x2c"
+      ]
+    },
+    "/soc/qcom,qupv3_3_geni_se@19c0000/spi@1988000/nvt": {
+      "pinctrl-1": [
+        "0x91d"
+      ],
+      "pinctrl-0": [
+        "0x91c"
+      ],
+      "pinctrl-names": [
+        "default",
+        "sleep"
+      ],
+      "clock-names": [
+        "mclk"
+      ],
+      "clocks": [
+        "0x34",
+        "0x11"
+      ],
+      "nvt,xtalEN": [
+        "0x30",
+        "0x1d",
+        "0x0"
+      ],
+      "nvt,abnormal": [
+        "0x30",
+        "0x4d",
+        "0x0"
+      ],
+      "nvt,ready": [
+        "0x30",
+        "0x37",
+        "0x0"
+      ],
+      "nvt,resetN": [
+        "0x30",
+        "0x1e",
+        "0x0"
+      ],
+      "nvt,vsel": [
+        "0x30",
+        "0xd7",
+        "0x0"
+      ],
+      "nvt,always18": [
+        "0x30",
+        "0xd6",
+        "0x0"
+      ],
+      "nvt,always08": [
+        "0x30",
+        "0xd4",
+        "0x0"
+      ],
+      "spi-max-frequency": [
+        "0x16e3600"
+      ],
+      "status": [
+        "ok"
+      ],
+      "reg": [
+        "0x0"
+      ],
+      "compatible": [
+        "novatek,vis-display"
+      ]
+    },
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0": {
+      "compatible": [
+        "focal,touch-spi"
+      ],
+      "reg": [
+        "0x0"
+      ],
+      "spi-max-frequency": [
+        "0x1312d00"
+      ],
+      "interrupt-parent": [
+        "0x30"
+      ],
+      "interrupts": [
+        "0x9e",
+        "0x2008"
+      ],
+      "focaltech,avdd-name": [
+        "avdd_focal"
+      ],
+      "avdd-supply": [
+        "0x728"
+      ],
+      "focaltech,iovdd-name": [
+        "iovdd_focal"
+      ],
+      "iovdd-supply": [
+        "0x45b"
+      ],
+      "focaltech,irq-gpio": [
+        "0x30",
+        "0x9e",
+        "0x2008"
+      ],
+      "focaltech,reset-gpio": [
+        "0x30",
+        "0x42",
+        "0x0"
+      ],
+      "focaltech,max-touch-number": [
+        "0xa"
+      ],
+      "focaltech,super-resolution-factors": [
+        "0x64"
+      ],
+      "focaltech,display-coords": [
+        "0x0",
+        "0x0",
+        "0x1d4bf",
+        "0x3fabf"
+      ],
+      "focaltech,touch-range-array": [
+        "0x1",
+        "0x5",
+        "0xa",
+        "0xf",
+        "0x14"
+      ],
+      "focaltech,touch-def-array": [
+        "0x3",
+        "0x3",
+        "0x3",
+        "0x3"
+      ],
+      "focaltech,touch-expert-array": [
+        "0xa",
+        "0xa",
+        "0xa",
+        "0xa",
+        "0x14",
+        "0x14",
+        "0xf",
+        "0xa",
+        "0x14",
+        "0x14",
+        "0x14",
+        "0xa"
+      ],
+      "focaltech,support-fod": [
+        "0x1"
+      ],
+      "focaltech,fod-lx": [
+        "0x1f8"
+      ],
+      "focaltech,fod-ly": [
+        "0x727"
+      ],
+      "focaltech,fod-x-size": [
+        "0x94"
+      ],
+      "focaltech,fod-y-size": [
+        "0x94"
+      ],
+      "focaltech,max-x": [
+        "0x4b0"
+      ],
+      "focaltech,max-y": [
+        "0xa30"
+      ],
+      "focaltech,rx-num": [
+        "0x12"
+      ],
+      "focaltech,tx-num": [
+        "0x27"
+      ],
+      "focaltech,touch-type": [
+        "primary"
+      ],
+      "pinctrl-names": [
+        "pmx_ts_active",
+        "pmx_ts_suspend"
+      ],
+      "pinctrl-0": [
+        "0x729",
+        "0x72a"
+      ],
+      "pinctrl-1": [
+        "0x72b",
+        "0x72c"
+      ],
+      "mi_tp,game-mode-array": [
+        "0x1",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+      ],
+      "mi_tp,active-mode-array": [
+        "0x1",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+      ],
+      "mi_tp,tolerance-array": [
+        "0x4",
+        "0x0",
+        "0x2",
+        "0x2",
+        "0x2"
+      ],
+      "mi_tp,up-threshold-array": [
+        "0x4",
+        "0x0",
+        "0x3",
+        "0x3",
+        "0x3"
+      ],
+      "mi_tp,aim-sensitivity-array": [
+        "0x4",
+        "0x0",
+        "0x2",
+        "0x2",
+        "0x2"
+      ],
+      "mi_tp,tap-stability-array": [
+        "0x4",
+        "0x0",
+        "0x2",
+        "0x2",
+        "0x2"
+      ],
+      "mi_tp,edge-filter-array": [
+        "0x3",
+        "0x0",
+        "0x2",
+        "0x2",
+        "0x2"
+      ],
+      "mi_tp,panel-orien-array": [
+        "0x3",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+      ],
+      "mi_tp,report-rate-array": [
+        "0x3",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+      ],
+      "mi_tp,expert-mode-array": [
+        "0x3",
+        "0x1",
+        "0x1",
+        "0x1",
+        "0x1"
+      ],
+      "panel": [
+        "0x91e",
+        "0x91f",
+        "0x920",
+        "0x8fc"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd": {
+      "mi,max-brightness-normal": [
+        "0x1e78"
+      ],
+      "qcom,platform-reset-gpio": [
+        "0x30",
+        "0x62",
+        "0x0"
+      ],
+      "qcom,mdss-dsi-bl-max-level": [
+        "0x3fff"
+      ],
+      "qcom,mdss-dsi-bl-min-level": [
+        "0x7"
+      ],
+      "qcom,mdss-dsi-reset-sequence": [
+        "0x1",
+        "0x5",
+        "0x0",
+        "0x5",
+        "0x1",
+        "0x19"
+      ],
+      "qcom,mdss-dsi-panel-name": [
+        "xiaomi songyuan 42 0d 0a cmd mode dsc dsi panel"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings": {},
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings/timing@wqhd_normal_60hz_index_00": {
+      "qcom,mdss-dsi-panel-framerate": [
+        "0x3c"
+      ],
+      "qcom,mdss-dsi-panel-height": [
+        "0xa30"
+      ],
+      "qcom,mdss-dsi-panel-width": [
+        "0x4b0"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings/timing@wqhd_normal_120hz_index_01": {
+      "qcom,mdss-dsi-panel-framerate": [
+        "0x78"
+      ],
+      "qcom,mdss-dsi-panel-height": [
+        "0xa30"
+      ],
+      "qcom,mdss-dsi-panel-width": [
+        "0x4b0"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings/timing@wqhd_normal_144hz_index_02": {
+      "qcom,mdss-dsi-panel-framerate": [
+        "0x90"
+      ],
+      "qcom,mdss-dsi-panel-height": [
+        "0xa30"
+      ],
+      "qcom,mdss-dsi-panel-width": [
+        "0x4b0"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings/timing@wqhd_normal_185hz_index_03": {
+      "qcom,mdss-dsi-panel-framerate": [
+        "0xb9"
+      ],
+      "qcom,mdss-dsi-panel-height": [
+        "0xa30"
+      ],
+      "qcom,mdss-dsi-panel-width": [
+        "0x4b0"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings/timing@wqhd_normal_165hz_index_04": {
+      "qcom,mdss-dsi-panel-framerate": [
+        "0xa5"
+      ],
+      "qcom,mdss-dsi-panel-height": [
+        "0xa30"
+      ],
+      "qcom,mdss-dsi-panel-width": [
+        "0x4b0"
+      ]
+    },
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd/qcom,mdss-dsi-display-timings/timing@wqhd_normal_90hz_index_05": {
+      "qcom,mdss-dsi-panel-framerate": [
+        "0x5a"
+      ],
+      "qcom,mdss-dsi-panel-height": [
+        "0xa30"
+      ],
+      "qcom,mdss-dsi-panel-width": [
+        "0x4b0"
+      ]
+    },
+    "/soc/xiaomi_touch": {
+      "compatible": [
+        "xiaomi-touch"
+      ],
+      "status": [
+        "ok"
+      ],
+      "touch,name": "7869616f6d692d746f75636800"
+    },
+    "/soc/touch_avdd_vreg": {
+      "compatible": [
+        "regulator-fixed"
+      ],
+      "regulator-name": [
+        "touch_avdd_vreg"
+      ],
+      "enable-active-high": true,
+      "gpio": [
+        "0x30",
+        "0x75",
+        "0x0"
+      ]
+    },
+    "/soc/apps-smmu@15000000": {
+      "compatible": [
+        "qcom,qsmmu-v500"
+      ],
+      "reg": [
+        "0x0",
+        "0x15000000",
+        "0x0",
+        "0x100000"
+      ],
+      "#iommu-cells": [
+        "0x2"
+      ],
+      "qcom,use-3-lvl-tables": true,
+      "qcom,handoff-smrs": [
+        "0x800",
+        "0x2"
+      ],
+      "#global-interrupts": [
+        "0x1"
+      ],
+      "#size-cells": [
+        "0x2"
+      ],
+      "#address-cells": [
+        "0x2"
+      ],
+      "ranges": true,
+      "dma-coherent": true,
+      "interrupts": [
+        "0x0",
+        "0x41",
+        "0x4",
+        "0x0",
+        "0x61",
+        "0x4",
+        "0x0",
+        "0x62",
+        "0x4",
+        "0x0",
+        "0x63",
+        "0x4",
+        "0x0",
+        "0x64",
+        "0x4",
+        "0x0",
+        "0x65",
+        "0x4",
+        "0x0",
+        "0x66",
+        "0x4",
+        "0x0",
+        "0x67",
+        "0x4",
+        "0x0",
+        "0x68",
+        "0x4",
+        "0x0",
+        "0x69",
+        "0x4",
+        "0x0",
+        "0x6a",
+        "0x4",
+        "0x0",
+        "0x6b",
+        "0x4",
+        "0x0",
+        "0x6c",
+        "0x4",
+        "0x0",
+        "0x6d",
+        "0x4",
+        "0x0",
+        "0x6e",
+        "0x4",
+        "0x0",
+        "0x6f",
+        "0x4",
+        "0x0",
+        "0x70",
+        "0x4",
+        "0x0",
+        "0x71",
+        "0x4",
+        "0x0",
+        "0x72",
+        "0x4",
+        "0x0",
+        "0x73",
+        "0x4",
+        "0x0",
+        "0x74",
+        "0x4",
+        "0x0",
+        "0x75",
+        "0x4",
+        "0x0",
+        "0x76",
+        "0x4",
+        "0x0",
+        "0xb5",
+        "0x4",
+        "0x0",
+        "0xb6",
+        "0x4",
+        "0x0",
+        "0xb7",
+        "0x4",
+        "0x0",
+        "0xb8",
+        "0x4",
+        "0x0",
+        "0xb9",
+        "0x4",
+        "0x0",
+        "0xba",
+        "0x4",
+        "0x0",
+        "0xbb",
+        "0x4",
+        "0x0",
+        "0xbc",
+        "0x4",
+        "0x0",
+        "0xbd",
+        "0x4",
+        "0x0",
+        "0xbe",
+        "0x4",
+        "0x0",
+        "0xbf",
+        "0x4",
+        "0x0",
+        "0xc0",
+        "0x4",
+        "0x0",
+        "0x13b",
+        "0x4",
+        "0x0",
+        "0x13c",
+        "0x4",
+        "0x0",
+        "0x13d",
+        "0x4",
+        "0x0",
+        "0x13e",
+        "0x4",
+        "0x0",
+        "0x13f",
+        "0x4",
+        "0x0",
+        "0x140",
+        "0x4",
+        "0x0",
+        "0x141",
+        "0x4",
+        "0x0",
+        "0x142",
+        "0x4",
+        "0x0",
+        "0x143",
+        "0x4",
+        "0x0",
+        "0x144",
+        "0x4",
+        "0x0",
+        "0x145",
+        "0x4",
+        "0x0",
+        "0x146",
+        "0x4",
+        "0x0",
+        "0x147",
+        "0x4",
+        "0x0",
+        "0x148",
+        "0x4",
+        "0x0",
+        "0x149",
+        "0x4",
+        "0x0",
+        "0x14a",
+        "0x4",
+        "0x0",
+        "0x14b",
+        "0x4",
+        "0x0",
+        "0x14c",
+        "0x4",
+        "0x0",
+        "0x14d",
+        "0x4",
+        "0x0",
+        "0x14e",
+        "0x4",
+        "0x0",
+        "0x14f",
+        "0x4",
+        "0x0",
+        "0x150",
+        "0x4",
+        "0x0",
+        "0x151",
+        "0x4",
+        "0x0",
+        "0x152",
+        "0x4",
+        "0x0",
+        "0x153",
+        "0x4",
+        "0x0",
+        "0x154",
+        "0x4",
+        "0x0",
+        "0x155",
+        "0x4",
+        "0x0",
+        "0x156",
+        "0x4",
+        "0x0",
+        "0x157",
+        "0x4",
+        "0x0",
+        "0x158",
+        "0x4",
+        "0x0",
+        "0x159",
+        "0x4",
+        "0x0",
+        "0x18b",
+        "0x4",
+        "0x0",
+        "0x18c",
+        "0x4",
+        "0x0",
+        "0x18d",
+        "0x4",
+        "0x0",
+        "0x18e",
+        "0x4",
+        "0x0",
+        "0x18f",
+        "0x4",
+        "0x0",
+        "0x190",
+        "0x4",
+        "0x0",
+        "0x191",
+        "0x4",
+        "0x0",
+        "0x192",
+        "0x4",
+        "0x0",
+        "0x193",
+        "0x4",
+        "0x0",
+        "0x194",
+        "0x4",
+        "0x0",
+        "0x195",
+        "0x4",
+        "0x0",
+        "0x196",
+        "0x4",
+        "0x0",
+        "0x197",
+        "0x4",
+        "0x0",
+        "0x198",
+        "0x4",
+        "0x0",
+        "0x199",
+        "0x4",
+        "0x0",
+        "0x1a2",
+        "0x4",
+        "0x0",
+        "0x1a3",
+        "0x4",
+        "0x0",
+        "0x19c",
+        "0x4",
+        "0x0",
+        "0x1a5",
+        "0x4",
+        "0x0",
+        "0x2c3",
+        "0x4",
+        "0x0",
+        "0x1a7",
+        "0x4",
+        "0x0",
+        "0x1a8",
+        "0x4",
+        "0x0",
+        "0x1a9",
+        "0x4",
+        "0x0",
+        "0x2b2",
+        "0x4",
+        "0x0",
+        "0x2b3",
+        "0x4",
+        "0x0",
+        "0x2b4",
+        "0x4",
+        "0x0",
+        "0x2b5",
+        "0x4",
+        "0x0",
+        "0x2b6",
+        "0x4",
+        "0x0",
+        "0x2b7",
+        "0x4",
+        "0x0",
+        "0x2b8",
+        "0x4",
+        "0x0",
+        "0x2b9",
+        "0x4",
+        "0x0",
+        "0x19a",
+        "0x4",
+        "0x0",
+        "0x1e8",
+        "0x4",
+        "0x0",
+        "0x1e9",
+        "0x4",
+        "0x0",
+        "0x1ea",
+        "0x4",
+        "0x0",
+        "0x1eb",
+        "0x4",
+        "0x0",
+        "0x1ec",
+        "0x4",
+        "0x0",
+        "0x1ed",
+        "0x4",
+        "0x0",
+        "0x1ee",
+        "0x4",
+        "0x0",
+        "0x1ef",
+        "0x4",
+        "0x0",
+        "0x1f0",
+        "0x4",
+        "0x0",
+        "0x1f1",
+        "0x4",
+        "0x0",
+        "0x1f2",
+        "0x4",
+        "0x0",
+        "0x1f3",
+        "0x4",
+        "0x0",
+        "0x1f4",
+        "0x4",
+        "0x0",
+        "0x1f5",
+        "0x4",
+        "0x0",
+        "0x1f6",
+        "0x4"
+      ],
+      "qcom,actlr": [
+        "0x1800",
+        "0xc0",
+        "0x1",
+        "0x1820",
+        "0x0",
+        "0x1",
+        "0x1860",
+        "0x0",
+        "0x103",
+        "0x18a0",
+        "0x0",
+        "0x103",
+        "0x18e0",
+        "0x0",
+        "0x103",
+        "0x1980",
+        "0x0",
+        "0x1",
+        "0x1c00",
+        "0x0",
+        "0x1",
+        "0xc01",
+        "0x40",
+        "0x303",
+        "0xc02",
+        "0x20",
+        "0x303",
+        "0xc03",
+        "0x40",
+        "0x303",
+        "0xc04",
+        "0x20",
+        "0x303",
+        "0xc05",
+        "0x20",
+        "0x303",
+        "0xc06",
+        "0x20",
+        "0x303",
+        "0xc07",
+        "0x40",
+        "0x303",
+        "0xc08",
+        "0x20",
+        "0x303",
+        "0xc09",
+        "0x40",
+        "0x303",
+        "0xc0c",
+        "0x40",
+        "0x303",
+        "0xc0d",
+        "0x40",
+        "0x303",
+        "0xc21",
+        "0x0",
+        "0x303",
+        "0xc23",
+        "0x0",
+        "0x303",
+        "0xc27",
+        "0x0",
+        "0x303",
+        "0xc29",
+        "0x0",
+        "0x303",
+        "0xc2c",
+        "0x0",
+        "0x303",
+        "0xc2d",
+        "0x0",
+        "0x303",
+        "0xc42",
+        "0x0",
+        "0x303",
+        "0xc44",
+        "0x0",
+        "0x303",
+        "0xc45",
+        "0x0",
+        "0x303",
+        "0xc46",
+        "0x0",
+        "0x303",
+        "0xc48",
+        "0x0",
+        "0x303",
+        "0x800",
+        "0x2",
+        "0x1",
+        "0x801",
+        "0x0",
+        "0x1",
+        "0x19a3",
+        "0x0",
+        "0x1",
+        "0x19a4",
+        "0x0",
+        "0x1",
+        "0x1900",
+        "0x20",
+        "0x103",
+        "0x1904",
+        "0x20",
+        "0x103",
+        "0x1923",
+        "0x0",
+        "0x103",
+        "0x1940",
+        "0x0",
+        "0x103",
+        "0x1941",
+        "0x0",
+        "0x103",
+        "0x1943",
+        "0x0",
+        "0x103",
+        "0x1944",
+        "0x0",
+        "0x103",
+        "0x1945",
+        "0x0",
+        "0x103",
+        "0x1946",
+        "0x0",
+        "0x103",
+        "0x1a20",
+        "0x0",
+        "0x103",
+        "0x1a21",
+        "0x0",
+        "0x103"
+      ]
+    },
+    "/soc/rsc@18900000/drv@2/rpmh-regulator-l17b-e0/regulator-pmh0101-l17": {
+      "regulator-name": [
+        "pmh0101_l17"
+      ],
+      "qcom,set": [
+        "0x3"
+      ],
+      "regulator-min-microvolt": [
+        "0x263540"
+      ],
+      "regulator-max-microvolt": [
+        "0x263540"
+      ],
+      "qcom,init-voltage": [
+        "0x263540"
+      ],
+      "qcom,init-mode": [
+        "0x4"
+      ]
+    },
+    "/soc/rsc@18900000/drv@2/rpmh-regulator-l4d-e0/regulator-pmh0110-d-l4": {
+      "regulator-name": [
+        "pmh0110_d_l4"
+      ],
+      "qcom,set": [
+        "0x3"
+      ],
+      "regulator-min-microvolt": [
+        "0x124f80"
+      ],
+      "regulator-max-microvolt": [
+        "0x124f80"
+      ],
+      "qcom,init-voltage": [
+        "0x124f80"
+      ],
+      "qcom,init-mode": [
+        "0x3"
+      ]
+    },
+    "/soc/rsc@18900000/drv@2/rpmh-regulator-l1g-e0/regulator-pmh0110-g-l1": {
+      "regulator-name": [
+        "pmh0110_g_l1"
+      ],
+      "qcom,set": [
+        "0x3"
+      ],
+      "regulator-min-microvolt": [
+        "0x124f80"
+      ],
+      "regulator-max-microvolt": [
+        "0x124f80"
+      ],
+      "qcom,init-voltage": [
+        "0x124f80"
+      ],
+      "qcom,init-mode": [
+        "0x3"
+      ]
+    },
+    "/soc/rsc@18900000/drv@2/rpmh-regulator-s7f-e0/regulator-pmh0110-f-s7": {
+      "regulator-name": [
+        "pmh0110_f_s7"
+      ],
+      "qcom,set": [
+        "0x3"
+      ],
+      "regulator-min-microvolt": [
+        "0x12ad40"
+      ],
+      "regulator-max-microvolt": [
+        "0x14ef60"
+      ],
+      "qcom,init-voltage": [
+        "0x132a40"
+      ],
+      "qcom,init-mode": [
+        "0x1"
+      ]
+    },
+    "/soc/pinctrl@f000000": {
+      "compatible": [
+        "qcom,canoe-tlmm"
+      ],
+      "reg": [
+        "0x0",
+        "0xf000000",
+        "0x0",
+        "0x202000"
+      ],
+      "interrupts": [
+        "0x0",
+        "0xd0",
+        "0x4"
+      ],
+      "gpio-controller": true,
+      "#gpio-cells": [
+        "0x2"
+      ],
+      "interrupt-controller": true,
+      "#interrupt-cells": [
+        "0x2"
+      ],
+      "wakeup-parent": [
+        "0x2f"
+      ],
+      "qcom,gpios-reserved": [
+        "0x24",
+        "0x25",
+        "0x26",
+        "0x27",
+        "0x28",
+        "0x29",
+        "0x2a",
+        "0x2b",
+        "0x4a",
+        "0x77",
+        "0x78",
+        "0x90",
+        "0x91",
+        "0x92",
+        "0x93"
+      ]
+    },
+    "/soc/pinctrl@f000000/nvt_xtal_en_sleep": {},
+    "/soc/pinctrl@f000000/nvt_xtal_en_active": {},
+    "/soc/rsc@18900000/drv@2/rpmh-regulator-l4i-e0/regulator-pmh0110-i-l4": {
+      "regulator-name": [
+        "pmh0110_i_l4"
+      ],
+      "qcom,set": [
+        "0x3"
+      ],
+      "regulator-min-microvolt": [
+        "0x1b7740"
+      ],
+      "regulator-max-microvolt": [
+        "0x1b7740"
+      ],
+      "qcom,init-voltage": [
+        "0x1b7740"
+      ],
+      "qcom,init-mode": [
+        "0x3"
+      ]
+    },
+    "/soc/pinctrl@f000000/ts_reset_active": {},
+    "/soc/pinctrl@f000000/ts_int_suspend": {}
+  },
+  "references": {
+    "/soc/ufshc@1d84000:depends-on-supply": "/soc/apps-smmu@15000000",
+    "/soc/ufshc@1d84000:vcc-supply": "/soc/rsc@18900000/drv@2/rpmh-regulator-l17b-e0/regulator-pmh0101-l17",
+    "/soc/ufshc@1d84000:vccq-supply": "/soc/rsc@18900000/drv@2/rpmh-regulator-l4d-e0/regulator-pmh0110-d-l4",
+    "/soc/ufshc@1d84000:qcom,vccq-proxy-vote-supply": "/soc/rsc@18900000/drv@2/rpmh-regulator-l4d-e0/regulator-pmh0110-d-l4",
+    "/soc/ufshc@1d84000:qcom,vddp-ref-clk-supply": "/soc/rsc@18900000/drv@2/rpmh-regulator-l1g-e0/regulator-pmh0110-g-l1",
+    "/soc/ufshc@1d84000:qcom,vccq-parent-supply": "/soc/rsc@18900000/drv@2/rpmh-regulator-s7f-e0/regulator-pmh0110-f-s7",
+    "/soc/ufshc@1d84000:reset-gpios": "/soc/pinctrl@f000000",
+    "/soc/qcom,qupv3_3_geni_se@19c0000/spi@1988000/nvt:pinctrl-1": "/soc/pinctrl@f000000/nvt_xtal_en_sleep",
+    "/soc/qcom,qupv3_3_geni_se@19c0000/spi@1988000/nvt:pinctrl-0": "/soc/pinctrl@f000000/nvt_xtal_en_active",
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0:avdd-supply": "/soc/touch_avdd_vreg",
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0:iovdd-supply": "/soc/rsc@18900000/drv@2/rpmh-regulator-l4i-e0/regulator-pmh0110-i-l4",
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0:focaltech,irq-gpio": "/soc/pinctrl@f000000",
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0:focaltech,reset-gpio": "/soc/pinctrl@f000000",
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0:pinctrl-0": "/soc/pinctrl@f000000/ts_reset_active",
+    "/soc/qcom,qupv3_4_geni_se@1ac0000/spi@1a80000/focaltech_ts@0:pinctrl-1": "/soc/pinctrl@f000000/ts_int_suspend",
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd:mi,esd-err-irq-gpio": "/soc/pinctrl@f000000",
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd:mi,panel-nt336-ason18-gpio": "/soc/pinctrl@f000000",
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd:mi,panel-nt336-ason08-gpio": "/soc/pinctrl@f000000",
+    "/soc/qcom,mdss_mdp@9800000/qcom,mdss_dsi_songyuan_42_0d_0a_p2_dsc_cmd:qcom,platform-reset-gpio": "/soc/pinctrl@f000000",
+    "/soc/touch_avdd_vreg:gpio": "/soc/pinctrl@f000000"
+  }
+}
