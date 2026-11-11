@@ -1,0 +1,42 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -54,6 +54,24 @@
+ }
+ #endif
+ 
++#if defined(PANDORA)
++/* RAM-only boots never initialize UFS, which installs the normal log/reset
++ * hook. UFS replaces this storage-independent fallback when it is ready. */
++static int
++songyuan_ram_restart(unsigned int type)
++{
++    if (type != kPEHaltCPU && type != kPERestartCPU &&
++        type != kPEPanicRestartCPU && type != kPEPanicRestartCPUNoCallouts) {
++        return 0;
++    }
++    register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++    __asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++    for (;;) {
++        __builtin_arm_wfe();
++    }
++}
++#endif
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -76,6 +94,14 @@
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++#if defined(PANDORA)
++    uint32_t songyuan = 0;
++    if (PE_parse_boot_argn("songyuan", &songyuan, sizeof(songyuan)) &&
++        songyuan == 1 && PE_halt_restart == NULL) {
++        PE_halt_restart = songyuan_ram_restart;
++        IOLog("SONGYUAN: RAM-only PSCI restart fallback installed\n");
++    }
++#endif
+ 	registerService();
+ #if defined(PANDORA)
+ 	/* 0210: what an iPhone's RTC driver publishes; IOKitInitializeTime waits up to 30 s for it. */

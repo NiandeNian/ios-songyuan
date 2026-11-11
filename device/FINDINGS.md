@@ -54,5 +54,11 @@ IRQ GPIO 158、reset GPIO 66、AVDD GPIO **117**、iovdd L4I_E0。
 | 色序 | 照片中 red / green / blue / white 正常 |
 | 快速引导 | fastboot product=songyuan、unlocked=yes，Sending/Booting OKAY |
 
-仅确认自定义 ARM64 程序和固件保留屏幕可工作。尚无本机 XNU 或 iOS
-用户空间启动证据。启动分区备份大小和 SHA-256 已与真机逐一比较。
+随后 XNU RAM 载荷临时启动的照片确认 Darwin 22.6.0（xnu-8796.141.3），
+`rd=md0`、`cpus=1`，已进入 `fs_unmountall(system)` / `MACH Reboot`，最后
+报 `Halt/Restart Timed Out @IOPlatformExpert.cpp:884`。最小 init 的设计行为
+是在约 60 秒后调用 reboot，但照片没有包含其 PID 1 标记，尚需独立确认。
+RAM 路线不初始化 UFS，因此没有注册 UFS 中的 PSCI 重启回调；新增
+`9001-songyuan-ram-psci-restart.patch` 在平台初始化时安装备用回调。
+
+完整 iOS 用户空间和桌面尚未验证。启动分区备份大小和 SHA-256 已与真机逐一比较。

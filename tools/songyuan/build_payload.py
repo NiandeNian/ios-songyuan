@@ -6,6 +6,8 @@ import subprocess
 import hashlib
 import struct
 import sys
+import os
+import json
 
 
 def main():
@@ -15,17 +17,31 @@ def main():
     p.add_argument('--ram-init', action='store_true')
     p.add_argument('--root-extents', type=Path)
     p.add_argument('--log-extents', type=Path)
+    p.add_argument('--apple-adt', type=Path)
+    p.add_argument('--trust-cache', type=Path, action='append', default=[])
     p.add_argument('--cmdline', default='')
     args = p.parse_args()
     if args.ram_init == bool(args.root_extents):
         p.error('Select --ram-init or --root-extents')
+    for path in [args.kernel, args.root_extents, args.log_extents, args.apple_adt, *args.trust_cache]:
+        if path is not None and not path.is_file():
+            p.error(f'Missing input: {path}')
+    if args.log_extents:
+        table = json.loads(args.log_extents.read_text())
+        if table['size'] < 4096 + (4 << 20):
+            p.error('Console log requires a 4 MiB ring plus one 4 KiB header block')
+    if not args.ram_init and (not args.apple_adt or not args.trust_cache):
+        p.error('iOS root boot requires --apple-adt and at least one --trust-cache')
     root = Path(__file__).resolve().parents[2]
     tools = root / 'tools/songyuan'
     out = root / ('out/xnu-init' if args.ram_init else 'out/ios')
     out.mkdir(parents=True, exist_ok=True)
     suffix = '.exe' if sys.platform == 'win32' else ''
     tool = lambda name: str(args.llvm_bin.resolve() / (name + suffix))
-    call = lambda cmd: subprocess.run([str(v) for v in cmd], check=True)
+    env = os.environ.copy()
+    if args.apple_adt:
+        env['D22AP_ADT'] = str(args.apple_adt.resolve())
+    call = lambda cmd: subprocess.run([str(v) for v in cmd], check=True, env=env)
     adt_cmd = [sys.executable, tools / 'mkadt_songyuan.py', out / 'songyuan.adt']
     for key in ('root_extents', 'log_extents'):
         value = getattr(args, key)
@@ -47,6 +63,10 @@ def main():
         call([sys.executable, tools / 'mkinit.py', out / 'init.o', out / 'init'])
         payload_cmd += ['--ramdisk', out / 'init']
     call(payload_cmd)
+    if args.trust_cache:
+        call([sys.executable, tools / 'addtrustcache.py', out / 'payload.bin',
+              out / 'payload-trusted.bin', *[path.resolve() for path in args.trust_cache]])
+        (out / 'payload-trusted.bin').replace(out / 'payload.bin')
     flags = ['--target=aarch64-none-elf', '-O2', '-ffreestanding', '-fno-builtin',
              '-nostdlib', '-fno-pic', '-fno-stack-protector', '-mgeneral-regs-only',
              '-mstrict-align', '-Wall', '-Wextra', '-Werror']

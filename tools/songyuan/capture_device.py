@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shlex
 from datetime import datetime, timezone
 
 
@@ -21,7 +22,7 @@ def main():
         path = out / name
         temp = path.with_suffix(path.suffix + '.partial')
         with temp.open('wb') as stream:
-            result = subprocess.run(adb + ['exec-out', 'su', '-c', command],
+            result = subprocess.run(adb + ['exec-out', 'su -c ' + shlex.quote(command)],
                                     stdout=stream, stderr=subprocess.PIPE, timeout=180)
         if result.returncode:
             raise RuntimeError(f'{name}: {result.stderr.decode(errors="replace")}')
@@ -54,9 +55,9 @@ def main():
         if name.endswith('.img'):
             partition = name[:-4]
             expected = subprocess.check_output(
-                adb + ['exec-out', 'su', '-c',
+                adb + ['exec-out', 'su -c ' + shlex.quote(
                        f'blockdev --getsize64 /dev/block/by-name/{partition}; '
-                       f'sha256sum /dev/block/by-name/{partition}'], timeout=180
+                       f'sha256sum /dev/block/by-name/{partition}')], timeout=180
             ).decode().split()
             if entry['size'] != int(expected[0]) or entry['sha256'] != expected[1]:
                 raise RuntimeError(f'{name}: backup does not match device size/SHA256')
