@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import shlex
 import subprocess
+import time
+import uuid
 
 
 def main():
@@ -32,7 +34,7 @@ def main():
     pin = '/data/local/tmp/unixnu-songyuan-pinfile'
 
     def root(command, timeout=180):
-        r = subprocess.run(adb + ['exec-out', 'su -c ' + shlex.quote(command)],
+        r = subprocess.run(adb + ['shell', '-T', 'su -W -c ' + shlex.quote(command)],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         if r.returncode:
             raise RuntimeError((r.stderr + r.stdout).decode(errors='replace'))
@@ -53,11 +55,27 @@ def main():
         p.error('Image SHA256 does not match')
     print('Writing checked pinned extents', flush=True)
     command = f'{pin} rawwrite {quoted_file} /dev/block/by-name/userdata all --yes'
+    base = '/data/local/tmp/unixnu-songyuan/install-' + uuid.uuid4().hex
+    report, status = base + '.log', base + '.status'
+    remote = (command + ' >' + report + ' 2>&1; code=$?; '
+              'printf "%s" "$code" >' + status)
     with image.open('rb') as f:
-        proc = subprocess.run(adb + ['exec-out', 'su -c ' + shlex.quote(command)], stdin=f,
+        # exec-in preserves all input bytes on Windows. shell translates LF
+        # bytes; exec-out never forwards stdin. Remote completion is separate.
+        proc = subprocess.run(adb + ['exec-in', 'su -W -c ' + shlex.quote(remote)], stdin=f,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
     print((proc.stdout + proc.stderr).decode(errors='replace'), flush=True)
     proc.check_returncode()
+    for _ in range(60):
+        finished = root(f'if test -f {status}; then cat {status}; fi').strip()
+        if finished:
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError('Writer completion not confirmed; do not boot')
+    print(root(f'cat {report}').decode(), flush=True)
+    if finished != b'0':
+        raise RuntimeError('Checked raw writer failed; do not boot')
     after = json.loads(root(extent_cmd))
     if after != before:
         raise RuntimeError('Pinned extents changed; do not boot the image')

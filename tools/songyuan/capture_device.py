@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import shlex
+import sys
 from datetime import datetime, timezone
 
 
@@ -21,11 +22,8 @@ def main():
     def capture(name, command):
         path = out / name
         temp = path.with_suffix(path.suffix + '.partial')
-        with temp.open('wb') as stream:
-            result = subprocess.run(adb + ['exec-out', 'su -c ' + shlex.quote(command)],
-                                    stdout=stream, stderr=subprocess.PIPE, timeout=180)
-        if result.returncode:
-            raise RuntimeError(f'{name}: {result.stderr.decode(errors="replace")}')
+        subprocess.run([sys.executable, Path(__file__).with_name('adb_root.py'),
+                        '--adb', args.adb, '--serial', args.serial, '--out', temp, command], check=True)
         temp.replace(path)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         print(f'{name}: {path.stat().st_size} bytes, SHA256 {digest}', flush=True)
@@ -55,7 +53,7 @@ def main():
         if name.endswith('.img'):
             partition = name[:-4]
             expected = subprocess.check_output(
-                adb + ['exec-out', 'su -c ' + shlex.quote(
+                adb + ['shell', '-T', 'su -W -c ' + shlex.quote(
                        f'blockdev --getsize64 /dev/block/by-name/{partition}; '
                        f'sha256sum /dev/block/by-name/{partition}')], timeout=180
             ).decode().split()
