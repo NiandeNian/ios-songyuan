@@ -57,7 +57,8 @@ IRQ GPIO 158、reset GPIO 66、AVDD GPIO **117**、iovdd L4I_E0。
 随后 XNU RAM 载荷临时启动的照片确认 Darwin 22.6.0（xnu-8796.141.3），
 `rd=md0`、`cpus=1`，已进入 `fs_unmountall(system)` / `MACH Reboot`，最后
 报 `Halt/Restart Timed Out @IOPlatformExpert.cpp:884`。最小 init 的设计行为
-是在约 60 秒后调用 reboot，但照片没有包含其 PID 1 标记，尚需独立确认。
+是在约 60 秒后调用 reboot。用户随后补充确认：第一版同样显示了 PID 1
+和持续的 `init: alive`；此前照片记录的是最后出现的重启超时画面。
 RAM 路线不初始化 UFS，因此没有注册 UFS 中的 PSCI 重启回调；新增
 `9001-songyuan-ram-psci-restart.patch` 在平台初始化时安装备用回调。
 修复内核已通过 CI；本轮用户照片明确显示 PID 1、持续的 `init: alive`
@@ -65,4 +66,9 @@ RAM 路线不初始化 UFS，因此没有注册 UFS 中的 PSCI 重启回调；�
 内核 UUID `4750da68-a025-3fd3-9fca-a98b93bb32d8` 对应上一版，而本轮
 内核 UUID 为 `15c52bd3-8add-3216-baf5-61bc4b881dfa`。
 
-完整 iOS 用户空间和桌面尚未验证。启动分区备份大小和 SHA-256 已与真机逐一比较。
+完整 iOS 16.7.16 / 20H392 用户空间已在真机运行。补齐 OS、Cryptex1 SystemOS、
+AppOS 信任缓存后，dyld 校验成功，launchd 完成早期启动，SpringBoard 和 backboardd
+已执行；backboardd 打开了 SweetHIDTouch 和 SweetHIDButtons。用户确认持续终端
+输出。日志在 240.297 秒明确记录测试参数触发重启，没有 panic 记录。
+iOS 界面仍未出现，下一轮通过线程栈诊断绘制启动的等待位置。
+启动分区备份大小和 SHA-256 已与真机逐一比较。

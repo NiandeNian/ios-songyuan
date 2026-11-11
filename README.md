@@ -18,7 +18,11 @@ at `a87da37e164f23502d845e86f6686b3aeda08f48`. Upstream history is preserved.
   修复内核已通过 CI 和本轮真机重启验证。
 - iOS 16.7.16 的 16 GiB HFSX 根镜像已安装到专用固定文件，完整原始存储
   SHA-256 与源镜像一致，75 个 extents 位置保持不变。
-- 尚未验证完整 iOS 用户空间或桌面启动。
+- 完整 iOS 16.7.16 用户空间已在真机运行：launchd 完成早期启动，
+  SpringBoard、backboardd 已执行，连续运行 240 秒后按测试参数返回 Android。
+  目前仍显示内核终端，尚未出现 iOS 界面。
+- 完整载荷须合并 OS、Cryptex1 SystemOS、AppOS 三份信任缓存；
+  仅 OS 缓存会导致 AMFI 拒绝 dyld shared cache。
 
 ## 编译
 
@@ -44,3 +48,6 @@ extent 稳定性。日志文件至少需要 4 MiB 环形缓冲加一个 4 KiB �
 `install_root.py` 使用 ADB sync 暂存并校验源文件，再在 Android 本地读取它写入
 已检查的固定块区，核对写入量、写入哈希、原始存储哈希和 extent 稳定性。
 `read_console.py` 在返回 Android 后读取并解析专用文件中的 `PANDORLG` 控制台日志。
+`prepare_trust_cache.py --ipsw FILE --out DIR` 按 IPSW manifest 提取并合并目标设备
+的三份信任缓存，记录版本、来源与 SHA-256。iOS 已读写根文件系统后，手机根镜像
+的哈希会变化；最初的安装哈希仅用于验证初次安装。

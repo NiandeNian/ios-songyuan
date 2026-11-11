@@ -1,5 +1,34 @@
 # songyuan bring-up record
 
+## 2026-11-11: full iOS userspace runs; display diagnosis continues
+
+The first full-root boot mounted HFSX and executed Apple's launchd, but
+AMFI rejected the dyld shared cache with `unsuitable CT policy 0`.
+The OS StaticTrustCache alone did not include its CDHash
+`2e6af99c2bbd9042f6b658b58739b6265cb3c46d`.
+`prepare_trust_cache.py` now reads the target IPSW manifest and merges the
+OS (2,760), Cryptex1 SystemOS (61) and AppOS (30) entries into one static
+module with 2,851 entries. The combined cache includes this CDHash.
+
+The second full iOS 16.7.16 / 20H392 boot validated the dyld subcaches,
+completed launchd early boot, executed SpringBoard at 12.084 seconds and
+backboardd at 12.504 seconds, and passed corecrypto's FIPS checks.
+backboardd opened SweetHIDTouch and SweetHIDButtons. No SpringBoard or
+backboardd CRASH was recorded, and no rendered GUI frame was recorded.
+The user saw continuous terminal output and then Android return.
+At 240.297 seconds the log explicitly recorded
+`pandora_reboot_after=240 reached, resetting`; this was the configured
+test timeout, with no panic recorded. The last repeating fairplayd and
+bluetoothd messages do not establish why the GUI has not appeared.
+
+The tested boot image SHA-256 is
+`787984831ba5047b2ba1bbd423bb5e02ed65196ae112e6d5ffc6f69e99994e14`.
+The root image is now being written by iOS; its initial installation
+hash is no longer an expected steady-state hash. The root and log
+pinned extent mappings remain unchanged in the next test's preflight.
+The existing kernel starts `pandora_prof_start()` even with `pandora_cpu=0`,
+so blocked-thread snapshots can be enabled without enabling SCMI probes.
+
 ## 2026-11-11: recovered transfer and verified root installation
 
 The previous long `adb exec-in` transfer failed with a standard-input I/O
@@ -36,8 +65,10 @@ root does not initialize UFS; a later valid log will be new evidence.
 
 The `rd=md0` test booted Darwin 22.6.0 / xnu-8796.141.3 on the phone.
 User photographs show filesystem unmount, MACH Reboot and a halt/restart
-timeout panic. This is consistent with the static init's 60-second reboot,
-but the PID 1 console marker was not captured; it is not a complete iOS boot.
+timeout panic. The user later confirmed that this first test also displayed
+PID 1 and continuous `init: alive`; the initial photographs captured only
+the final reboot timeout. This verifies the first RAM userspace test, not
+a complete iOS boot.
 
 The normal PSCI callback is installed from `sweet_ufs_init()`, which RAM-only
 boot does not call. Patch 9001 installs a fallback in the platform expert,
