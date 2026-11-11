@@ -1,4 +1,4 @@
-name: nezha-xnu-experimental
+name: songyuan-xnu-baseline
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG (PANDORA = nezha bring-up using the shared SM8850 platform, 4 KiB pages)
+        description: Shared SM8850 baseline (PANDORA, 4 KiB pages; board boot not yet verified)
         default: PANDORA
       keep_going:
         description: make -k (collect all compile errors in one run)
