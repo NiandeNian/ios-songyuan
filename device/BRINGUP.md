@@ -1,5 +1,67 @@
 # songyuan bring-up record
 
+## 2026-11-11: network identity and extended GUI observation
+
+The fifth full-root test published patch 0337's network identity at 0.157
+seconds. The user confirmed that the Apple progress bar advanced, and the
+last photograph shows approximately one fifth completed. The return to
+Android was the configured test reset: the console records
+`pandora_reboot_after=360 reached, resetting` at 361.000 seconds, followed
+by a completed Android boot after 407.609 seconds. No kernel panic was
+recorded. The boot image SHA-256 is
+`afe13227ec05ede47adb9c0c29aa3e4560cad025cda7d3f5d43f6dc4ecd170ca`.
+
+Twelve snapshots still show SpringBoard waiting for the LaunchServices
+server store. lsd waits in MobileGestalt's IONetworkController notification
+helper, despite the published identity. MobileGestaltHelper also waits for
+`AppleDiagnosticDataAccessReadOnly` while reading `AppleDiagnosticDataSysCfg`.
+These service names were recovered from the corresponding iOS 16.7.16
+cache instructions and constant strings; large offsets from the nearest
+exported `MGSetAnswer` symbol are not actual function names.
+
+The newly supplied references are yechenan/data-a-live at
+`6547194c4883efad2f8a42ad46e95874dd5e7576` and yechenan/pudding-ios at
+`1d23efa6f3ff5e2f6a7b63ba61188ac40f5a3dbd`. Their handoff notes report
+14 to more than 25 minutes for the first LaunchServices rebuild. A six-minute
+reset cannot establish that the GUI will never start. The sixth test uses
+1800 seconds, snapshots every 120 seconds, and
+`sweetfb_refresh=60 sweetfb_hz=30 sweetiolog=lsd,MobileGestaltHel` to reduce
+display work and observe the outstanding matching calls. Phone-created
+databases are retained between tests; the initial root installation hash
+is not used to reject a root that iOS has subsequently written.
+
+## 2026-11-11: first iOS-rendered boot screen
+
+Four snapshots from the third full-root test located the first display
+block: backboardd's main thread waited in `IOHIDSessionOpen`, while its
+remote HID session filter waited in MobileBluetooth / MobileGestalt's
+synchronous XPC query. SpringBoard waited in `BKSDisplayGetMainScreenInfo`.
+
+The fourth test used an independently allocated 8 MiB pinned file pack
+and the kernel VFS installer to move only
+`IOHIDRemoteSensorSessionFilter.plugin` from SessionFilters into
+`HIDPlugins/SongyuanDisabled`. The installer completed at 2.767 seconds
+with two writes and zero failures. The original bundle is retained and
+the reverse rename restores it; `prepare_hid_pack.py` prepares either
+operation without including Apple binaries.
+
+backboardd opened the framebuffer, presented its first 1125 x 2436 BGRA
+surface at 48.158 seconds and continued CPU rendering at about 79 fps.
+The user photograph confirms an Apple logo and progress bar. The test
+ended at 120.461 seconds with the configured `pandora_reboot_after=120`
+reset and no panic. This verifies the iOS boot screen, not a usable GUI.
+The boot image SHA-256 is
+`2974b2e240e177351ae8a64796020f04023678dc7510261a49d0ea9beef26472`.
+
+Later snapshots show SpringBoard waiting for LaunchServices' database,
+and MobileGestaltHelper waiting on a network identity query. The compiled
+kernel already contains patch 0337's IONetworkController identity publisher,
+but the songyuan ADT did not supply its `nezha-wifi-mac` input. The next
+test supplies the private Android WLAN MAC capture (addr_assign_type 0)
+through `--wifi-mac-file`. This publishes identity without starting Wi-Fi
+hardware or registering a network transport. The fifth test verified publication,
+but the remaining waits above require further diagnosis.
+
 ## 2026-11-11: full iOS userspace runs; display diagnosis continues
 
 The first full-root boot mounted HFSX and executed Apple's launchd, but

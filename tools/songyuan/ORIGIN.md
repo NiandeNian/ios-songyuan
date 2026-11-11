@@ -4,6 +4,7 @@ dipa-studio/ios-sweet at 45263bee51df4a0f55cdf9c649af886399488ddb
 the lowest-segment virt_base change required by Data A Live prelinking.
 
 `mkadt_songyuan.py`, `mkbootimg_v4.py`, `mkprelink.py`, `addtrustcache.py`,
+the `mkfwpack.py` file format,
 `native_prelink/` and the files under `shim/loader`
 come from ShueiTsuki/data-a-live at d2c7089b0a2e6da2b1e7e843337b503ec032b2c5.
 The MIT notice is preserved in shim/hello/ORIGIN.md. The display dimensions,

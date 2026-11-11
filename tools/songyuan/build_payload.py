@@ -17,13 +17,18 @@ def main():
     p.add_argument('--ram-init', action='store_true')
     p.add_argument('--root-extents', type=Path)
     p.add_argument('--log-extents', type=Path)
+    p.add_argument('--fw-extents', type=Path,
+                   help='Verified pinned file pack for the kernel VFS installer')
+    p.add_argument('--wifi-mac-file', type=Path,
+                   help='Private Android MAC capture for the existing network identity publisher')
     p.add_argument('--apple-adt', type=Path)
     p.add_argument('--trust-cache', type=Path, action='append', default=[])
     p.add_argument('--cmdline', default='')
     args = p.parse_args()
     if args.ram_init == bool(args.root_extents):
         p.error('Select --ram-init or --root-extents')
-    for path in [args.kernel, args.root_extents, args.log_extents, args.apple_adt, *args.trust_cache]:
+    for path in [args.kernel, args.root_extents, args.log_extents, args.fw_extents, args.wifi_mac_file,
+                 args.apple_adt, *args.trust_cache]:
         if path is not None and not path.is_file():
             p.error(f'Missing input: {path}')
     if args.log_extents:
@@ -32,6 +37,8 @@ def main():
             p.error('Console log requires a 4 MiB ring plus one 4 KiB header block')
     if not args.ram_init and (not args.apple_adt or not args.trust_cache):
         p.error('iOS root boot requires --apple-adt and at least one --trust-cache')
+    if args.ram_init and args.fw_extents:
+        p.error('The VFS installer requires an iOS root')
     root = Path(__file__).resolve().parents[2]
     tools = root / 'tools/songyuan'
     out = root / ('out/xnu-init' if args.ram_init else 'out/ios')
@@ -43,16 +50,23 @@ def main():
         env['D22AP_ADT'] = str(args.apple_adt.resolve())
     call = lambda cmd: subprocess.run([str(v) for v in cmd], check=True, env=env)
     adt_cmd = [sys.executable, tools / 'mkadt_songyuan.py', out / 'songyuan.adt']
-    for key in ('root_extents', 'log_extents'):
+    for key in ('root_extents', 'log_extents', 'fw_extents'):
         value = getattr(args, key)
         if value:
             adt_cmd += ['--' + key.replace('_', '-'), value.resolve()]
+    if args.wifi_mac_file:
+        adt_cmd += ['--wifi-mac-file', args.wifi_mac_file.resolve()]
     call(adt_cmd)
     rd = 'md0' if args.ram_init else 'ufsroot0'
-    cmdline = (f'debug=0x8 serial=3 cpus=1 keepsyms=1 -v -noprogress rd={rd} '
-               'songyuan=1 pandora_touch=0 pandora_gpu=0 pandora_adsp=0 '
-               'pandora_gauge=0 pandora_amp=0 pandora_therm=0 pandora_camera=0 '
-               'pandora_wifi=0 pandora_cpu=0 pandora_files=0 ' + args.cmdline).strip()
+    files = int(bool(args.fw_extents))
+    board_cmdline = (f'debug=0x8 serial=3 cpus=1 keepsyms=1 -v -noprogress rd={rd} '
+                     'songyuan=1 pandora_touch=0 pandora_gpu=0 pandora_adsp=0 '
+                     'pandora_gauge=0 pandora_amp=0 pandora_therm=0 pandora_camera=0 '
+                     f'pandora_wifi=0 pandora_cpu=0 pandora_files={files}')
+    fixed_keys = {token.split('=', 1)[0] for token in board_cmdline.split() if '=' in token}
+    if any(token.split('=', 1)[0] in fixed_keys for token in args.cmdline.split()):
+        raise ValueError('Extra boot arguments duplicate a fixed board setting')
+    cmdline = (board_cmdline + ' ' + args.cmdline).strip()
     if len(cmdline.encode()) >= 608:
         raise ValueError('Boot arguments exceed the XNU 608-byte command line')
     payload_cmd = [sys.executable, tools / 'mkpayload.py', args.kernel.resolve(),

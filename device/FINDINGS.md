@@ -70,5 +70,12 @@ RAM 路线不初始化 UFS，因此没有注册 UFS 中的 PSCI 重启回调；�
 AppOS 信任缓存后，dyld 校验成功，launchd 完成早期启动，SpringBoard 和 backboardd
 已执行；backboardd 打开了 SweetHIDTouch 和 SweetHIDButtons。用户确认持续终端
 输出。日志在 240.297 秒明确记录测试参数触发重启，没有 panic 记录。
-iOS 界面仍未出现，下一轮通过线程栈诊断绘制启动的等待位置。
+iOS 随后显示了苹果标志和进度条：停用阻塞 HID 初始化的可选远程蓝牙插件后，
+backboardd 在 48.158 秒送出第一张 BGRA 画面，持续 CPU 绘制。该轮在 120.461 秒
+按测试参数重启。SpringBoard 后续等待 LaunchServices 数据库；设备能力服务等待
+网络身份查询。第五轮确认身份已发布，进度条推进到约五分之一；361.000 秒的
+日志明确记录 `pandora_reboot_after=360` 主动复位，没有内核 panic。
+lsd 的网络通知等待和 MobileGestaltHelper 的诊断配置等待仍在，身份发布不能
+等同于查询已解除。新参考记录首次 LaunchServices 重建需要 14–25 分钟以上，
+因此后续 GUI 观察窗口扩展为 1800 秒，并保留手机已生成的数据库。桌面尚未启动。
 启动分区备份大小和 SHA-256 已与真机逐一比较。

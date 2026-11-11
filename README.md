@@ -20,7 +20,7 @@ at `a87da37e164f23502d845e86f6686b3aeda08f48`. Upstream history is preserved.
   SHA-256 与源镜像一致，75 个 extents 位置保持不变。
 - 完整 iOS 16.7.16 用户空间已在真机运行：launchd 完成早期启动，
   SpringBoard、backboardd 已执行，连续运行 240 秒后按测试参数返回 Android。
-  目前仍显示内核终端，尚未出现 iOS 界面。
+  随后已显示苹果标志和持续推进的进度条，CPU 绘制链路已运行；桌面仍未完成启动。
 - 完整载荷须合并 OS、Cryptex1 SystemOS、AppOS 三份信任缓存；
   仅 OS 缓存会导致 AMFI 拒绝 dyld shared cache。
 
@@ -51,3 +51,14 @@ extent 稳定性。日志文件至少需要 4 MiB 环形缓冲加一个 4 KiB �
 `prepare_trust_cache.py --ipsw FILE --out DIR` 按 IPSW manifest 提取并合并目标设备
 的三份信任缓存，记录版本、来源与 SHA-256。iOS 已读写根文件系统后，手机根镜像
 的哈希会变化；最初的安装哈希仅用于验证初次安装。
+
+`build_payload.py --fw-extents TABLE` 通过专用固定文件提供内核 VFS 安装包。
+`mkfwpack.py` 生成包；`install_pack.py` 核对源、传输和原始存储 SHA-256，
+核对固定映射，仅接受专用 files/fw 测试文件。`prepare_hid_pack.py disable|restore`
+生成远程蓝牙 HID 插件的可恢复重命名操作。
+`--wifi-mac-file FILE` 将私有 Android MAC 采集结果提供给现有网络身份发布器，
+用于解除设备能力查询等待；Wi-Fi 数据连接尚未适配。
+
+首次 GUI 观察须留足 LaunchServices 重建时间：参考机型实测约 14 分钟，上游
+记录超过 25 分钟。当前用 1800 秒临时启动观察，并保留根镜像已生成的数据库。
+苹果标志和 `exec SpringBoard` 均不能作为锁屏或桌面成功的证明。

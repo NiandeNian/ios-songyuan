@@ -15,6 +15,8 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
            /chosen pandora-log-extents + pandora-log-blocks, same layout.
   --fw-extents JSON    a pinned firmware pack (tools/mkfwpack.py, patch 0144):
            /chosen pandora-fw-extents + pandora-fw-blocks, same layout.
+  --wifi-mac-file FILE a private Android MAC capture (six bytes or colon-separated text),
+           for patch 0337's network identity publisher; this does not enable Wi-Fi transport.
   --amp                cores 0-5 as the E cluster and 6-7 as the P cluster (kernels with patch 0320
            only; others assert on a second cluster).
   --gpu-pool MIB       carve MIB MiB below the panic log off the RAM given to XNU for the GPU
@@ -126,6 +128,18 @@ def fw_extent_props(path):
     """/chosen props for the firmware pack (patch 0144), same triples as the root."""
     props = root_extent_props(path)
     return [('pandora-fw-extents', props[0][1]), ('pandora-fw-blocks', props[1][1])]
+
+
+def network_identity_props(path):
+    mac = open(path, 'rb').read()
+    if len(mac) != 6:
+        try:
+            mac = bytes.fromhex(mac.decode('ascii').strip().replace(':', ''))
+        except (UnicodeError, ValueError) as error:
+            raise ValueError('Invalid private MAC capture') from error
+    if len(mac) != 6 or mac[0] & 1 or mac == b'\0' * 6:
+        raise ValueError('Network identity requires a six-byte nonzero unicast MAC')
+    return [('nezha-wifi-mac', mac)]
 
 
 def root_extent_props(path, root_bytes=None):
@@ -425,6 +439,9 @@ if __name__ == '__main__':
         print(f'fw extents: {len(fp[0][1]) // 24}, {struct.unpack("<Q", fp[1][1])[0]} blocks',
               file=sys.stderr)
         props = list(props) + fp
+    if opt('--wifi-mac-file'):
+        props = list(props) + network_identity_props(opt('--wifi-mac-file'))
+        print('network identity: private Android MAC capture supplied', file=sys.stderr)
     pool = int(opt('--gpu-pool'), 0) << 20 if opt('--gpu-pool') else 0
     if pool:
         print(f'gpu pool: {pool >> 20} MiB', file=sys.stderr)
