@@ -1,0 +1,55 @@
+name: songyuan-xnu-init
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Successful XNU baseline run in this repository
+        required: true
+        default: '42936844367'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  payload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang lld llvm
+      - name: Fetch successful XNU build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          set -euo pipefail
+          test "$(gh run view "$SOURCE_RUN" --json conclusion --jq .conclusion)" = success
+          gh run download "$SOURCE_RUN" --name xnu-kernel --dir source-kernel
+      - name: Build songyuan XNU and static PID 1 RAM payload
+        run: |
+          set -euo pipefail
+          kernel=$(find source-kernel -type f -name kernel.development.pandora -print -quit)
+          test -n "$kernel"
+          python3 tools/songyuan/build_payload.py --llvm-bin /usr/bin --kernel "$kernel" --ram-init
+          python3 - <<'PY'
+          import lzma, pathlib, hashlib
+          for name in ('boot.img',):
+              p = pathlib.Path('out/xnu-init') / name
+              p.with_suffix(p.suffix + '.xz').write_bytes(lzma.compress(p.read_bytes(), preset=9))
+          kernel = next(pathlib.Path('source-kernel').rglob('kernel.development.pandora'))
+          pathlib.Path('out/xnu-init/kernel.xz').write_bytes(lzma.compress(kernel.read_bytes(), preset=9))
+          pathlib.Path('out/xnu-init/SHA256SUMS').write_text(
+              hashlib.sha256(pathlib.Path('out/xnu-init/boot.img').read_bytes()).hexdigest() + '  boot.img\n' +
+              hashlib.sha256(kernel.read_bytes()).hexdigest() + '  kernel.development.pandora\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: songyuan-xnu-init
+          path: |
+            out/xnu-init/*.xz
+            out/xnu-init/SHA256SUMS
+            out/xnu-init/BOOTARGS.txt
+          retention-days: 14
